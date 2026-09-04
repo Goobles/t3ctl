@@ -264,6 +264,26 @@ A maintainer promotes it with 2FA:
 2FA is required either way. `npm stage view <id>` and `npm stage download <id>`
 let you inspect the exact tarball before approving.
 
+### If a stage is rejected or expires
+
+The GitHub release already exists at that point, so release-please reports
+`release_created=false` from then on and rerunning the workflow skips the stage
+job entirely — a rerun can never re-stage. Use the manual path instead:
+
+```sh
+gh workflow run release.yml -f tag=v0.4.0
+```
+
+That skips release-please, checks out the tag, re-verifies tag/package.json
+agreement, and stages it again for approval.
+
+### Known rough edge: the approval window
+
+`npm stage` moves `dist-tags.latest` to the staged version immediately, but the
+version is not fetchable until it is approved. In between, `npm i @gobius/t3ctl`
+fails with `ETARGET` for anyone tracking `latest`. It resolves the moment you
+approve, so approve promptly rather than leaving releases staged.
+
 So a release passes two human gates — merging the release PR, and approving the
 staged package — and no long-lived credential is involved in either.
 
