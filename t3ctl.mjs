@@ -368,14 +368,56 @@ const cmdProject = async (args) => {
 // thread.meta.update also accepts regenerateTitle:true, which asks the server to
 // derive a title from the thread's own content instead of taking one from us.
 const cmdThreadRename = async (thread, host, title) => {
-  const command = {
+  const { sequence } = await dispatch(host, {
+    type: 'thread.meta.update', commandId: crypto.randomUUID(), threadId: thread.id, title,
+  });
+  console.log(`renamed ${dim(thread.title || thread.id)} -> ${bold(title)}\n  seq ${sequence}`);
+};
+
+// Lighter than the full snapshot; retitle polls this so it does not refetch every
+// thread's history once a second.
+const threadDetail = async (host, threadId) => {
+  const res = await fetch(`${host.origin}/api/orchestration/threads/${threadId}?turnLimit=1`, {
+    headers: { authorization: `Bearer ${host.token}` },
+    signal: AbortSignal.timeout(host.timeoutMs ?? 15000),
+  });
+  if (!res.ok) throw new Error(`${host.name}: HTTP ${res.status}`);
+  return (await res.json()).thread;
+};
+
+// `regenerateTitle` does NOT rename anything by itself. The server records an
+// intent marker (`titleRegeneration: {requestId, startedAt}`) and expects something
+// downstream to generate a title and write it back. Observed on a live server: the
+// marker is sometimes cleared a few seconds later with the title untouched, and no
+// error is reported anywhere — not in the event, the command receipt, or the server
+// trace. So we dispatch, then watch, and say what actually happened.
+const cmdThreadRetitle = async (thread, host, timeoutSeconds) => {
+  const before = thread.title;
+  const { sequence } = await dispatch(host, {
     type: 'thread.meta.update', commandId: crypto.randomUUID(), threadId: thread.id,
-    ...(title === null ? { regenerateTitle: true } : { title }),
-  };
-  const { sequence } = await dispatch(host, command);
-  console.log(title === null
-    ? `retitling ${bold(thread.title || thread.id)} from its content\n  seq ${sequence}`
-    : `renamed ${dim(thread.title || thread.id)} -> ${bold(title)}\n  seq ${sequence}`);
+    regenerateTitle: true,
+  });
+  console.log(`asked the server to retitle ${bold(before || thread.id)}${dim(`  (seq ${sequence})`)}`);
+
+  const deadline = Date.now() + timeoutSeconds * 1000;
+  let sawMarker = false;
+  while (Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, 1500));
+    const current = await threadDetail(host, thread.id);
+    if (current.title && current.title !== before) {
+      console.log(`retitled -> ${bold(current.title)}`);
+      return;
+    }
+    if (current.titleRegeneration) { sawMarker = true; continue; }
+    if (sawMarker) break; // marker appeared and was cleared, title unchanged
+  }
+
+  console.error(
+    `\x1b[33mno title was generated\x1b[0m — the server ${sawMarker ? 'cleared the request without producing one' : `did not act on it within ${timeoutSeconds}s`}.\n` +
+    `  The title is still "${before}". Set one directly:\n` +
+    `    t3ctl thread rename ${thread.id} <title...>`,
+  );
+  process.exitCode = 1;
 };
 
 const cmdThread = async (args) => {
@@ -389,10 +431,13 @@ const cmdThread = async (args) => {
   if (sub === 'rename' || sub === 'retitle') {
     const [ref, ...titleParts] = pos;
     if (!ref) return usage(`usage: t3ctl thread ${sub} <thread>` + (sub === 'rename' ? ' <new title...>' : ''));
-    const title = sub === 'retitle' ? null : titleParts.join(' ');
+    const title = titleParts.join(' ');
     if (sub === 'rename' && !title) return usage('usage: t3ctl thread rename <thread> <new title...>');
     const host = pickHost(flags);
-    return cmdThreadRename(resolveThread(await snapshot(host), ref), host, title);
+    const target = resolveThread(await snapshot(host), ref);
+    return sub === 'retitle'
+      ? cmdThreadRetitle(target, host, Number(flags.timeout) > 0 ? Number(flags.timeout) : 30)
+      : cmdThreadRename(target, host, title);
   }
 
   if (isSend || sub === 'interrupt') {
@@ -460,7 +505,8 @@ if (!commands[cmd]) {
   t3ctl thread send <thread> <message...>       send a message and run the agent
                                                 (alias: start)
   t3ctl thread rename <thread> <title...>       rename a thread
-  t3ctl thread retitle <thread>                 let the server derive the title
+  t3ctl thread retitle <thread> [--timeout n]   ask the server to derive a title
+                                                (warns if it produces none)
   t3ctl thread interrupt <thread>               stop the running turn
   t3ctl thread settle <thread>                  settle a thread (also: archive,
                                                 unarchive, unpin, delete)`);
