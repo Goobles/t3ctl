@@ -1,0 +1,12 @@
+# Requests @Goobles as reviewer on every pull request.
+#
+# This is what puts release-please's `chore(main): release X.Y.Z` PRs into your
+# review queue: they are authored by app/github-actions, not by you, so GitHub
+# can request your review on them. (It never requests review from a PR's own
+# author, so PRs you open yourself are unaffected — as they should be.)
+#
+# The ruleset on main has require_code_owner_review: false, so this requests a
+# review without hard-blocking the merge. Set that to true if you want the
+# review to be mandatory rather than advisory.
+
+* @Goobles
