@@ -1,149 +1,310 @@
 # t3ctl
 
-A controller CLI for [T3 Code](https://github.com/pingdotgg/t3code) — a peer of the
-mobile app, not a host. Lists and (eventually) drives threads across all your machines.
+A terminal client for [T3 Code](https://github.com/pingdotgg/t3code) that lists and
+drives your coding-agent threads across every machine you run T3 Code on. Register
+each host once, then start turns, interrupt runaway agents, and see what's running
+everywhere from one prompt — without opening the desktop app.
 
-T3 Code is MIT-licensed open source. **Read the source before guessing at anything here:**
-`docs/user/remote-access.md`, `docs/internals/environment-auth.md`,
-`docs/internals/t3-connect.md`, and `packages/contracts/src/orchestration.ts`.
+> Unofficial community client. Not affiliated with T3 Tools. See [Limitations](#limitations).
 
-## Install
+## Quick start
 
-    npm i -g @gobius/t3ctl     # installs a `t3ctl` binary
-    npx @gobius/t3ctl ls
+You need a running T3 Code server (`t3 serve`, or the desktop app, which runs one)
+and Node 22+.
 
-## Status: local read + write working; relay transport not started
+```sh
+# 1. install
+npm i -g @gobius/t3ctl
 
-    t3ctl ls [-t|--threads] [-a|--all] [--json]
-    t3ctl host add <name> <origin> <token>
-    t3ctl project create <title> <workspace-root>
-    t3ctl thread create <project> <title> [--model <instance>/<model>] [--branch <b>]
-    t3ctl thread start <thread> <message...>  [--interaction-mode plan] [--model ...]
-    t3ctl thread interrupt <thread>
-    t3ctl thread settle|archive|unarchive|unpin|delete <thread>
+# 2. mint a token — run this on the machine hosting T3 Code
+npx t3 auth session issue --label t3ctl --ttl 30d --token-only
 
-`<project>` resolves by id, title, or workspace root. `<thread>` resolves by id,
-exact title, then unique case-insensitive substring (ambiguous matches are listed,
-not guessed). The five verb commands above are exactly those whose payload is
-`{commandId, threadId}`; `unsettle` carries extra fields and is not among them. `--model` defaults to
-`claudeAgent/claude-opus-5`; `instanceId` is the segment before the first slash
-(opencode models are themselves slashed, e.g. `opencode/github-copilot/gpt-5.4`).
+# 3. register that host under a short name of your choosing
+t3ctl host add laptop http://localhost:3773 t3s_...
 
-`thread create` creates an *idle* thread with no messages — it does not start the
-agent; use `thread start` for that. The UI never produces this state: it always fires `thread.create` immediately
-followed by `thread.turn.start`, a single command that carries the first message
-inline (`message: {messageId, role, text, attachments}` plus a `titleSeed`).
-`thread.message-sent` and `thread.turn-start-requested` are the resulting *events*,
-not commands. Starting a turn is not implemented here yet.
+# 4. see everything
+t3ctl ls
+```
 
-## Auth
+```
+laptop http://localhost:3773
 
-The server advertises its own policy at `GET /api/auth/session`; `bearer-access-token`
-is a supported session method. `t3 auth` is the documented way to manage access.
+  t3ctl  ●1 ◆1 ·3  ~/Code/t3ctl
+  api-gateway  ✓2 ·1  ~/Code/api-gateway
+```
 
-    npx t3 auth session issue --label t3ctl --ttl 30d --token-only
-    npx t3 auth session list
-    npx t3 auth session revoke <session-id>
+Add `-t` to expand threads:
 
-`t3` is published on npm (the `apps/server` package); `npx t3` works. Note that npx
-resolves the latest *published* version, which may lag the Nightly server you're running
-— T3 Code warns about client/server version skew. The same CLI ships inside the desktop
-app and needs no install, which guarantees an exact version match:
+```sh
+t3ctl ls -t
+```
 
-    APP="/Applications/T3 Code (Nightly).app"
-    ELECTRON_RUN_AS_NODE=1 "$APP/Contents/MacOS/T3 Code (Nightly)" \
-      "$APP/Contents/Resources/app.asar/apps/server/dist/bin.mjs" auth session issue --token-only
+```
+laptop http://localhost:3773
 
-Note `@t3tools/contracts` and `@t3tools/client-runtime` are `private: true` — readable in
-the repo, but not installable from npm. Hence the hand-rolled HTTP client here.
+  t3ctl  ●1 ◆1 ·3  ~/Code/t3ctl
+    ● rewrite the readme for users                                   main claudeAgent
+    ◆ add snapshotSequence polling                                   poll claudeAgent
+    · flaky release workflow                                         main claudeAgent
+```
 
-## Endpoints
+Projects are sorted most-recently-updated first, and so are the threads inside
+them. Thread titles are truncated at 62 characters.
 
-| Purpose | Endpoint |
-|---|---|
-| List everything | `GET /api/orchestration/snapshot` |
-| Per-thread | `GET /api/orchestration/threads/:threadId` |
-| Writes (commands) | `POST /api/orchestration/dispatch` |
+Hosts and tokens are stored in `~/.config/t3ctl/hosts.json` (directory `0700`,
+file `0600`). Tokens are stored in plaintext, so treat that file like a password
+file — revoke with `npx t3 auth session revoke <session-id>` if it leaks.
 
-Commands are imperative, events past-tense (`thread.create` → `thread.created`).
-**The client generates `commandId`, `threadId`, and `projectId`**; `commandId` is the
-idempotency key. Exact schemas: `packages/contracts/src/orchestration.ts`.
+## Commands
 
-    project.create  { commandId, projectId, title, workspaceRoot, createdAt,
-                      createWorkspaceRootIfMissing? }
-    thread.create   { commandId, threadId, projectId, title, modelSelection,
-                      runtimeMode, interactionMode?, branch, worktreePath, createdAt }
+Run `t3ctl` with no arguments for the built-in summary.
 
-### Derived thread status
+### `t3ctl ls`
 
-Most-urgent-first: `running` (`session.activeTurnId` or `session.status==="running"`)
-› `error` › `snoozed` › `needs-review` (`proposedPlans`) › `settled` › `idle`;
-`archived`/`deleted` short-circuit.
+List projects and threads across **all** registered hosts, in parallel. Hosts that
+don't answer are reported at the end as `unreachable` rather than failing the run.
 
-## Cross-machine
+```sh
+t3ctl ls                # projects only, with a status tally per project
+t3ctl ls -t             # --threads: expand each project's threads
+t3ctl ls -a             # --all: include archived and deleted, and empty projects
+t3ctl ls --json         # machine-readable; always includes threads
+```
 
-`t3ctl` is origin-agnostic, so anything that gives a host a reachable URL works:
+`ls` deliberately has no `--host` filter — it's the "what's happening everywhere"
+view. Pipe `--json` through `jq` if you want to slice it:
 
-- **Tailscale** — `t3 serve --tailscale-serve` advertises `https://machine.tailnet.ts.net/`.
-  Then `t3ctl host add <name> <url> <token>`.
-- **LAN** — `t3 serve --host "$(tailscale ip -4)"` or any bound interface.
-- **SSH launch** — desktop-only today; the desktop app starts a remote server and port-forwards.
-- **T3 Connect relay** (`relay.t3.codes`) — account-level environment registry, what mobile
-  uses off-tailnet. Client-side API is `/v1/client/environment-links`, `.../dpop-token`,
-  `.../environment-link-challenges`, `.../devices`. Not implemented here yet; see
-  `docs/internals/t3-connect.md` and `packages/contracts/src/relay.ts`.
+```sh
+t3ctl ls --json | jq -r '.projects[].threads[] | select(.status=="running") | .title'
+```
 
-## Releasing
+The JSON shape is `{projects: [{host, id, title, workspaceRoot, threads: [{id,
+title, branch, status, provider, updatedAt}]}], unreachable: [{host, error}]}`.
 
-Publishing runs in CI via **npm trusted publishing (OIDC)**. There is no `NPM_TOKEN`
-anywhere — not in the workflow, not in repo secrets. CI proves its identity with a
-short-lived OIDC token that npm verifies against a configured trusted publisher, so
-there is no long-lived credential to leak, rotate, or exfiltrate. npm also attaches a
-provenance attestation linking the tarball to the exact commit and workflow run.
+### `t3ctl host add <name> <origin> <token>`
 
-To cut a release:
+Register (or overwrite) a host. `<name>` is whatever you want to call it locally;
+`<origin>` is a scheme + host + optional port, with any trailing slash trimmed.
 
-    npm version minor          # or patch/major; commits and tags
-    git push origin main --follow-tags
+```sh
+t3ctl host add desktop https://studio.tailnet-1234.ts.net t3s_...
+```
 
-The `v*` tag triggers `.github/workflows/release.yml`, which **stages** the release.
-CI cannot make a version public: the trusted publisher is configured stage-only, so
-a maintainer must promote it with 2FA. Either:
+### `t3ctl host rm <name>`
 
-- **npmjs.com** → the package → **Staged Packages** tab → **Approve**, or
-- `npm stage list @gobius/t3ctl` then `npm stage approve <stage-id>`
+```sh
+t3ctl host rm desktop
+```
 
-2FA is required either way. `npm stage view <id>` and `npm stage download <id>` let
-you inspect the exact tarball before approving. Prereleases (`1.2.3-beta.0`) target
-the `next` dist-tag; everything else `latest`.
+### `t3ctl hosts`
 
-Trust boundaries, deliberately:
+List registered hosts with truncated tokens. `t3ctl host` with no subcommand does
+the same thing.
 
-- **Staged, not published.** CI stages with provenance; a human promotes with 2FA.
-  A compromised workflow cannot ship anything to users. This is npm's own hardened
-  recommendation, and the stage subcommands can't use OIDC tokens by design.
-- **Tag-triggered, not push-to-main.** Merging never publishes.
-- **`environment: release`.** The OIDC subject npm checks includes the environment,
-  so a workflow running outside it cannot publish even from this repo. Add required
-  reviewers to that environment in GitHub settings to gate releases on a human.
-- **`permissions: {}` at the top**, with the job opting into only `contents: read`
-  and `id-token: write`.
-- **Actions pinned to full commit SHAs**, so a moved tag cannot swap the code.
-- **`persist-credentials: false`**, so the job's token isn't left in `.git/config`.
-- **`--ignore-scripts`** on publish, and the package has zero dependencies, so no
-  third-party code executes in the release job.
-- **Tag/version agreement is enforced** before publishing, not after.
+```sh
+t3ctl hosts
+```
 
-One-time setup on npmjs.com (package → Settings → Trusted Publisher):
-organization/user `Goobles`, repository `t3ctl`, workflow `release.yml`,
-environment `release`. Grant it `npm stage publish` only — not `npm publish`.
-Once that works, consider disallowing token-based publishes for the package entirely
-so this pipeline becomes the only path in.
+```
+laptop           http://localhost:3773  token:t3s_9fa2…
+desktop          https://studio.tailnet-1234.ts.net  token:t3s_41bc…
+```
 
-## Caveats
+### `t3ctl project create <title> <workspace-root>`
 
-- Unofficial client. Built against T3 Code Nightly; pin to `snapshot` + `dispatch`.
-- A host is only reachable while its T3 Code server is running.
-- `snapshot` returns full messages/activities (~900 KB for 215 threads). Fine for `ls`,
-  wrong for polling — use `snapshotSequence` for incremental sync.
-- Treat pairing tokens like passwords; revoke with `t3 auth session revoke`.
+Register an existing directory on the host as a project. The path is resolved
+locally (`~` expands) and must already exist — t3ctl will not create it.
+
+```sh
+t3ctl project create t3ctl ~/Code/t3ctl
+```
+
+> Note: the workspace root is interpreted on the **host**, so this really only
+> makes sense for a host whose filesystem you share — i.e. `localhost`. For a
+> remote host, pass the remote absolute path and skip the `~` shorthand.
+
+### `t3ctl thread create <project> <title>`
+
+Create a thread. This produces an **idle thread with no messages** — it does not
+start the agent. Use `thread start` for that.
+
+```sh
+t3ctl thread create t3ctl "rewrite the readme for users" --branch docs/readme
+```
+
+Flags:
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--model <instance>/<model>` | `claudeAgent/claude-opus-5` | Provider instance and model |
+| `--branch <name>` | none | Git branch for the thread |
+| `--worktree <path>` | none | Explicit worktree path |
+| `--runtime-mode <mode>` | `full-access` | `approval-required`, `auto-accept-edits`, `auto`, `full-access` |
+| `--interaction-mode <mode>` | `default` | `default` or `plan` |
+| `--host <name>` | the only host | Which host to act on |
+
+`--model` splits on the **first** slash, so slashed model names work as-is:
+`--model opencode/github-copilot/gpt-5.4`.
+
+### `t3ctl thread start <thread> <message...>`
+
+Send a message and run the agent. Everything after the thread reference is the
+message — no quoting needed.
+
+```sh
+t3ctl thread start "rewrite the readme" move the endpoint tables into CONTRIBUTING.md
+```
+
+```
+started rewrite the readme for users
+  id    0f5c1e2a-...
+  model claudeAgent/claude-opus-5
+  mode  full-access / default
+  seq   4471
+```
+
+Accepts `--model`, `--runtime-mode`, `--interaction-mode`, and `--host`. Unlike
+`thread create`, `--model` has no default here: the thread's existing model is
+reused unless you override it. Use `--interaction-mode plan` to make the agent
+plan instead of edit:
+
+```sh
+t3ctl thread start "flaky release workflow" --interaction-mode plan why does the tag job race?
+```
+
+### `t3ctl thread interrupt <thread>`
+
+Stop the turn that's currently running.
+
+```sh
+t3ctl thread interrupt "rewrite the readme"
+```
+
+### `t3ctl thread settle|archive|unarchive|unpin|delete <thread>`
+
+Thread lifecycle. Each takes a single thread reference (plus `--host`).
+
+```sh
+t3ctl thread settle "rewrite the readme"    # mark as done, drop out of the active list
+t3ctl thread archive "flaky release workflow"
+t3ctl thread unarchive 0f5c1e2a-...
+t3ctl thread unpin "api rate limits"
+t3ctl thread delete "scratch experiment"
+```
+
+`delete` is not prompted and not undoable from t3ctl — check with `ls -t` first.
+
+## Referring to projects and threads
+
+You rarely need to paste a UUID.
+
+**Projects** resolve by id, then exact title, then workspace root (`~` expands,
+relative paths are resolved against your current directory).
+
+**Threads** resolve by id, then exact title, then a unique case-insensitive
+substring of the title. Ambiguous substrings are listed rather than guessed:
+
+```
+error "readme" matches 3 threads:
+  0f5c1e2a-...  rewrite the readme for users
+  7b31d004-...  readme screenshots
+  c9e0a115-...  fix readme badge
+```
+
+Deleted threads are never resolution candidates.
+
+## Choosing a host
+
+Write commands act on one host. With a single host registered, that one is
+implied. With more than one, pass `--host`:
+
+```sh
+t3ctl thread start --host desktop "api rate limits" pick this back up
+```
+
+Otherwise you get `multiple hosts; pass --host <laptop|desktop>`.
+
+## Reading `ls` output
+
+Each project line ends with a tally like `●1 ◆1 ·3` — one icon per status, with a
+count. With `-t`, each thread line starts with its own icon.
+
+| Icon | Status | What it means |
+|---|---|---|
+| `●` green | `running` | A turn is in flight right now. The agent is working. |
+| `✕` red | `error` | The session or its most recent turn failed. Needs you. |
+| `◆` yellow | `needs-review` | The agent produced a plan and is waiting for you to approve it. |
+| `☾` grey | `snoozed` | Hidden on purpose until a wake time (set in the app) passes. |
+| `✓` grey | `settled` | You marked it done. It stays settled until new activity un-settles it. |
+| `·` grey | `idle` | Alive, nothing running, nothing waiting on you. Freshly created threads land here. |
+| `▪` grey | `archived` | Archived. Hidden unless you pass `-a`. |
+| `✗` grey | `deleted` | Deleted. Hidden unless you pass `-a`. |
+
+The two worth acting on are `✕` and `◆`: red means something broke, yellow means an
+agent is blocked waiting for your approval. `●` is just work in progress.
+
+One status per thread, most urgent first — a thread that is both running and
+settled shows as `running`.
+
+## Several machines
+
+t3ctl only ever stores an origin string, so **any transport that gives a host a
+reachable URL works.** There's nothing to configure beyond `host add`.
+
+- **Tailscale** — on the host, `npx t3 serve --tailscale-serve` publishes it at
+  `https://machine.tailnet.ts.net/`. Register that URL.
+- **LAN** — `npx t3 serve --host 0.0.0.0` (or a specific interface), then register
+  `http://192.168.1.x:3773`. Read the URL `t3 serve` prints; it picks another port
+  if the default is taken.
+- **SSH port-forward** — `ssh -N -L 3773:localhost:3773 you@box`, then register
+  `http://localhost:3773`. Good for hosts you don't want exposed at all.
+
+**One token per host.** Tokens are issued by the server they belong to, so run
+`npx t3 auth session issue --label t3ctl --ttl 30d --token-only` on each machine
+and give each host its own short name:
+
+```sh
+t3ctl host add laptop  http://localhost:3773                  t3s_...
+t3ctl host add desktop https://studio.tailnet-1234.ts.net     t3s_...
+t3ctl host add builder http://10.0.0.42:3773                  t3s_...
+t3ctl ls -t
+```
+
+`ls` then fans out to all three at once. Machines that are asleep or offline show
+up as `unreachable` and don't block the rest.
+
+T3 Code's own **T3 Connect relay** (what the mobile app uses when you're off your
+tailnet) is **not implemented in t3ctl** — the transports above are the options
+today.
+
+## Limitations
+
+Worth knowing before you build a workflow on this:
+
+- **Unofficial.** Not affiliated with or supported by T3 Tools. Written against
+  T3 Code Nightly's HTTP API, which is not a documented public API — **endpoints
+  and payloads can change without warning** and a T3 Code update may break t3ctl
+  until it catches up.
+- **A host is only reachable while its T3 Code server is running.** t3ctl can't
+  wake a machine, launch a server, or queue work for later. If the desktop app is
+  closed and no `t3 serve` is running, that host is `unreachable`.
+- **`thread create` doesn't run anything.** It leaves an idle thread with no
+  messages — a state the desktop UI never produces. Follow it with `thread start`,
+  or the thread just sits there.
+- **Not everything the API supports is wired up.** No `pin`, `unsettle`,
+  `snooze`/`unsnooze`, no reading message content, no live tailing of a running
+  turn. `unpin` exists without `pin` because only some of these share a payload
+  shape — see [CONTRIBUTING.md](CONTRIBUTING.md).
+- **`ls` fetches full snapshots.** Fine interactively; too heavy to poll in a
+  loop.
+- **Tokens sit in plaintext** in `~/.config/t3ctl/hosts.json`. No keychain
+  integration. Scope them with `--ttl` and revoke when done.
+
+## Contributing
+
+Protocol notes, the command vocabulary, status-derivation rules, and the release
+process are in [CONTRIBUTING.md](CONTRIBUTING.md).
+
+## License
+
+MIT
