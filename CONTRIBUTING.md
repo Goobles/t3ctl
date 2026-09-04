@@ -195,23 +195,27 @@ trusted publisher, so there is no long-lived credential to leak, rotate, or
 exfiltrate. npm also attaches a provenance attestation linking the tarball to
 the exact commit and workflow run.
 
-To cut a release:
+Versions are not chosen by hand. **release-please** watches `main`, derives the
+next version from Conventional Commits, and keeps a `chore(main): release X.Y.Z`
+pull request up to date with the computed version and a generated `CHANGELOG.md`.
 
-```sh
-npm version minor          # or patch/major; commits and tags
-git push origin main --follow-tags
-```
+To cut a release, merge that PR. Nothing else. `feat:` bumps the minor, `fix:`
+the patch, `feat!:`/`BREAKING CHANGE:` the major; `ci:`, `chore:`, `docs:`,
+`refactor:` and `test:` do not trigger a release on their own.
 
-The `v*` tag triggers `.github/workflows/release.yml`, which **stages** the
-release. CI cannot make a version public: the trusted publisher is configured
-stage-only, so a maintainer must promote it with 2FA. Either:
+Merging the release PR creates the tag and GitHub release, which runs the
+`stage` job in the same workflow. That job **stages** the package — it cannot
+make a version public, because the trusted publisher is configured stage-only.
+A maintainer promotes it with 2FA:
 
 - **npmjs.com** → the package → **Staged Packages** tab → **Approve**, or
 - `npm stage list @gobius/t3ctl` then `npm stage approve <stage-id>`
 
 2FA is required either way. `npm stage view <id>` and `npm stage download <id>`
-let you inspect the exact tarball before approving. Prereleases
-(`1.2.3-beta.0`) target the `next` dist-tag; everything else `latest`.
+let you inspect the exact tarball before approving.
+
+So a release passes two human gates — merging the release PR, and approving the
+staged package — and no long-lived credential is involved in either.
 
 ### Trust boundaries, deliberately
 
@@ -219,7 +223,8 @@ let you inspect the exact tarball before approving. Prereleases
   2FA. A compromised workflow cannot ship anything to users. This is npm's own
   hardened recommendation, and the stage subcommands can't use OIDC tokens by
   design.
-- **Tag-triggered, not push-to-main.** Merging never publishes.
+- **Releases come from merging the release PR**, never from an ordinary merge to
+  main. Everyday commits only update the pending release PR.
 - **`environment: release`.** The OIDC subject npm checks includes the
   environment, so a workflow running outside it cannot publish even from this
   repo. Add required reviewers to that environment in GitHub settings to gate
