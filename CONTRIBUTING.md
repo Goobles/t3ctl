@@ -243,9 +243,15 @@ TypeScript, compiled with `tsc` to `dist/`, which is what gets published.
 ```sh
 npm ci
 npm run typecheck    # tsc --noEmit
-npm run build        # tsc -> dist/
+npm test             # builds, then runs test/*.test.mjs against dist/
 node dist/t3ctl.js --help
 ```
+
+Tests drive the built CLI as a subprocess and assert on the contract a user
+sees — help, exit codes, argument rejection — rather than on internals. They
+run with `HOME` pointed at a nonexistent directory and touch no network, so
+every case works with no hosts registered. CI runs exactly `npm test`; there
+are no assertions living only in the workflow.
 
 `strict` and `noUncheckedIndexedAccess` are both on. Note the workflows run
 `npm ci --ignore-scripts`, so `prepack`/`prepublishOnly` never fire — the build
