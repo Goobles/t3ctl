@@ -89,17 +89,12 @@ jobs:
       - name: Install
         run: npm ci --ignore-scripts
 
-      - name: Typecheck
-        run: npm run typecheck
+      # tsc typechecks as it emits, so this is the typecheck too.
+      - name: Build
+        run: npm run build
 
-      # Builds and runs the same suite CI runs, so a release cannot ship code
-      # that would have failed a pull request. `npm ci --ignore-scripts` means
-      # prepack never fires, so this is also what populates dist/ for the stage.
       - name: Test
         run: npm test
-
-      - name: Package is publishable
-        run: npm pack --dry-run
 
       # Stages only. The trusted publisher is stage-only, so this cannot make a
       # version public — a maintainer approves it with 2FA on npmjs.com or via

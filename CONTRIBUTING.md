@@ -242,10 +242,14 @@ TypeScript, compiled with `tsc` to `dist/`, which is what gets published.
 
 ```sh
 npm ci
-npm run typecheck    # tsc --noEmit
-npm test             # builds, then runs test/*.test.mjs against dist/
+npm run build        # tsc -> dist/ (typechecks as it emits)
+npm test             # runs test/*.test.mjs against dist/
 node dist/t3ctl.js --help
 ```
+
+`npm test` does not build. Both workflows are install -> build -> test, so the
+steps stay honest about what failed; running the tests without a build gives a
+clear message rather than a wall of assertion errors.
 
 Tests drive the built CLI as a subprocess and assert on the contract a user
 sees — help, exit codes, argument rejection — rather than on internals. They

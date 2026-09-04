@@ -16,6 +16,15 @@ const run = promisify(execFile);
 const CLI = fileURLToPath(new URL('../dist/t3ctl.js', import.meta.url));
 const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
 
+// Tests run against the build output, and `npm test` deliberately does not
+// build — the workflows do that as their own step. Fail with something useful
+// rather than a pile of confusing assertion errors.
+try {
+  statSync(CLI);
+} catch {
+  throw new Error(`${CLI} is missing — run \`npm run build\` first`);
+}
+
 /** Run the CLI; never throws, so a test can assert on failures too. */
 const cli = async (...args) => {
   try {
