@@ -46,6 +46,8 @@ jobs:
           node t3ctl.mjs project create 2>&1 | grep -q 'usage:' || { echo "::error::project create usage missing"; exit 1; }
           node t3ctl.mjs thread create  2>&1 | grep -q 'usage:' || { echo "::error::thread create usage missing"; exit 1; }
           node t3ctl.mjs thread start   2>&1 | grep -q 'usage:' || { echo "::error::thread start usage missing"; exit 1; }
+          node t3ctl.mjs host add       2>&1 | grep -q 'usage:' || { echo "::error::host add usage missing"; exit 1; }
+          node t3ctl.mjs host rm        2>&1 | grep -q 'usage:' || { echo "::error::host rm usage missing"; exit 1; }
 
       - name: Package is publishable
         run: npm pack --dry-run
