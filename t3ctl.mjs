@@ -150,14 +150,8 @@ const uniqueName = (base, hosts) => {
 
 const isOrigin = (value) => /^https?:\/\//i.test(value ?? '');
 
-// Two accepted shapes, told apart by the scheme:
-//   host add <origin> [token] [--name <n>]     current
-//   host add <name> <origin> <token>           legacy, still works
-const parseHostAdd = (pos) => {
-  if (isOrigin(pos[0])) return { origin: pos[0], token: pos[1] ?? null, legacy: false };
-  if (isOrigin(pos[1])) return { name: pos[0], origin: pos[1], token: pos[2] ?? null, legacy: true };
-  return null;
-};
+const parseHostAdd = (pos) =>
+  (isOrigin(pos[0]) ? { origin: pos[0], token: pos[1] ?? null } : null);
 
 const HOST_ADD_USAGE = 'usage: t3ctl host add <origin> [token] [--name <name>]\n' +
   '       an origin needs a scheme, e.g. http://localhost:3773';
@@ -167,8 +161,6 @@ const cmdHostAdd = async (pos, flags, hosts) => {
   // usage instead of stalling on a probe.
   const parsed = parseHostAdd(pos);
   if (!parsed) return usage(HOST_ADD_USAGE);
-  if ('name' in flags && !flags.name) return usage(HOST_ADD_USAGE);
-  if (parsed.legacy) warn('"host add <name> <origin> <token>" is deprecated — use: t3ctl host add <origin> [token] [--name <name>]');
 
   const origin = parsed.origin.replace(/\/$/, '');
   const descriptor = await probe(origin);
@@ -425,11 +417,19 @@ const cmdThreadSimple = async (verb, ref, flags) => {
 // commander's option names arrive camelCased; the command implementations were
 // written against the kebab-case spellings, so translate once here rather than
 // touching every call site.
-const toFlags = (o) => ({
-  host: o.host, model: o.model, branch: o.branch, worktree: o.worktree,
-  name: o.name, timeout: o.timeout,
-  'runtime-mode': o.runtimeMode, 'interaction-mode': o.interactionMode,
-});
+const FLAG_NAMES = {
+  host: 'host', model: 'model', branch: 'branch', worktree: 'worktree',
+  name: 'name', timeout: 'timeout',
+  runtimeMode: 'runtime-mode', interactionMode: 'interaction-mode',
+};
+// Only carry options that were actually supplied. Emitting every key
+// unconditionally made `'name' in flags` always true, which made host add bail
+// on every invocation.
+const toFlags = (o) => Object.fromEntries(
+  Object.entries(FLAG_NAMES)
+    .filter(([from]) => o[from] !== undefined)
+    .map(([from, to]) => [to, o[from]]),
+);
 
 const resolve = async (ref, o) => {
   const host = pickHost(toFlags(o));
@@ -460,10 +460,9 @@ const host = program.command('host').description('manage the host registry');
 host.command('add')
   .argument('<origin>', 'base URL of the host, e.g. https://box.tailnet.ts.net:3773')
   .argument('[token]', 'bearer token from `t3 auth session issue` on that host')
-  .argument('[legacy]', 'accepts the older `host add <name> <origin> <token>` form')
   .description('register a host, probing /.well-known/t3/environment first')
   .option('--name <name>', 'override the label detected from the host')
-  .action((a, b, c, o) => cmdHostAdd([a, b, c].filter(Boolean), toFlags(o), readHosts()));
+  .action((origin, token, o) => cmdHostAdd([origin, token].filter(Boolean), toFlags(o), readHosts()));
 
 host.command('rm')
   .argument('<name>', 'registered host name')
@@ -483,7 +482,7 @@ program.command('hosts').description('list registered hosts and probe each one (
 
 const project = program.command('project').description('manage projects');
 hostOption(project.command('create')
-  .argument('<title>')
+  .argument('<title>', 'name for the project as it appears in T3 Code')
   .argument('<workspace-root>', 'existing directory the project maps to')
   .description('create a project for an existing directory'))
   .action((title, root, o) => cmdProjectCreate(title, root, toFlags(o)));
@@ -492,39 +491,39 @@ const thread = program.command('thread').description('create and drive threads')
 
 hostOption(thread.command('create')
   .argument('<project>', 'project id, title, or workspace root')
-  .argument('<title...>')
+  .argument('<title...>', 'thread title; everything after the project is used')
   .description('create a thread (idle — use `thread send` to run it)')
   .option('--model <instance/model>', 'e.g. claudeAgent/claude-opus-5', 'claudeAgent/claude-opus-5')
-  .option('--branch <branch>')
-  .option('--worktree <path>')
-  .option('--runtime-mode <mode>', 'approval-required | auto-accept-edits | auto | full-access')
-  .option('--interaction-mode <mode>', 'default | plan'))
+  .option('--branch <branch>', 'git branch to associate with the thread')
+  .option('--worktree <path>', 'git worktree the thread should run in')
+  .option('--runtime-mode <mode>', 'approval-required | auto-accept-edits | auto | full-access', 'full-access')
+  .option('--interaction-mode <mode>', 'default | plan', 'default'))
   .action((ref, title, o) => cmdThreadCreate(ref, title.join(' '), toFlags(o)));
 
 hostOption(thread.command('send')
   .alias('start')
   .argument('<thread>', 'thread id, exact title, or unique substring')
-  .argument('<message...>')
+  .argument('<message...>', 'the message; everything after the thread is sent')
   .description('send a message to a thread and run the agent')
-  .option('--model <instance/model>', 'override the thread\'s model for this turn')
-  .option('--runtime-mode <mode>')
-  .option('--interaction-mode <mode>'))
+  .option('--model <instance/model>', "override the thread's model for this turn")
+  .option('--runtime-mode <mode>', 'approval-required | auto-accept-edits | auto | full-access')
+  .option('--interaction-mode <mode>', 'default | plan'))
   .action(async (ref, message, o) => {
     const { host: h, thread: t } = await resolve(ref, o);
     return cmdThreadStart(t, h, message.join(' '), toFlags(o));
   });
 
 hostOption(thread.command('rename')
-  .argument('<thread>')
-  .argument('<title...>')
-  .description('set a thread title'))
+  .argument('<thread>', 'thread id, exact title, or unique substring')
+  .argument('<title...>', 'the new title')
+  .description('set a thread title directly'))
   .action(async (ref, title, o) => {
     const { host: h, thread: t } = await resolve(ref, o);
     return cmdThreadRename(t, h, title.join(' '));
   });
 
 hostOption(thread.command('retitle')
-  .argument('<thread>')
+  .argument('<thread>', 'thread id, exact title, or unique substring')
   .description('ask the server to derive a title; warns if it produces none')
   .option('--timeout <seconds>', 'how long to wait for a title', '30'))
   .action(async (ref, o) => {
@@ -532,14 +531,25 @@ hostOption(thread.command('retitle')
     return cmdThreadRetitle(t, h, Number(o.timeout) > 0 ? Number(o.timeout) : 30);
   });
 
-hostOption(thread.command('interrupt').argument('<thread>').description('stop the running turn'))
+hostOption(thread.command('interrupt')
+  .argument('<thread>', 'thread id, exact title, or unique substring')
+  .description('stop the turn currently running in a thread'))
   .action(async (ref, o) => {
     const { host: h, thread: t } = await resolve(ref, o);
     return cmdThreadInterrupt(t, h);
   });
 
+const VERB_HELP = {
+  settle: 'mark a thread done so it drops out of the active list',
+  archive: 'hide a thread from the default listing (reversible)',
+  unarchive: 'bring an archived thread back into the default listing',
+  unpin: 'remove a thread from the pinned section',
+  delete: 'delete a thread',
+};
 for (const verb of SIMPLE_THREAD_COMMANDS) {
-  hostOption(thread.command(verb).argument('<thread>').description(`${verb} a thread`))
+  hostOption(thread.command(verb)
+    .argument('<thread>', 'thread id, exact title, or unique substring')
+    .description(VERB_HELP[verb] ?? `${verb} a thread`))
     .action((ref, o) => cmdThreadSimple(verb, ref, toFlags(o)));
 }
 
