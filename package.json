@@ -1,10 +1,34 @@
 {
   "name": "t3ctl",
   "version": "0.1.0",
-  "private": true,
   "type": "module",
   "description": "Controller CLI for T3 Code hosts — list and drive threads across machines",
-  "bin": { "t3ctl": "./t3ctl.mjs" },
-  "engines": { "node": ">=22" },
-  "license": "MIT"
+  "keywords": [
+    "t3",
+    "t3code",
+    "cli",
+    "agents",
+    "coding-agents"
+  ],
+  "license": "MIT",
+  "author": "Gobius Dolhain (https://github.com/Goobles)",
+  "homepage": "https://github.com/Goobles/t3ctl#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Goobles/t3ctl.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Goobles/t3ctl/issues"
+  },
+  "bin": {
+    "t3ctl": "t3ctl.mjs"
+  },
+  "files": [
+    "t3ctl.mjs",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=22"
+  }
 }
