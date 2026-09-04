@@ -156,7 +156,7 @@ t3ctl project create t3ctl ~/Code/t3ctl
 ### `t3ctl thread create <project> <title>`
 
 Create a thread. This produces an **idle thread with no messages** — it does not
-start the agent. Use `thread start` for that.
+start the agent. Use `thread send` for that.
 
 ```sh
 t3ctl thread create t3ctl "rewrite the readme for users" --branch docs/readme
@@ -176,13 +176,15 @@ Flags:
 `--model` splits on the **first** slash, so slashed model names work as-is:
 `--model opencode/github-copilot/gpt-5.4`.
 
-### `t3ctl thread start <thread> <message...>`
+### `t3ctl thread send <thread> <message...>`
 
-Send a message and run the agent. Everything after the thread reference is the
+Send a message to a thread and run the agent. This is how you continue a
+conversation — it is the same thing the app does for every message you type,
+first or fiftieth. Aliased as `thread start`, the name it shipped under in 0.2.0. Everything after the thread reference is the
 message — no quoting needed.
 
 ```sh
-t3ctl thread start "rewrite the readme" move the endpoint tables into CONTRIBUTING.md
+t3ctl thread send "rewrite the readme" move the endpoint tables into CONTRIBUTING.md
 ```
 
 ```
@@ -195,11 +197,24 @@ started rewrite the readme for users
 
 Accepts `--model`, `--runtime-mode`, `--interaction-mode`, and `--host`. Unlike
 `thread create`, `--model` has no default here: the thread's existing model is
-reused unless you override it. Use `--interaction-mode plan` to make the agent
-plan instead of edit:
+reused unless you override it.
+
+### `t3ctl thread rename <thread> <new title...>`
+
+Rename a thread. Useful when a thread was created from a script and ended up with
+a title like a filename.
 
 ```sh
-t3ctl thread start "flaky release workflow" --interaction-mode plan why does the tag job race?
+t3ctl thread rename "probe well-known" Verify hosts with the environment descriptor
+```
+
+### `t3ctl thread retitle <thread>`
+
+Ask the server to derive a title from the thread's own content, instead of
+supplying one. Handy when you cannot think of a good name.
+
+```sh
+t3ctl thread retitle "probe well-known"
 ```
 
 ### `t3ctl thread interrupt <thread>`
@@ -249,7 +264,7 @@ Write commands act on one host. With a single host registered, that one is
 implied. With more than one, pass `--host`:
 
 ```sh
-t3ctl thread start --host desktop "api rate limits" pick this back up
+t3ctl thread send --host desktop "api rate limits" pick this back up
 ```
 
 Otherwise you get `multiple hosts; pass --host <laptop|desktop>`.

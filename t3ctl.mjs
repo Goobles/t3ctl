@@ -364,15 +364,43 @@ const cmdProject = async (args) => {
   console.log(`created project ${bold(title)} on ${host.name}\n  id   ${projectId}\n  root ${workspaceRoot}\n  seq  ${sequence}`);
 };
 
+
+// thread.meta.update also accepts regenerateTitle:true, which asks the server to
+// derive a title from the thread's own content instead of taking one from us.
+const cmdThreadRename = async (thread, host, title) => {
+  const command = {
+    type: 'thread.meta.update', commandId: crypto.randomUUID(), threadId: thread.id,
+    ...(title === null ? { regenerateTitle: true } : { title }),
+  };
+  const { sequence } = await dispatch(host, command);
+  console.log(title === null
+    ? `retitling ${bold(thread.title || thread.id)} from its content\n  seq ${sequence}`
+    : `renamed ${dim(thread.title || thread.id)} -> ${bold(title)}\n  seq ${sequence}`);
+};
+
 const cmdThread = async (args) => {
   const [sub, ...rest] = args;
   const { flags, pos } = parseArgs(rest);
-  if (sub === 'start' || sub === 'interrupt') {
+  // `send` is the accurate name: thread.turn.start posts a message to a thread and
+  // runs a turn, which is exactly what the UI does for every message, first or not.
+  // `start` stays as an alias because it shipped in 0.2.0.
+  const isSend = sub === 'send' || sub === 'start';
+
+  if (sub === 'rename' || sub === 'retitle') {
+    const [ref, ...titleParts] = pos;
+    if (!ref) return usage(`usage: t3ctl thread ${sub} <thread>` + (sub === 'rename' ? ' <new title...>' : ''));
+    const title = sub === 'retitle' ? null : titleParts.join(' ');
+    if (sub === 'rename' && !title) return usage('usage: t3ctl thread rename <thread> <new title...>');
+    const host = pickHost(flags);
+    return cmdThreadRename(resolveThread(await snapshot(host), ref), host, title);
+  }
+
+  if (isSend || sub === 'interrupt') {
     // Validate arguments before touching the host registry, so `t3ctl thread
-    // start` with no args prints usage instead of "no hosts registered".
+    // send` with no args prints usage instead of "no hosts registered".
     const [ref, ...rest2] = pos;
-    if (!ref) return usage(`usage: t3ctl thread ${sub} <thread>` + (sub === 'start' ? ' <message...>' : ''));
-    if (sub === 'start' && rest2.length === 0) return usage('usage: t3ctl thread start <thread> <message...>');
+    if (!ref) return usage(`usage: t3ctl thread ${sub} <thread>` + (isSend ? ' <message...>' : ''));
+    if (isSend && rest2.length === 0) return usage(`usage: t3ctl thread ${sub} <thread> <message...>`);
     const host = pickHost(flags);
     const thread = resolveThread(await snapshot(host), ref);
     if (sub === 'interrupt') return cmdThreadInterrupt(thread, host);
@@ -429,7 +457,10 @@ if (!commands[cmd]) {
   t3ctl project create <title> <root>           create a project for an existing dir
   t3ctl thread create <project> <title>         start a thread (--model inst/model,
                                                 --branch, --host)
-  t3ctl thread start <thread> <message...>      send a message and run the agent
+  t3ctl thread send <thread> <message...>       send a message and run the agent
+                                                (alias: start)
+  t3ctl thread rename <thread> <title...>       rename a thread
+  t3ctl thread retitle <thread>                 let the server derive the title
   t3ctl thread interrupt <thread>               stop the running turn
   t3ctl thread settle <thread>                  settle a thread (also: archive,
                                                 unarchive, unpin, delete)`);
