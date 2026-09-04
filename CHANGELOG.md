@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.0](https://github.com/Goobles/t3ctl/compare/v0.4.0...v0.5.0) (2026-09-04)
+
+
+### Features
+
+* move the CLI onto commander ([#10](https://github.com/Goobles/t3ctl/issues/10)) ([bf3f6ff](https://github.com/Goobles/t3ctl/commit/bf3f6ffdbd21864f54607f4dd881d557108dfc41))
+
 ## [0.4.0](https://github.com/Goobles/t3ctl/compare/v0.3.0...v0.4.0) (2026-09-04)
 
 
