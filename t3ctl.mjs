@@ -171,6 +171,27 @@ const resolveProject = (snap, ref) =>
   snap.projects.find((p) => !p.deletedAt && p.title === ref) ??
   snap.projects.find((p) => !p.deletedAt && p.workspaceRoot === path.resolve(ref.replace(/^~/, os.homedir())));
 
+
+// Commands whose entire payload is {commandId, threadId}. Verified against
+// packages/contracts/src/orchestration.ts — note `unsettle` is NOT one of
+// these (it carries extra fields), so it is deliberately absent.
+const SIMPLE_THREAD_COMMANDS = ['settle', 'archive', 'unarchive', 'unpin', 'delete'];
+
+const resolveThread = (snap, ref) => {
+  const live = snap.threads.filter((t) => !t.deletedAt);
+  const byId = live.find((t) => t.id === ref);
+  if (byId) return byId;
+  const exact = live.filter((t) => t.title === ref);
+  if (exact.length === 1) return exact[0];
+  const fuzzy = live.filter((t) => (t.title ?? '').toLowerCase().includes(ref.toLowerCase()));
+  if (fuzzy.length === 1) return fuzzy[0];
+  if (fuzzy.length > 1) {
+    throw new Error(`"${ref}" matches ${fuzzy.length} threads:\n` +
+      fuzzy.slice(0, 8).map((t) => `  ${t.id}  ${t.title}`).join('\n'));
+  }
+  throw new Error(`no thread matching "${ref}"`);
+};
+
 const cmdProject = async (args) => {
   const [sub, ...rest] = args;
   const { flags, pos } = parseArgs(rest);
@@ -191,7 +212,16 @@ const cmdProject = async (args) => {
 const cmdThread = async (args) => {
   const [sub, ...rest] = args;
   const { flags, pos } = parseArgs(rest);
-  if (sub !== 'create') return console.error('usage: t3ctl thread create <project> <title> [--model <instance>/<model>] [--branch <b>] [--host <name>]');
+  if (SIMPLE_THREAD_COMMANDS.includes(sub)) {
+    const host = pickHost(flags);
+    const thread = resolveThread(await snapshot(host), pos.join(' '));
+    const { sequence } = await dispatch(host, {
+      type: `thread.${sub}`, commandId: crypto.randomUUID(), threadId: thread.id,
+    });
+    console.log(`${sub}d ${bold(thread.title || thread.id)}\n  id  ${thread.id}\n  seq ${sequence}`);
+    return;
+  }
+  if (sub !== 'create') return console.error('usage: t3ctl thread create <project> <title> [--model <instance>/<model>] [--branch <b>] [--host <name>]\n       t3ctl thread <settle|archive|unarchive|unpin|delete> <thread>');
   const [projectRef, ...titleParts] = pos;
   const title = titleParts.join(' ');
   if (!projectRef || !title) return console.error('usage: t3ctl thread create <project> <title> [--model <instance>/<model>] [--branch <b>] [--host <name>]');
@@ -231,7 +261,9 @@ if (!commands[cmd]) {
 
   t3ctl project create <title> <root>           create a project for an existing dir
   t3ctl thread create <project> <title>         start a thread (--model inst/model,
-                                                --branch, --host)`);
+                                                --branch, --host)
+  t3ctl thread settle <thread>                  settle a thread (also: archive,
+                                                unarchive, unpin, delete)`);
   process.exit(cmd ? 1 : 0);
 }
 await commands[cmd](rest);

@@ -18,8 +18,12 @@ T3 Code is MIT-licensed open source. **Read the source before guessing at anythi
     t3ctl host add <name> <origin> <token>
     t3ctl project create <title> <workspace-root>
     t3ctl thread create <project> <title> [--model <instance>/<model>] [--branch <b>]
+    t3ctl thread settle|archive|unarchive|unpin|delete <thread>
 
-`<project>` resolves by id, title, or workspace root. `--model` defaults to
+`<project>` resolves by id, title, or workspace root. `<thread>` resolves by id,
+exact title, then unique case-insensitive substring (ambiguous matches are listed,
+not guessed). The five verb commands above are exactly those whose payload is
+`{commandId, threadId}`; `unsettle` carries extra fields and is not among them. `--model` defaults to
 `claudeAgent/claude-opus-5`; `instanceId` is the segment before the first slash
 (opencode models are themselves slashed, e.g. `opencode/github-copilot/gpt-5.4`).
 
