@@ -281,8 +281,22 @@ agreement, and stages it again for approval.
 
 `npm stage` moves `dist-tags.latest` to the staged version immediately, but the
 version is not fetchable until it is approved. In between, `npm i @gobius/t3ctl`
-fails with `ETARGET` for anyone tracking `latest`. It resolves the moment you
-approve, so approve promptly rather than leaving releases staged.
+fails with `ETARGET` for anyone tracking `latest`.
+
+This window cannot be shortened by being quick. npm runs an automated review
+first and the Approve button stays disabled until it finishes. Measured on 0.3.0:
+
+```
+staged     2026-09-04T12:26:09Z
+published  2026-09-04T12:35:43Z   → 9m34s unfetchable
+```
+
+So every release currently has a ~10 minute outage for anyone installing
+`latest`. That is acceptable while nothing depends on this package. If that
+changes, stage under a holding tag instead (`npm stage publish . --tag next`),
+which leaves `latest` on the previous published version, and move the tag after
+approval with `npm dist-tag add @gobius/t3ctl@X.Y.Z latest`. That costs one
+authenticated command per release and removes the outage entirely.
 
 So a release passes two human gates — merging the release PR, and approving the
 staged package — and no long-lived credential is involved in either.
