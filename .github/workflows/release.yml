@@ -1,0 +1,72 @@
+name: release
+
+# Publishing is deliberate: it happens only when a v* tag is pushed, never as a
+# side effect of merging to main.
+on:
+  push:
+    tags: ["v*"]
+
+# Deny by default; each job opts into the minimum it needs.
+permissions: {}
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+
+    # Trust boundary. The OIDC subject npm verifies includes this environment,
+    # so a workflow running outside it cannot publish even from this repo.
+    # Add required reviewers to this environment to gate releases on a human.
+    environment:
+      name: release
+      url: https://www.npmjs.com/package/@gobius/t3ctl
+
+    permissions:
+      contents: read # read the tagged source
+      id-token: write # mint the short-lived OIDC token npm verifies
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Don't leave the job's GITHUB_TOKEN behind in .git/config.
+          persist-credentials: false
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "24"
+          registry-url: "https://registry.npmjs.org"
+
+      # Trusted publishing requires npm >= 11.5.1; don't rely on what Node ships.
+      - name: Ensure npm supports trusted publishing
+        run: |
+          npm install -g npm@latest
+          npm --version
+
+      # A tag that disagrees with package.json means someone tagged the wrong
+      # commit. Fail before anything is published rather than after.
+      - name: Verify tag matches package.json
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          pkg="$(node -p 'require("./package.json").version')"
+          echo "tag=$tag package.json=$pkg"
+          [ "$tag" = "$pkg" ] || { echo "::error::tag v$tag does not match package.json $pkg"; exit 1; }
+
+      # Cheap smoke test. The package has no dependencies and no build step, so
+      # this is the whole surface: it parses and the CLI runs.
+      - name: Smoke test
+        run: |
+          node --check t3ctl.mjs
+          node t3ctl.mjs | head -1
+          npm pack --dry-run
+
+      # No NPM_TOKEN. Auth is the OIDC token minted above; npm also generates a
+      # provenance attestation linking the package to this commit and workflow.
+      # Prereleases (1.2.3-beta.0) go to `next` so they never become `latest`.
+      - name: Publish
+        run: |
+          version="$(node -p 'require("./package.json").version')"
+          case "$version" in
+            *-*) dist_tag=next ;;
+            *)   dist_tag=latest ;;
+          esac
+          echo "publishing $version to dist-tag $dist_tag"
+          npm publish --provenance --tag "$dist_tag" --ignore-scripts

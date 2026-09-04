@@ -93,6 +93,41 @@ Most-urgent-first: `running` (`session.activeTurnId` or `session.status==="runni
   `.../environment-link-challenges`, `.../devices`. Not implemented here yet; see
   `docs/internals/t3-connect.md` and `packages/contracts/src/relay.ts`.
 
+## Releasing
+
+Publishing runs in CI via **npm trusted publishing (OIDC)**. There is no `NPM_TOKEN`
+anywhere — not in the workflow, not in repo secrets. CI proves its identity with a
+short-lived OIDC token that npm verifies against a configured trusted publisher, so
+there is no long-lived credential to leak, rotate, or exfiltrate. npm also attaches a
+provenance attestation linking the tarball to the exact commit and workflow run.
+
+To cut a release:
+
+    npm version minor          # or patch/major; commits and tags
+    git push origin main --follow-tags
+
+The `v*` tag triggers `.github/workflows/release.yml`. Prereleases (`1.2.3-beta.0`)
+publish to the `next` dist-tag; everything else to `latest`.
+
+Trust boundaries, deliberately:
+
+- **Tag-triggered, not push-to-main.** Merging never publishes.
+- **`environment: release`.** The OIDC subject npm checks includes the environment,
+  so a workflow running outside it cannot publish even from this repo. Add required
+  reviewers to that environment in GitHub settings to gate releases on a human.
+- **`permissions: {}` at the top**, with the job opting into only `contents: read`
+  and `id-token: write`.
+- **Actions pinned to full commit SHAs**, so a moved tag cannot swap the code.
+- **`persist-credentials: false`**, so the job's token isn't left in `.git/config`.
+- **`--ignore-scripts`** on publish, and the package has zero dependencies, so no
+  third-party code executes in the release job.
+- **Tag/version agreement is enforced** before publishing, not after.
+
+One-time setup on npmjs.com (package → Settings → Trusted Publisher):
+organization/user `Goobles`, repository `t3ctl`, workflow `release.yml`,
+environment `release`. Once that works, consider disallowing token-based publishes
+for the package entirely so CI becomes the only path.
+
 ## Caveats
 
 - Unofficial client. Built against T3 Code Nightly; pin to `snapshot` + `dispatch`.
