@@ -1,33 +1,52 @@
 name: release
 
-# Publishing is deliberate: it happens only when a v* tag is pushed, never as a
-# side effect of merging to main.
+# release-please watches main, derives the next version from Conventional
+# Commits, and maintains a release PR. Merging that PR creates the tag and
+# GitHub release, which is what actually triggers a publish.
 on:
   push:
-    tags: ["v*"]
+    branches: ["main"]
 
-# Deny by default; each job opts into the minimum it needs.
 permissions: {}
 
 jobs:
-  publish:
+  release-please:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # create the release branch, tag and GitHub release
+      pull-requests: write # open and groom the release PR
+    outputs:
+      release_created: ${{ steps.rp.outputs.release_created }}
+      tag_name: ${{ steps.rp.outputs.tag_name }}
+      version: ${{ steps.rp.outputs.version }}
+    steps:
+      - uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
+        id: rp
+        with:
+          release-type: node
+
+  # Separate job so publish rights never coexist with contents:write, and so a
+  # tag created by GITHUB_TOKEN still reaches this step — a tag push alone would
+  # not trigger a second workflow.
+  stage:
+    needs: release-please
+    if: needs.release-please.outputs.release_created == 'true'
     runs-on: ubuntu-latest
 
-    # Trust boundary. The OIDC subject npm verifies includes this environment,
-    # so a workflow running outside it cannot publish even from this repo.
-    # Add required reviewers to this environment to gate releases on a human.
+    # Trust boundary. npm's trusted publisher pins this workflow filename AND
+    # this environment; add required reviewers here to gate on a human.
     environment:
       name: release
       url: https://www.npmjs.com/package/@gobius/t3ctl
 
     permissions:
-      contents: read # read the tagged source
+      contents: read
       id-token: write # mint the short-lived OIDC token npm verifies
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          # Don't leave the job's GITHUB_TOKEN behind in .git/config.
+          ref: ${{ needs.release-please.outputs.tag_name }}
           persist-credentials: false
 
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
@@ -35,54 +54,43 @@ jobs:
           node-version: "24"
           registry-url: "https://registry.npmjs.org"
 
-      # Trusted publishing requires npm >= 11.5.1; don't rely on what Node ships.
       - name: Ensure npm supports trusted publishing
         run: |
           npm install -g npm@latest
           npm --version
 
-      # A tag that disagrees with package.json means someone tagged the wrong
-      # commit. Fail before anything is published rather than after.
       - name: Verify tag matches package.json
         run: |
-          tag="${GITHUB_REF_NAME#v}"
+          tag="${TAG#v}"
           pkg="$(node -p 'require("./package.json").version')"
           echo "tag=$tag package.json=$pkg"
           [ "$tag" = "$pkg" ] || { echo "::error::tag v$tag does not match package.json $pkg"; exit 1; }
+        env:
+          TAG: ${{ needs.release-please.outputs.tag_name }}
 
-      # Cheap smoke test. The package has no dependencies and no build step, so
-      # this is the whole surface: it parses and the CLI runs.
       - name: Smoke test
         run: |
           node --check t3ctl.mjs
           node t3ctl.mjs | head -1
           npm pack --dry-run
 
-      # No NPM_TOKEN. Auth is the OIDC token minted above; npm also generates a
-      # provenance attestation linking the package to this commit and workflow.
-      #
-      # This STAGES the release rather than publishing it. The trusted publisher
-      # is deliberately configured stage-only, so this workflow cannot make a
-      # version public on its own — a maintainer must run
-      #   npm stage list && npm stage approve <stage-id> --otp <code>
-      # Proof-of-presence (2FA) is deferred to that step, which means a
-      # compromised workflow still cannot ship anything to users.
-      #
-      # Prereleases (1.2.3-beta.0) target `next` so they never become `latest`.
+      # Stages only. The trusted publisher is stage-only, so this cannot make a
+      # version public — a maintainer approves it with 2FA on npmjs.com or via
+      # `npm stage approve`. release-please only emits stable semver, so there
+      # is no prerelease dist-tag to special-case.
       - name: Stage release
         run: |
-          version="$(node -p 'require("./package.json").version')"
-          case "$version" in
-            *-*) dist_tag=next ;;
-            *)   dist_tag=latest ;;
-          esac
-          echo "staging $version for dist-tag $dist_tag"
-          npm stage publish . --provenance --tag "$dist_tag" --ignore-scripts
+          echo "staging $(node -p 'require("./package.json").version')"
+          npm stage publish . --provenance --tag latest --ignore-scripts
 
-      - name: Show how to promote
+      - name: Promote instructions
         run: |
-          echo "Staged. Promote from a trusted machine:" >> "$GITHUB_STEP_SUMMARY"
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
-          echo 'npm stage list @gobius/t3ctl' >> "$GITHUB_STEP_SUMMARY"
-          echo 'npm stage approve <stage-id> --otp <code>' >> "$GITHUB_STEP_SUMMARY"
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo "### Staged — awaiting approval"
+            echo ""
+            echo "Approve on [npmjs.com](https://www.npmjs.com/package/@gobius/t3ctl) under **Staged Packages**, or:"
+            echo '```'
+            echo "npm stage list @gobius/t3ctl"
+            echo "npm stage approve <stage-id>"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
