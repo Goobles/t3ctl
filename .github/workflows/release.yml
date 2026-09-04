@@ -60,13 +60,29 @@ jobs:
 
       # No NPM_TOKEN. Auth is the OIDC token minted above; npm also generates a
       # provenance attestation linking the package to this commit and workflow.
-      # Prereleases (1.2.3-beta.0) go to `next` so they never become `latest`.
-      - name: Publish
+      #
+      # This STAGES the release rather than publishing it. The trusted publisher
+      # is deliberately configured stage-only, so this workflow cannot make a
+      # version public on its own — a maintainer must run
+      #   npm stage list && npm stage approve <stage-id> --otp <code>
+      # Proof-of-presence (2FA) is deferred to that step, which means a
+      # compromised workflow still cannot ship anything to users.
+      #
+      # Prereleases (1.2.3-beta.0) target `next` so they never become `latest`.
+      - name: Stage release
         run: |
           version="$(node -p 'require("./package.json").version')"
           case "$version" in
             *-*) dist_tag=next ;;
             *)   dist_tag=latest ;;
           esac
-          echo "publishing $version to dist-tag $dist_tag"
-          npm publish --provenance --tag "$dist_tag" --ignore-scripts
+          echo "staging $version for dist-tag $dist_tag"
+          npm stage publish . --provenance --tag "$dist_tag" --ignore-scripts
+
+      - name: Show how to promote
+        run: |
+          echo "Staged. Promote from a trusted machine:" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          echo 'npm stage list @gobius/t3ctl' >> "$GITHUB_STEP_SUMMARY"
+          echo 'npm stage approve <stage-id> --otp <code>' >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"

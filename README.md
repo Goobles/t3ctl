@@ -106,11 +106,22 @@ To cut a release:
     npm version minor          # or patch/major; commits and tags
     git push origin main --follow-tags
 
-The `v*` tag triggers `.github/workflows/release.yml`. Prereleases (`1.2.3-beta.0`)
-publish to the `next` dist-tag; everything else to `latest`.
+The `v*` tag triggers `.github/workflows/release.yml`, which **stages** the release.
+CI cannot make a version public: the trusted publisher is configured stage-only, so
+a maintainer must promote it with 2FA. Either:
+
+- **npmjs.com** → the package → **Staged Packages** tab → **Approve**, or
+- `npm stage list @gobius/t3ctl` then `npm stage approve <stage-id>`
+
+2FA is required either way. `npm stage view <id>` and `npm stage download <id>` let
+you inspect the exact tarball before approving. Prereleases (`1.2.3-beta.0`) target
+the `next` dist-tag; everything else `latest`.
 
 Trust boundaries, deliberately:
 
+- **Staged, not published.** CI stages with provenance; a human promotes with 2FA.
+  A compromised workflow cannot ship anything to users. This is npm's own hardened
+  recommendation, and the stage subcommands can't use OIDC tokens by design.
 - **Tag-triggered, not push-to-main.** Merging never publishes.
 - **`environment: release`.** The OIDC subject npm checks includes the environment,
   so a workflow running outside it cannot publish even from this repo. Add required
@@ -125,8 +136,9 @@ Trust boundaries, deliberately:
 
 One-time setup on npmjs.com (package → Settings → Trusted Publisher):
 organization/user `Goobles`, repository `t3ctl`, workflow `release.yml`,
-environment `release`. Once that works, consider disallowing token-based publishes
-for the package entirely so CI becomes the only path.
+environment `release`. Grant it `npm stage publish` only — not `npm publish`.
+Once that works, consider disallowing token-based publishes for the package entirely
+so this pipeline becomes the only path in.
 
 ## Caveats
 
