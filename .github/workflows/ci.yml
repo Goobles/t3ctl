@@ -1,0 +1,59 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: ["main"]
+
+permissions: {}
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    strategy:
+      fail-fast: false
+      matrix:
+        # package.json declares engines.node >= 22, so prove both ends of that
+        # claim rather than only whatever the release job happens to use.
+        node: ["22", "24"]
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ matrix.node }}
+
+      # Zero dependencies and no build step, so there is nothing to install.
+      - name: Parse
+        run: node --check t3ctl.mjs
+
+      - name: CLI runs and prints help
+        run: |
+          out="$(node t3ctl.mjs)"
+          echo "$out"
+          echo "$out" | grep -q 't3ctl ls' || { echo "::error::help output missing expected commands"; exit 1; }
+
+      # Exercise the arg-parsing paths that don't need a host, so a typo in the
+      # command table fails here rather than at release time.
+      - name: Subcommand usage paths
+        run: |
+          node t3ctl.mjs project create 2>&1 | grep -q 'usage:' || { echo "::error::project create usage missing"; exit 1; }
+          node t3ctl.mjs thread create  2>&1 | grep -q 'usage:' || { echo "::error::thread create usage missing"; exit 1; }
+          node t3ctl.mjs thread start   2>&1 | grep -q 'usage:' || { echo "::error::thread start usage missing"; exit 1; }
+
+      - name: Package is publishable
+        run: npm pack --dry-run
+
+      # The release job enforces this too, but catching it on the PR means a bad
+      # version never reaches a tag in the first place.
+      - name: bin target exists and is executable
+        run: |
+          bin="$(node -p 'require("./package.json").bin.t3ctl')"
+          test -f "$bin" || { echo "::error::bin target $bin missing"; exit 1; }
+          head -1 "$bin" | grep -q '^#!/usr/bin/env node' || { echo "::error::$bin missing shebang"; exit 1; }
