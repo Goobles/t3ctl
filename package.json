@@ -1,0 +1,10 @@
+{
+  "name": "t3ctl",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Controller CLI for T3 Code hosts — list and drive threads across machines",
+  "bin": { "t3ctl": "./t3ctl.mjs" },
+  "engines": { "node": ">=22" },
+  "license": "MIT"
+}
