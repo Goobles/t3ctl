@@ -7,12 +7,19 @@ T3 Code is MIT-licensed open source. **Read the source before guessing at anythi
 `docs/user/remote-access.md`, `docs/internals/environment-auth.md`,
 `docs/internals/t3-connect.md`, and `packages/contracts/src/orchestration.ts`.
 
-## Status: spike (read-only) working
+## Status: local read + write working; relay transport not started
 
-    node t3ctl.mjs ls              # projects + status badges, per host
-    node t3ctl.mjs ls --threads    # expand threads
-    node t3ctl.mjs ls --json       # machine-readable
-    node t3ctl.mjs host add <name> <origin> <token>
+    t3ctl ls [-t|--threads] [-a|--all] [--json]
+    t3ctl host add <name> <origin> <token>
+    t3ctl project create <title> <workspace-root>
+    t3ctl thread create <project> <title> [--model <instance>/<model>] [--branch <b>]
+
+`<project>` resolves by id, title, or workspace root. `--model` defaults to
+`claudeAgent/claude-opus-5`; `instanceId` is the segment before the first slash
+(opencode models are themselves slashed, e.g. `opencode/github-copilot/gpt-5.4`).
+
+`thread create` creates an *idle* thread — it does not start the agent. Kicking off
+a turn needs `thread.message-sent` + `thread.turn-start-requested` (not implemented).
 
 ## Auth
 
