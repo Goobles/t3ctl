@@ -193,13 +193,27 @@ construction. What produces a reachable origin:
 - **SSH** — any manual port-forward works. T3 Code's own SSH *launch* feature
   (the desktop app starting a remote server and forwarding for you) is
   desktop-only today.
-- **T3 Connect relay** (`relay.t3.codes`) — **NOT IMPLEMENTED in t3ctl.** This
-  is the account-level environment registry that mobile uses off-tailnet. The
+- **T3 Connect relay** (`relay.t3.codes`) — **NOT PLANNED for t3ctl.** This is
+  the account-level environment registry that mobile uses off-tailnet. The
   client-side API is `/v1/client/environment-links`, `.../dpop-token`,
-  `.../environment-link-challenges`, `.../devices`; auth is DPoP-bound rather
-  than a plain bearer, which is why it isn't a drop-in for the existing client.
-  See `docs/internals/t3-connect.md` and `packages/contracts/src/relay.ts`.
-  Nothing in the codebase talks to the relay — do not describe it as working.
+  `.../environment-link-challenges`, `.../devices`.
+
+  It is closed to third-party clients by construction, not merely unimplemented.
+  The `dpop-token` handler calls `verifyClerkBearerToken` on `subject_token` and
+  fails outright if that fails — unlike `verifyRelayClientBearerToken`, which
+  falls back to Clerk OAuth tokens, this path has no fallback. So the exchange
+  needs a Clerk **session** JWT carrying the configured relay audience, which
+  only T3's own signed-in clients hold. On top of that,
+  `allowedScopesByClientId` keys the grantable scopes by `client_id`, and
+  `RelayPublicClientId` is `["t3-mobile", "t3-web"]` — an unknown `client_id`
+  resolves to no scopes and the request is rejected before auth even matters.
+  DPoP binding is then a third requirement on top.
+
+  Sources: `infra/relay/src/http/Api.ts` (`exchangeDpopAccessToken`,
+  `verifyClerkBearerToken`), `infra/relay/src/auth/RelayTokens.ts`
+  (`allowedScopesByClientId`), `packages/contracts/src/relay.ts`, and
+  `docs/internals/t3-connect.md`. Nothing in t3ctl talks to the relay — do not
+  describe it as working, and do not describe it as merely pending.
 
 ## Known rough edges
 

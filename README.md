@@ -304,8 +304,10 @@ t3ctl ls -t
 up as `unreachable` and don't block the rest.
 
 T3 Code's own **T3 Connect relay** (what the mobile app uses when you're off your
-tailnet) is **not implemented in t3ctl** — the transports above are the options
-today.
+tailnet) is **not planned**: the relay's `dpop-token` exchange only accepts a
+Clerk *session* JWT carrying the relay audience, and its allowed scopes are keyed
+by `client_id`, which is pinned to `t3-mobile` and `t3-web`. A third-party CLI has
+no way to present either. The transports above are the options.
 
 ## Limitations
 
