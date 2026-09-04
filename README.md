@@ -18,6 +18,8 @@ T3 Code is MIT-licensed open source. **Read the source before guessing at anythi
     t3ctl host add <name> <origin> <token>
     t3ctl project create <title> <workspace-root>
     t3ctl thread create <project> <title> [--model <instance>/<model>] [--branch <b>]
+    t3ctl thread start <thread> <message...>  [--interaction-mode plan] [--model ...]
+    t3ctl thread interrupt <thread>
     t3ctl thread settle|archive|unarchive|unpin|delete <thread>
 
 `<project>` resolves by id, title, or workspace root. `<thread>` resolves by id,
@@ -28,7 +30,7 @@ not guessed). The five verb commands above are exactly those whose payload is
 (opencode models are themselves slashed, e.g. `opencode/github-copilot/gpt-5.4`).
 
 `thread create` creates an *idle* thread with no messages — it does not start the
-agent. The UI never produces this state: it always fires `thread.create` immediately
+agent; use `thread start` for that. The UI never produces this state: it always fires `thread.create` immediately
 followed by `thread.turn.start`, a single command that carries the first message
 inline (`message: {messageId, role, text, attachments}` plus a `titleSeed`).
 `thread.message-sent` and `thread.turn-start-requested` are the resulting *events*,

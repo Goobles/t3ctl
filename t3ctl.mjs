@@ -192,6 +192,42 @@ const resolveThread = (snap, ref) => {
   throw new Error(`no thread matching "${ref}"`);
 };
 
+
+// thread.turn.start is ONE command carrying the first message inline — this is
+// what the UI fires immediately after thread.create, which is why a thread with
+// no messages is a state the UI never produces. The client-side schema requires
+// runtimeMode/interactionMode explicitly (the server-side one defaults them).
+const cmdThreadStart = async (thread, host, text, flags) => {
+  const command = {
+    type: 'thread.turn.start',
+    commandId: crypto.randomUUID(),
+    threadId: thread.id,
+    message: { messageId: crypto.randomUUID(), role: 'user', text, attachments: [] },
+    runtimeMode: flags['runtime-mode'] ?? thread.runtimeMode ?? 'full-access',
+    interactionMode: flags['interaction-mode'] ?? 'default',
+    createdAt: new Date().toISOString(),
+  };
+  if (flags.model) {
+    const slash = flags.model.indexOf('/');
+    if (slash < 1) throw new Error(`--model must be <instance>/<model>, got "${flags.model}"`);
+    command.modelSelection = { instanceId: flags.model.slice(0, slash), model: flags.model.slice(slash + 1) };
+  } else if (thread.modelSelection) {
+    command.modelSelection = thread.modelSelection;
+  }
+  const { sequence } = await dispatch(host, command);
+  const m = command.modelSelection;
+  console.log(`started ${bold(thread.title || thread.id)}\n  id    ${thread.id}` +
+    (m ? `\n  model ${m.instanceId}/${m.model}` : '') +
+    `\n  mode  ${command.runtimeMode} / ${command.interactionMode}\n  seq   ${sequence}`);
+};
+
+const cmdThreadInterrupt = async (thread, host) => {
+  const { sequence } = await dispatch(host, {
+    type: 'thread.turn.interrupt', commandId: crypto.randomUUID(), threadId: thread.id,
+  });
+  console.log(`interrupted ${bold(thread.title || thread.id)}\n  seq ${sequence}`);
+};
+
 const cmdProject = async (args) => {
   const [sub, ...rest] = args;
   const { flags, pos } = parseArgs(rest);
@@ -212,6 +248,16 @@ const cmdProject = async (args) => {
 const cmdThread = async (args) => {
   const [sub, ...rest] = args;
   const { flags, pos } = parseArgs(rest);
+  if (sub === 'start' || sub === 'interrupt') {
+    const host = pickHost(flags);
+    const [ref, ...rest2] = pos;
+    if (!ref) return console.error(`usage: t3ctl thread ${sub} <thread>` + (sub === 'start' ? ' <message...>' : ''));
+    const thread = resolveThread(await snapshot(host), ref);
+    if (sub === 'interrupt') return cmdThreadInterrupt(thread, host);
+    const text = rest2.join(' ');
+    if (!text) return console.error('usage: t3ctl thread start <thread> <message...>');
+    return cmdThreadStart(thread, host, text, flags);
+  }
   if (SIMPLE_THREAD_COMMANDS.includes(sub)) {
     const host = pickHost(flags);
     const thread = resolveThread(await snapshot(host), pos.join(' '));
@@ -262,6 +308,8 @@ if (!commands[cmd]) {
   t3ctl project create <title> <root>           create a project for an existing dir
   t3ctl thread create <project> <title>         start a thread (--model inst/model,
                                                 --branch, --host)
+  t3ctl thread start <thread> <message...>      send a message and run the agent
+  t3ctl thread interrupt <thread>               stop the running turn
   t3ctl thread settle <thread>                  settle a thread (also: archive,
                                                 unarchive, unpin, delete)`);
   process.exit(cmd ? 1 : 0);
