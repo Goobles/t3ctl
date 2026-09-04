@@ -83,10 +83,19 @@ jobs:
           echo "tag=$tag package.json=$pkg"
           [ "$tag" = "$pkg" ] || { echo "::error::tag v$tag does not match package.json $pkg"; exit 1; }
 
+      # t3ctl now has a runtime dependency, so it cannot even start without an
+      # install. Note `node t3ctl.mjs | head -1` would NOT catch that: the pipe
+      # masks the exit code and the step would pass while broken.
+      - name: Install
+        run: npm ci --ignore-scripts
+
       - name: Smoke test
         run: |
           node --check t3ctl.mjs
-          node t3ctl.mjs | head -1
+          node t3ctl.mjs --help > /dev/null
+          v="$(node t3ctl.mjs --version)"
+          [ "$v" = "$(node -p 'require("./package.json").version')" ] \
+            || { echo "::error::--version ($v) disagrees with package.json"; exit 1; }
           npm pack --dry-run
 
       # Stages only. The trusted publisher is stage-only, so this cannot make a

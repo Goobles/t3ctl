@@ -4,6 +4,7 @@
 // Spike scope: host registry + read-only listing.
 
 import fs from 'node:fs';
+import { Command } from 'commander';
 import os from 'node:os';
 import path from 'node:path';
 
@@ -62,10 +63,7 @@ const collect = async (hosts) => {
   return { ok, failed };
 };
 
-const cmdLs = async (args) => {
-  const showThreads = args.includes('--threads') || args.includes('-t');
-  const showAll = args.includes('--all') || args.includes('-a');
-  const asJson = args.includes('--json');
+const cmdLs = async ({ threads: showThreads, all: showAll, json: asJson }) => {
   const hosts = readHosts();
   if (!hosts.length) return console.error('No hosts registered. Run: t3ctl host add <origin> <token>');
 
@@ -228,38 +226,12 @@ const cmdHostsList = async (hosts) => {
   }
 };
 
-const cmdHost = async (args) => {
-  const [sub, ...rest] = args;
-  const { flags, pos } = parseArgs(rest);
-  const hosts = readHosts();
-  if (sub === 'add') return cmdHostAdd(pos, flags, hosts);
-  if (sub === 'rm') {
-    if (!pos[0]) return usage('usage: t3ctl host rm <name>');
-    writeHosts(hosts.filter((h) => h.name !== pos[0]));
-    console.log(`removed ${pos[0]}`);
-    return;
-  }
-  return cmdHostsList(hosts);
-};
 
 
 // ---- writes -------------------------------------------------------------
 // Commands are dispatched directly (no envelope). The CLIENT mints every id;
 // commandId is the idempotency key, so retries are safe.
 // Schemas: packages/contracts/src/orchestration.ts in pingdotgg/t3code.
-
-const VALUE_FLAGS = ['host', 'model', 'branch', 'runtime-mode', 'interaction-mode', 'worktree', 'name'];
-
-const parseArgs = (argv) => {
-  const flags = {}, pos = [];
-  for (let i = 0; i < argv.length; i++) {
-    const a = argv[i];
-    if (!a.startsWith('--')) { pos.push(a); continue; }
-    const k = a.slice(2);
-    flags[k] = VALUE_FLAGS.includes(k) ? argv[++i] : true;
-  }
-  return { flags, pos };
-};
 
 const pickHost = (flags) => {
   const hosts = readHosts();
@@ -347,22 +319,6 @@ const cmdThreadInterrupt = async (thread, host) => {
   console.log(`interrupted ${bold(thread.title || thread.id)}\n  seq ${sequence}`);
 };
 
-const cmdProject = async (args) => {
-  const [sub, ...rest] = args;
-  const { flags, pos } = parseArgs(rest);
-  if (sub !== 'create') return usage('usage: t3ctl project create <title> <workspace-root> [--host <name>]');
-  const [title, root] = pos;
-  if (!title || !root) return usage('usage: t3ctl project create <title> <workspace-root> [--host <name>]');
-  const host = pickHost(flags);
-  const workspaceRoot = path.resolve(root.replace(/^~/, os.homedir()));
-  if (!fs.existsSync(workspaceRoot)) return console.error(`workspace root does not exist: ${workspaceRoot}`);
-  const projectId = crypto.randomUUID();
-  const { sequence } = await dispatch(host, {
-    type: 'project.create', commandId: crypto.randomUUID(),
-    projectId, title, workspaceRoot, createdAt: new Date().toISOString(),
-  });
-  console.log(`created project ${bold(title)} on ${host.name}\n  id   ${projectId}\n  root ${workspaceRoot}\n  seq  ${sequence}`);
-};
 
 
 // thread.meta.update also accepts regenerateTitle:true, which asks the server to
@@ -420,62 +376,29 @@ const cmdThreadRetitle = async (thread, host, timeoutSeconds) => {
   process.exitCode = 1;
 };
 
-const cmdThread = async (args) => {
-  const [sub, ...rest] = args;
-  const { flags, pos } = parseArgs(rest);
-  // `send` is the accurate name: thread.turn.start posts a message to a thread and
-  // runs a turn, which is exactly what the UI does for every message, first or not.
-  // `start` stays as an alias because it shipped in 0.2.0.
-  const isSend = sub === 'send' || sub === 'start';
 
-  if (sub === 'rename' || sub === 'retitle') {
-    const [ref, ...titleParts] = pos;
-    if (!ref) return usage(`usage: t3ctl thread ${sub} <thread>` + (sub === 'rename' ? ' <new title...>' : ''));
-    const title = titleParts.join(' ');
-    if (sub === 'rename' && !title) return usage('usage: t3ctl thread rename <thread> <new title...>');
-    const host = pickHost(flags);
-    const target = resolveThread(await snapshot(host), ref);
-    return sub === 'retitle'
-      ? cmdThreadRetitle(target, host, Number(flags.timeout) > 0 ? Number(flags.timeout) : 30)
-      : cmdThreadRename(target, host, title);
-  }
+const cmdProjectCreate = async (title, root, flags) => {
+  const host = pickHost(flags);
+  const workspaceRoot = path.resolve(root.replace(/^~/, os.homedir()));
+  if (!fs.existsSync(workspaceRoot)) throw new Error(`workspace root does not exist: ${workspaceRoot}`);
+  const projectId = crypto.randomUUID();
+  const { sequence } = await dispatch(host, {
+    type: 'project.create', commandId: crypto.randomUUID(),
+    projectId, title, workspaceRoot, createdAt: new Date().toISOString(),
+  });
+  console.log(`created project ${bold(title)} on ${host.name}\n  id   ${projectId}\n  root ${workspaceRoot}\n  seq  ${sequence}`);
+};
 
-  if (isSend || sub === 'interrupt') {
-    // Validate arguments before touching the host registry, so `t3ctl thread
-    // send` with no args prints usage instead of "no hosts registered".
-    const [ref, ...rest2] = pos;
-    if (!ref) return usage(`usage: t3ctl thread ${sub} <thread>` + (isSend ? ' <message...>' : ''));
-    if (isSend && rest2.length === 0) return usage(`usage: t3ctl thread ${sub} <thread> <message...>`);
-    const host = pickHost(flags);
-    const thread = resolveThread(await snapshot(host), ref);
-    if (sub === 'interrupt') return cmdThreadInterrupt(thread, host);
-    return cmdThreadStart(thread, host, rest2.join(' '), flags);
-  }
-  if (SIMPLE_THREAD_COMMANDS.includes(sub)) {
-    if (!pos.length) return usage(`usage: t3ctl thread ${sub} <thread>`);
-    const host = pickHost(flags);
-    const thread = resolveThread(await snapshot(host), pos.join(' '));
-    const { sequence } = await dispatch(host, {
-      type: `thread.${sub}`, commandId: crypto.randomUUID(), threadId: thread.id,
-    });
-    console.log(`${sub}d ${bold(thread.title || thread.id)}\n  id  ${thread.id}\n  seq ${sequence}`);
-    return;
-  }
-  if (sub !== 'create') return usage('usage: t3ctl thread create <project> <title> [--model <instance>/<model>] [--branch <b>] [--host <name>]\n       t3ctl thread <settle|archive|unarchive|unpin|delete> <thread>');
-  const [projectRef, ...titleParts] = pos;
-  const title = titleParts.join(' ');
-  if (!projectRef || !title) return usage('usage: t3ctl thread create <project> <title> [--model <instance>/<model>] [--branch <b>] [--host <name>]');
+const cmdThreadCreate = async (projectRef, title, flags) => {
   const host = pickHost(flags);
   const project = resolveProject(await snapshot(host), projectRef);
   if (!project) throw new Error(`no project matching "${projectRef}" on ${host.name}`);
-
-  // instanceId is the segment before the first slash; model keeps the rest
-  // (opencode models look like "github-copilot/gpt-5.4").
+  // instanceId is the segment before the FIRST slash; the model keeps the rest,
+  // because opencode model ids are themselves slashed ("github-copilot/gpt-5.4").
   const raw = flags.model ?? 'claudeAgent/claude-opus-5';
   const slash = raw.indexOf('/');
   if (slash < 1) throw new Error(`--model must be <instance>/<model>, got "${raw}"`);
   const modelSelection = { instanceId: raw.slice(0, slash), model: raw.slice(slash + 1) };
-
   const threadId = crypto.randomUUID();
   const { sequence } = await dispatch(host, {
     type: 'thread.create', commandId: crypto.randomUUID(),
@@ -489,31 +412,139 @@ const cmdThread = async (args) => {
   console.log(`created thread ${bold(title)} in ${project.title} on ${host.name}\n  id    ${threadId}\n  model ${modelSelection.instanceId}/${modelSelection.model}\n  seq   ${sequence}`);
 };
 
-const [cmd, ...rest] = process.argv.slice(2);
-const commands = { ls: cmdLs, host: cmdHost, hosts: () => cmdHost([]), project: cmdProject, thread: cmdThread };
-if (!commands[cmd]) {
-  console.log(`t3ctl — control T3 Code hosts
+const cmdThreadSimple = async (verb, ref, flags) => {
+  const host = pickHost(flags);
+  const thread = resolveThread(await snapshot(host), ref);
+  const { sequence } = await dispatch(host, {
+    type: `thread.${verb}`, commandId: crypto.randomUUID(), threadId: thread.id,
+  });
+  console.log(`${verb}d ${bold(thread.title || thread.id)}\n  id  ${thread.id}\n  seq ${sequence}`);
+};
 
-  t3ctl ls [-t|--threads] [-a|--all] [--json]   list projects and threads across hosts
-  t3ctl host add <origin> [token] [--name <n>]  register a host (probes it first)
-  t3ctl host rm <name>                          remove a host
-  t3ctl hosts                                   list hosts and probe each one
+// ---- cli ----------------------------------------------------------------
+// commander's option names arrive camelCased; the command implementations were
+// written against the kebab-case spellings, so translate once here rather than
+// touching every call site.
+const toFlags = (o) => ({
+  host: o.host, model: o.model, branch: o.branch, worktree: o.worktree,
+  name: o.name, timeout: o.timeout,
+  'runtime-mode': o.runtimeMode, 'interaction-mode': o.interactionMode,
+});
 
-  t3ctl project create <title> <root>           create a project for an existing dir
-  t3ctl thread create <project> <title>         start a thread (--model inst/model,
-                                                --branch, --host)
-  t3ctl thread send <thread> <message...>       send a message and run the agent
-                                                (alias: start)
-  t3ctl thread rename <thread> <title...>       rename a thread
-  t3ctl thread retitle <thread> [--timeout n]   ask the server to derive a title
-                                                (warns if it produces none)
-  t3ctl thread interrupt <thread>               stop the running turn
-  t3ctl thread settle <thread>                  settle a thread (also: archive,
-                                                unarchive, unpin, delete)`);
-  process.exit(cmd ? 1 : 0);
+const resolve = async (ref, o) => {
+  const host = pickHost(toFlags(o));
+  return { host, thread: resolveThread(await snapshot(host), ref) };
+};
+
+const pkg = JSON.parse(fs.readFileSync(new URL('./package.json', import.meta.url), 'utf8'));
+
+const program = new Command();
+program
+  .name('t3ctl')
+  .description('Control T3 Code hosts — list and drive coding-agent threads across every machine you run T3 Code on.')
+  .version(pkg.version, '-v, --version', 'print the t3ctl version')
+  .showHelpAfterError('(run `t3ctl --help` or `t3ctl <command> --help`)')
+  .configureHelp({ showGlobalOptions: true });
+
+const hostOption = (cmd) => cmd.option('--host <name>', 'which registered host to talk to (required when several are registered)');
+
+program.command('ls')
+  .description('list projects and threads across all registered hosts')
+  .option('-t, --threads', 'expand the threads under each project')
+  .option('-a, --all', 'include archived and deleted items')
+  .option('--json', 'emit JSON instead of a table')
+  .action((o) => cmdLs(o));
+
+const host = program.command('host').description('manage the host registry');
+
+host.command('add')
+  .argument('<origin>', 'base URL of the host, e.g. https://box.tailnet.ts.net:3773')
+  .argument('[token]', 'bearer token from `t3 auth session issue` on that host')
+  .argument('[legacy]', 'accepts the older `host add <name> <origin> <token>` form')
+  .description('register a host, probing /.well-known/t3/environment first')
+  .option('--name <name>', 'override the label detected from the host')
+  .action((a, b, c, o) => cmdHostAdd([a, b, c].filter(Boolean), toFlags(o), readHosts()));
+
+host.command('rm')
+  .argument('<name>', 'registered host name')
+  .description('remove a host from the registry')
+  .action((name) => {
+    const hosts = readHosts();
+    if (!hosts.some((h) => h.name === name)) throw new Error(`no such host: ${name}`);
+    writeHosts(hosts.filter((h) => h.name !== name));
+    console.log(`removed ${name}`);
+  });
+
+host.command('ls').description('list registered hosts and probe each one')
+  .action(() => cmdHostsList(readHosts()));
+
+program.command('hosts').description('list registered hosts and probe each one (alias of `host ls`)')
+  .action(() => cmdHostsList(readHosts()));
+
+const project = program.command('project').description('manage projects');
+hostOption(project.command('create')
+  .argument('<title>')
+  .argument('<workspace-root>', 'existing directory the project maps to')
+  .description('create a project for an existing directory'))
+  .action((title, root, o) => cmdProjectCreate(title, root, toFlags(o)));
+
+const thread = program.command('thread').description('create and drive threads');
+
+hostOption(thread.command('create')
+  .argument('<project>', 'project id, title, or workspace root')
+  .argument('<title...>')
+  .description('create a thread (idle — use `thread send` to run it)')
+  .option('--model <instance/model>', 'e.g. claudeAgent/claude-opus-5', 'claudeAgent/claude-opus-5')
+  .option('--branch <branch>')
+  .option('--worktree <path>')
+  .option('--runtime-mode <mode>', 'approval-required | auto-accept-edits | auto | full-access')
+  .option('--interaction-mode <mode>', 'default | plan'))
+  .action((ref, title, o) => cmdThreadCreate(ref, title.join(' '), toFlags(o)));
+
+hostOption(thread.command('send')
+  .alias('start')
+  .argument('<thread>', 'thread id, exact title, or unique substring')
+  .argument('<message...>')
+  .description('send a message to a thread and run the agent')
+  .option('--model <instance/model>', 'override the thread\'s model for this turn')
+  .option('--runtime-mode <mode>')
+  .option('--interaction-mode <mode>'))
+  .action(async (ref, message, o) => {
+    const { host: h, thread: t } = await resolve(ref, o);
+    return cmdThreadStart(t, h, message.join(' '), toFlags(o));
+  });
+
+hostOption(thread.command('rename')
+  .argument('<thread>')
+  .argument('<title...>')
+  .description('set a thread title'))
+  .action(async (ref, title, o) => {
+    const { host: h, thread: t } = await resolve(ref, o);
+    return cmdThreadRename(t, h, title.join(' '));
+  });
+
+hostOption(thread.command('retitle')
+  .argument('<thread>')
+  .description('ask the server to derive a title; warns if it produces none')
+  .option('--timeout <seconds>', 'how long to wait for a title', '30'))
+  .action(async (ref, o) => {
+    const { host: h, thread: t } = await resolve(ref, o);
+    return cmdThreadRetitle(t, h, Number(o.timeout) > 0 ? Number(o.timeout) : 30);
+  });
+
+hostOption(thread.command('interrupt').argument('<thread>').description('stop the running turn'))
+  .action(async (ref, o) => {
+    const { host: h, thread: t } = await resolve(ref, o);
+    return cmdThreadInterrupt(t, h);
+  });
+
+for (const verb of SIMPLE_THREAD_COMMANDS) {
+  hostOption(thread.command(verb).argument('<thread>').description(`${verb} a thread`))
+    .action((ref, o) => cmdThreadSimple(verb, ref, toFlags(o)));
 }
+
 try {
-  await commands[cmd](rest);
+  await program.parseAsync(process.argv);
 } catch (error) {
   console.error(`\x1b[31merror\x1b[0m ${error instanceof Error ? error.message : String(error)}`);
   process.exit(1);
