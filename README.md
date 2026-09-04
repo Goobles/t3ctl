@@ -7,6 +7,11 @@ T3 Code is MIT-licensed open source. **Read the source before guessing at anythi
 `docs/user/remote-access.md`, `docs/internals/environment-auth.md`,
 `docs/internals/t3-connect.md`, and `packages/contracts/src/orchestration.ts`.
 
+## Install
+
+    npm i -g @gobius/t3ctl     # installs a `t3ctl` binary
+    npx @gobius/t3ctl ls
+
 ## Status: local read + write working; relay transport not started
 
     t3ctl ls [-t|--threads] [-a|--all] [--json]

@@ -1,5 +1,5 @@
 {
-  "name": "t3ctl",
+  "name": "@gobius/t3ctl",
   "version": "0.1.0",
   "type": "module",
   "description": "Controller CLI for T3 Code hosts — list and drive threads across machines",
@@ -30,5 +30,8 @@
   ],
   "engines": {
     "node": ">=22"
+  },
+  "publishConfig": {
+    "access": "public"
   }
 }
