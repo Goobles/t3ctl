@@ -47,6 +47,12 @@ const ICON = {
   archived: '\x1b[90m▪\x1b[0m', deleted: '\x1b[90m✗\x1b[0m',
 };
 const dim = (s) => `\x1b[90m${s}\x1b[0m`;
+// Usage errors are user errors: print to stderr and exit non-zero so scripts
+// can tell them apart from success.
+const usage = (message) => {
+  console.error(message);
+  process.exitCode = 1;
+};
 const bold = (s) => `\x1b[1m${s}\x1b[0m`;
 
 const collect = async (hosts) => {
@@ -110,7 +116,7 @@ const cmdHost = (args) => {
   const hosts = readHosts();
   if (sub === 'add') {
     const [name, origin, token] = rest;
-    if (!name || !origin || !token) return console.error('usage: t3ctl host add <name> <origin> <token>');
+    if (!name || !origin || !token) return usage('usage: t3ctl host add <name> <origin> <token>');
     const next = hosts.filter((h) => h.name !== name).concat({ name, origin: origin.replace(/\/$/, ''), token });
     writeHosts(next);
     console.log(`added ${name} -> ${origin}`);
@@ -231,9 +237,9 @@ const cmdThreadInterrupt = async (thread, host) => {
 const cmdProject = async (args) => {
   const [sub, ...rest] = args;
   const { flags, pos } = parseArgs(rest);
-  if (sub !== 'create') return console.error('usage: t3ctl project create <title> <workspace-root> [--host <name>]');
+  if (sub !== 'create') return usage('usage: t3ctl project create <title> <workspace-root> [--host <name>]');
   const [title, root] = pos;
-  if (!title || !root) return console.error('usage: t3ctl project create <title> <workspace-root> [--host <name>]');
+  if (!title || !root) return usage('usage: t3ctl project create <title> <workspace-root> [--host <name>]');
   const host = pickHost(flags);
   const workspaceRoot = path.resolve(root.replace(/^~/, os.homedir()));
   if (!fs.existsSync(workspaceRoot)) return console.error(`workspace root does not exist: ${workspaceRoot}`);
@@ -249,16 +255,18 @@ const cmdThread = async (args) => {
   const [sub, ...rest] = args;
   const { flags, pos } = parseArgs(rest);
   if (sub === 'start' || sub === 'interrupt') {
-    const host = pickHost(flags);
+    // Validate arguments before touching the host registry, so `t3ctl thread
+    // start` with no args prints usage instead of "no hosts registered".
     const [ref, ...rest2] = pos;
-    if (!ref) return console.error(`usage: t3ctl thread ${sub} <thread>` + (sub === 'start' ? ' <message...>' : ''));
+    if (!ref) return usage(`usage: t3ctl thread ${sub} <thread>` + (sub === 'start' ? ' <message...>' : ''));
+    if (sub === 'start' && rest2.length === 0) return usage('usage: t3ctl thread start <thread> <message...>');
+    const host = pickHost(flags);
     const thread = resolveThread(await snapshot(host), ref);
     if (sub === 'interrupt') return cmdThreadInterrupt(thread, host);
-    const text = rest2.join(' ');
-    if (!text) return console.error('usage: t3ctl thread start <thread> <message...>');
-    return cmdThreadStart(thread, host, text, flags);
+    return cmdThreadStart(thread, host, rest2.join(' '), flags);
   }
   if (SIMPLE_THREAD_COMMANDS.includes(sub)) {
+    if (!pos.length) return usage(`usage: t3ctl thread ${sub} <thread>`);
     const host = pickHost(flags);
     const thread = resolveThread(await snapshot(host), pos.join(' '));
     const { sequence } = await dispatch(host, {
@@ -267,10 +275,10 @@ const cmdThread = async (args) => {
     console.log(`${sub}d ${bold(thread.title || thread.id)}\n  id  ${thread.id}\n  seq ${sequence}`);
     return;
   }
-  if (sub !== 'create') return console.error('usage: t3ctl thread create <project> <title> [--model <instance>/<model>] [--branch <b>] [--host <name>]\n       t3ctl thread <settle|archive|unarchive|unpin|delete> <thread>');
+  if (sub !== 'create') return usage('usage: t3ctl thread create <project> <title> [--model <instance>/<model>] [--branch <b>] [--host <name>]\n       t3ctl thread <settle|archive|unarchive|unpin|delete> <thread>');
   const [projectRef, ...titleParts] = pos;
   const title = titleParts.join(' ');
-  if (!projectRef || !title) return console.error('usage: t3ctl thread create <project> <title> [--model <instance>/<model>] [--branch <b>] [--host <name>]');
+  if (!projectRef || !title) return usage('usage: t3ctl thread create <project> <title> [--model <instance>/<model>] [--branch <b>] [--host <name>]');
   const host = pickHost(flags);
   const project = resolveProject(await snapshot(host), projectRef);
   if (!project) throw new Error(`no project matching "${projectRef}" on ${host.name}`);
@@ -314,4 +322,9 @@ if (!commands[cmd]) {
                                                 unarchive, unpin, delete)`);
   process.exit(cmd ? 1 : 0);
 }
-await commands[cmd](rest);
+try {
+  await commands[cmd](rest);
+} catch (error) {
+  console.error(`\x1b[31merror\x1b[0m ${error instanceof Error ? error.message : String(error)}`);
+  process.exit(1);
+}
