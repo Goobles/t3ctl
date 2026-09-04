@@ -236,6 +236,22 @@ construction. What produces a reachable origin:
   touching the network, so `t3ctl host add` with no arguments prints usage. Keep
   it that way — the no-host paths are exercised in CI.
 
+## Working on it
+
+TypeScript, compiled with `tsc` to `dist/`, which is what gets published.
+
+```sh
+npm ci
+npm run typecheck    # tsc --noEmit
+npm run build        # tsc -> dist/
+node dist/t3ctl.js --help
+```
+
+`strict` and `noUncheckedIndexedAccess` are both on. Note the workflows run
+`npm ci --ignore-scripts`, so `prepack`/`prepublishOnly` never fire — the build
+is an explicit step in both CI and release. Without it an empty `dist/` would
+be staged.
+
 ## Releasing
 
 Publishing runs in CI via **npm trusted publishing (OIDC)**. There is no

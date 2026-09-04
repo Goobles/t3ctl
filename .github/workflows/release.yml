@@ -89,11 +89,15 @@ jobs:
       - name: Install
         run: npm ci --ignore-scripts
 
+      # `npm ci --ignore-scripts` means prepack/prepublishOnly never run, so the
+      # build has to be an explicit step or an empty dist/ would be staged.
+      - name: Build
+        run: npm run build
+
       - name: Smoke test
         run: |
-          node --check t3ctl.mjs
-          node t3ctl.mjs --help > /dev/null
-          v="$(node t3ctl.mjs --version)"
+          node dist/t3ctl.js --help > /dev/null
+          v="$(node dist/t3ctl.js --version)"
           [ "$v" = "$(node -p 'require("./package.json").version')" ] \
             || { echo "::error::--version ($v) disagrees with package.json"; exit 1; }
           npm pack --dry-run

@@ -32,18 +32,21 @@ jobs:
       - name: Install
         run: npm ci --ignore-scripts
 
-      - name: Parse
-        run: node --check t3ctl.mjs
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Build
+        run: npm run build
 
       - name: CLI runs and prints help
         run: |
-          out="$(node t3ctl.mjs --help)"
+          out="$(node dist/t3ctl.js --help)"
           echo "$out"
           echo "$out" | grep -q 'Commands:' || { echo "::error::help output missing command list"; exit 1; }
 
       - name: --version matches package.json
         run: |
-          v="$(node t3ctl.mjs --version)"
+          v="$(node dist/t3ctl.js --version)"
           pkg="$(node -p 'require("./package.json").version')"
           echo "cli=$v package.json=$pkg"
           [ "$v" = "$pkg" ] || { echo "::error::--version ($v) != package.json ($pkg)"; exit 1; }
@@ -53,18 +56,18 @@ jobs:
       - name: Rejects bad input
         run: |
           fail() { echo "::error::expected failure: $*"; exit 1; }
-          node t3ctl.mjs thread send      >/dev/null 2>&1 && fail "thread send with no args"
-          node t3ctl.mjs thread rename    >/dev/null 2>&1 && fail "thread rename with no args"
-          node t3ctl.mjs host add         >/dev/null 2>&1 && fail "host add with no args"
-          node t3ctl.mjs project create   >/dev/null 2>&1 && fail "project create with no args"
-          node t3ctl.mjs bogus            >/dev/null 2>&1 && fail "unknown command"
-          node t3ctl.mjs ls --nope        >/dev/null 2>&1 && fail "unknown option"
+          node dist/t3ctl.js thread send      >/dev/null 2>&1 && fail "thread send with no args"
+          node dist/t3ctl.js thread rename    >/dev/null 2>&1 && fail "thread rename with no args"
+          node dist/t3ctl.js host add         >/dev/null 2>&1 && fail "host add with no args"
+          node dist/t3ctl.js project create   >/dev/null 2>&1 && fail "project create with no args"
+          node dist/t3ctl.js bogus            >/dev/null 2>&1 && fail "unknown command"
+          node dist/t3ctl.js ls --nope        >/dev/null 2>&1 && fail "unknown option"
           echo "all rejected correctly"
 
       - name: Per-command help exists
         run: |
           for c in "ls" "host add" "thread send" "thread retitle"; do
-            node t3ctl.mjs $c --help >/dev/null 2>&1 || { echo "::error::no help for: $c"; exit 1; }
+            node dist/t3ctl.js $c --help >/dev/null 2>&1 || { echo "::error::no help for: $c"; exit 1; }
           done
           echo "per-command help ok"
 
