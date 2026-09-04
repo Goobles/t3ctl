@@ -208,14 +208,30 @@ a title like a filename.
 t3ctl thread rename "probe well-known" Verify hosts with the environment descriptor
 ```
 
-### `t3ctl thread retitle <thread>`
+### `t3ctl thread retitle <thread> [--timeout <seconds>]`
 
 Ask the server to derive a title from the thread's own content, instead of
-supplying one. Handy when you cannot think of a good name.
+supplying one.
 
 ```sh
 t3ctl thread retitle "probe well-known"
 ```
+
+This is a **request, not a guarantee**. The server records the intent and expects
+something downstream to generate the title; in practice it sometimes clears the
+request a few seconds later without producing one, and reports no error when it
+does. So `retitle` watches the thread afterwards and tells you which happened:
+
+```
+asked the server to retitle Build t3ctl: a CLI for controlling T3 Code hosts  (seq 677390)
+no title was generated — the server cleared the request without producing one.
+  The title is still "Build t3ctl: a CLI for controlling T3 Code hosts". Set one directly:
+    t3ctl thread rename 861645a3-... <title...>
+```
+
+It exits non-zero when no title appears, so a script can tell. Waits 30s by
+default; `--timeout` changes that. If you need the rename to be certain, use
+`thread rename`, which sets the title directly.
 
 ### `t3ctl thread interrupt <thread>`
 
