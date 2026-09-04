@@ -56,14 +56,40 @@ instead, so it never touches the pairing flow.
 
 ## Endpoints
 
-| Purpose | Endpoint |
-|---|---|
-| List everything | `GET /api/orchestration/snapshot` |
-| Per-thread | `GET /api/orchestration/threads/:threadId` |
-| Writes (commands) | `POST /api/orchestration/dispatch` |
+| Purpose | Endpoint | Auth |
+|---|---|---|
+| Identify the server | `GET /.well-known/t3/environment` | **none** |
+| List everything | `GET /api/orchestration/snapshot` | bearer |
+| Per-thread | `GET /api/orchestration/threads/:threadId` | bearer |
+| Writes (commands) | `POST /api/orchestration/dispatch` | bearer |
 
-All three take `Authorization: Bearer <token>`. t3ctl currently uses `snapshot`
-and `dispatch` only.
+t3ctl uses `descriptor`, `snapshot` and `dispatch` only.
+
+### The environment descriptor
+
+`GET /.well-known/t3/environment` is the one endpoint with no auth middleware
+(route `descriptor` in `packages/contracts/src/environmentHttp.ts`; payload
+`ExecutionEnvironmentDescriptor` in `packages/contracts/src/environment.ts`):
+
+```json
+{ "environmentId": "9d9d9921-…", "label": "SPR-Gobius-D",
+  "platform": { "os": "darwin", "arch": "arm64" },
+  "serverVersion": "0.0.38-nightly.20260901.1250",
+  "capabilities": { "…": true } }
+```
+
+Because it needs no token, `host add` probes it *first* and only writes to
+`hosts.json` if it parses. That splits two failures users otherwise cannot tell
+apart: "this origin isn't T3 Code" and "your token is wrong". t3ctl stores
+`environmentId`, `label` and `serverVersion`, and treats a changed
+`environmentId` on a known origin as a loud warning — the origin now resolves to
+a different machine, so the stored token belongs to something else.
+
+Probing happens on `host add` and `hosts` only. `ls` must stay one request per
+host; adding a descriptor round-trip there would double its cost for information
+it never displays. t3ctl reads only the three string fields — `platform` and
+`capabilities` are deliberately ignored rather than stored, so there is nothing
+to keep in sync when the server grows a capability flag.
 
 ## Command vocabulary
 
@@ -185,6 +211,16 @@ construction. What produces a reachable origin:
   commands take `--host` and require it when more than one host is registered.
 - Tokens are stored in plaintext in `~/.config/t3ctl/hosts.json` (dir `0700`,
   file `0600`). No keychain integration.
+- `host add` accepts two shapes and tells them apart by scheme: a first argument
+  matching `^https?://` is the origin (current form), otherwise it is the legacy
+  `<name> <origin> <token>`, which warns. The cost is that an origin must carry a
+  scheme — `host add localhost:3773` is rejected rather than guessed at.
+- Stored descriptor fields go stale: `hosts` shows live values where it can and
+  dims the row when it falls back to what was last recorded. Nothing re-probes in
+  the background.
+- `host` subcommands validate their arguments before reading the registry or
+  touching the network, so `t3ctl host add` with no arguments prints usage. Keep
+  it that way — the no-host paths are exercised in CI.
 
 ## Releasing
 

@@ -22,7 +22,7 @@ const writeHosts = (hosts) => {
 
 const snapshot = async (host) => {
   const res = await fetch(`${host.origin}/api/orchestration/snapshot`, {
-    headers: { authorization: `Bearer ${host.token}` },
+    headers: host.token ? { authorization: `Bearer ${host.token}` } : {},
     signal: AbortSignal.timeout(host.timeoutMs ?? 15000),
   });
   if (!res.ok) throw new Error(`${host.name}: HTTP ${res.status} ${await res.text().catch(() => '')}`.trim());
@@ -67,7 +67,7 @@ const cmdLs = async (args) => {
   const showAll = args.includes('--all') || args.includes('-a');
   const asJson = args.includes('--json');
   const hosts = readHosts();
-  if (!hosts.length) return console.error('No hosts registered. Run: t3ctl host add <name> <origin> <token>');
+  if (!hosts.length) return console.error('No hosts registered. Run: t3ctl host add <origin> <token>');
 
   const { ok, failed } = await collect(hosts);
 
@@ -111,22 +111,135 @@ const cmdLs = async (args) => {
   for (const f of failed) console.error(`\n\x1b[31munreachable\x1b[0m ${f.host.name}: ${f.error}`);
 };
 
-const cmdHost = (args) => {
-  const [sub, ...rest] = args;
-  const hosts = readHosts();
-  if (sub === 'add') {
-    const [name, origin, token] = rest;
-    if (!name || !origin || !token) return usage('usage: t3ctl host add <name> <origin> <token>');
-    const next = hosts.filter((h) => h.name !== name).concat({ name, origin: origin.replace(/\/$/, ''), token });
-    writeHosts(next);
-    console.log(`added ${name} -> ${origin}`);
-  } else if (sub === 'rm') {
-    writeHosts(hosts.filter((h) => h.name !== rest[0]));
-    console.log(`removed ${rest[0]}`);
-  } else {
-    if (!hosts.length) return console.log('(no hosts)');
-    for (const h of hosts) console.log(`${h.name.padEnd(16)} ${h.origin}  ${dim('token:' + h.token.slice(0, 8) + '…')}`);
+// ---- host registry ------------------------------------------------------
+// The descriptor at /.well-known/t3/environment is UNAUTHENTICATED, so probing
+// it answers "is anyone home, and is it T3 Code?" without a token — a wrong
+// origin fails here instead of as a baffling 401 on the first real call.
+// Schema: ExecutionEnvironmentDescriptor in packages/contracts/src/environment.ts.
+
+const DESCRIPTOR_PATH = '/.well-known/t3/environment';
+
+const probe = async (origin, timeoutMs = 5000) => {
+  let res;
+  try {
+    res = await fetch(`${origin}${DESCRIPTOR_PATH}`, { signal: AbortSignal.timeout(timeoutMs) });
+  } catch (error) {
+    // Node's fetch reports a bare "fetch failed"; the cause carries the real reason.
+    const why = error.name === 'TimeoutError' ? `no response in ${timeoutMs}ms`
+      : (error.cause?.message ?? error.message);
+    throw new Error(`cannot reach ${origin}: ${why}`);
   }
+  const notT3 = (why) => new Error(`not a T3 Code server (${DESCRIPTOR_PATH} ${why})`);
+  if (!res.ok) throw notT3(`returned HTTP ${res.status}`);
+  let d;
+  try { d = await res.json(); } catch { throw notT3('is not JSON'); }
+  const missing = ['environmentId', 'label', 'serverVersion'].filter((k) => typeof d?.[k] !== 'string' || !d[k]);
+  if (missing.length) throw notT3(`is missing ${missing.join(', ')}`);
+  return { environmentId: d.environmentId, label: d.label, serverVersion: d.serverVersion };
+};
+
+const shortId = (id) => (id ? id.slice(0, 8) : '-');
+const warn = (message) => console.error(`\x1b[33mwarning\x1b[0m ${message}`);
+
+// The name is what you type in --host, so derive a typeable slug from the label
+// rather than using the label verbatim.
+const slugify = (label) => label.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') || 'host';
+
+const uniqueName = (base, hosts) => {
+  if (!hosts.some((h) => h.name === base)) return base;
+  for (let n = 2; ; n++) if (!hosts.some((h) => h.name === `${base}-${n}`)) return `${base}-${n}`;
+};
+
+const isOrigin = (value) => /^https?:\/\//i.test(value ?? '');
+
+// Two accepted shapes, told apart by the scheme:
+//   host add <origin> [token] [--name <n>]     current
+//   host add <name> <origin> <token>           legacy, still works
+const parseHostAdd = (pos) => {
+  if (isOrigin(pos[0])) return { origin: pos[0], token: pos[1] ?? null, legacy: false };
+  if (isOrigin(pos[1])) return { name: pos[0], origin: pos[1], token: pos[2] ?? null, legacy: true };
+  return null;
+};
+
+const HOST_ADD_USAGE = 'usage: t3ctl host add <origin> [token] [--name <name>]\n' +
+  '       an origin needs a scheme, e.g. http://localhost:3773';
+
+const cmdHostAdd = async (pos, flags, hosts) => {
+  // Validate before any network or registry work so a bare `host add` prints
+  // usage instead of stalling on a probe.
+  const parsed = parseHostAdd(pos);
+  if (!parsed) return usage(HOST_ADD_USAGE);
+  if ('name' in flags && !flags.name) return usage(HOST_ADD_USAGE);
+  if (parsed.legacy) warn('"host add <name> <origin> <token>" is deprecated — use: t3ctl host add <origin> [token] [--name <name>]');
+
+  const origin = parsed.origin.replace(/\/$/, '');
+  const descriptor = await probe(origin);
+  const existing = hosts.find((h) => h.origin === origin);
+
+  // A changed environmentId on a known origin means the origin now points at a
+  // different machine — the stored token almost certainly belongs to the old one.
+  if (existing?.environmentId && existing.environmentId !== descriptor.environmentId) {
+    warn(`${origin} is now a DIFFERENT environment\n` +
+      `  was ${existing.environmentId} (${existing.label ?? 'unknown'})\n` +
+      `  now ${descriptor.environmentId} (${descriptor.label})\n` +
+      `  the token stored for "${existing.name}" was issued by the old one and will likely fail`);
+  }
+
+  const name = flags.name ?? parsed.name ?? existing?.name ??
+    uniqueName(slugify(descriptor.label), hosts);
+  const token = parsed.token ?? existing?.token ?? null;
+
+  const others = hosts.filter((h) => h.name !== name && h.origin !== origin && h.serverVersion);
+  const skewed = [...new Set(others.map((h) => h.serverVersion))].filter((v) => v !== descriptor.serverVersion);
+  if (skewed.length) warn(`serverVersion ${descriptor.serverVersion} differs from other hosts: ${skewed.join(', ')}`);
+
+  writeHosts(hosts.filter((h) => h.name !== name && h.origin !== origin).concat({
+    name, origin, token,
+    environmentId: descriptor.environmentId,
+    label: descriptor.label,
+    serverVersion: descriptor.serverVersion,
+  }));
+  console.log(`added ${bold(name)} -> ${origin}\n  label   ${descriptor.label}\n` +
+    `  env     ${descriptor.environmentId}\n  version ${descriptor.serverVersion}`);
+  if (!token) warn(`no token stored for ${name} — reads will fail until you run: t3ctl host add ${origin} <token>`);
+};
+
+const cmdHostsList = async (hosts) => {
+  if (!hosts.length) return console.log('(no hosts)');
+  const probes = await Promise.allSettled(hosts.map((h) => probe(h.origin)));
+  const drifted = [];
+  hosts.forEach((h, i) => {
+    const p = probes[i];
+    const live = p.status === 'fulfilled' ? p.value : null;
+    if (live && h.environmentId && h.environmentId !== live.environmentId) drifted.push({ h, live });
+    const icon = live ? ICON.running : ICON.error;
+    const label = live?.label ?? h.label ?? '-';
+    const env = shortId(live?.environmentId ?? h.environmentId);
+    const version = live?.serverVersion ?? h.serverVersion ?? '-';
+    // Values for an unreachable host are whatever was last stored, so dim the
+    // whole row to keep remembered data visually distinct from probed data.
+    const cell = (text, width) => (live ? text.padEnd(width) : dim(text.padEnd(width)));
+    console.log(`${icon} ${live ? bold(h.name.padEnd(14)) : dim(h.name.padEnd(14))} ${cell(label, 18)} ${dim(env.padEnd(9))} ${cell(version, 28)} ${dim(h.origin)}` +
+      (live ? '' : ` ${dim(p.reason.message)}`));
+  });
+  for (const { h, live } of drifted) {
+    warn(`${h.name} (${h.origin}) is now a DIFFERENT environment\n` +
+      `  was ${h.environmentId} (${h.label ?? 'unknown'})\n  now ${live.environmentId} (${live.label})`);
+  }
+};
+
+const cmdHost = async (args) => {
+  const [sub, ...rest] = args;
+  const { flags, pos } = parseArgs(rest);
+  const hosts = readHosts();
+  if (sub === 'add') return cmdHostAdd(pos, flags, hosts);
+  if (sub === 'rm') {
+    if (!pos[0]) return usage('usage: t3ctl host rm <name>');
+    writeHosts(hosts.filter((h) => h.name !== pos[0]));
+    console.log(`removed ${pos[0]}`);
+    return;
+  }
+  return cmdHostsList(hosts);
 };
 
 
@@ -135,7 +248,7 @@ const cmdHost = (args) => {
 // commandId is the idempotency key, so retries are safe.
 // Schemas: packages/contracts/src/orchestration.ts in pingdotgg/t3code.
 
-const VALUE_FLAGS = ['host', 'model', 'branch', 'runtime-mode', 'interaction-mode', 'worktree'];
+const VALUE_FLAGS = ['host', 'model', 'branch', 'runtime-mode', 'interaction-mode', 'worktree', 'name'];
 
 const parseArgs = (argv) => {
   const flags = {}, pos = [];
@@ -155,7 +268,7 @@ const pickHost = (flags) => {
     if (!h) throw new Error(`no such host: ${flags.host}`);
     return h;
   }
-  if (!hosts.length) throw new Error('no hosts registered — run: t3ctl host add <name> <origin> <token>');
+  if (!hosts.length) throw new Error('no hosts registered — run: t3ctl host add <origin> <token>');
   if (hosts.length > 1) throw new Error(`multiple hosts; pass --host <${hosts.map((h) => h.name).join('|')}>`);
   return hosts[0];
 };
@@ -163,7 +276,7 @@ const pickHost = (flags) => {
 const dispatch = async (host, command) => {
   const res = await fetch(`${host.origin}/api/orchestration/dispatch`, {
     method: 'POST',
-    headers: { authorization: `Bearer ${host.token}`, 'content-type': 'application/json' },
+    headers: { ...(host.token ? { authorization: `Bearer ${host.token}` } : {}), 'content-type': 'application/json' },
     body: JSON.stringify(command),
     signal: AbortSignal.timeout(host.timeoutMs ?? 15000),
   });
@@ -309,9 +422,9 @@ if (!commands[cmd]) {
   console.log(`t3ctl — control T3 Code hosts
 
   t3ctl ls [-t|--threads] [-a|--all] [--json]   list projects and threads across hosts
-  t3ctl host add <name> <origin> <token>        register a host
+  t3ctl host add <origin> [token] [--name <n>]  register a host (probes it first)
   t3ctl host rm <name>                          remove a host
-  t3ctl hosts                                   list registered hosts
+  t3ctl hosts                                   list hosts and probe each one
 
   t3ctl project create <title> <root>           create a project for an existing dir
   t3ctl thread create <project> <title>         start a thread (--model inst/model,

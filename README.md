@@ -19,8 +19,8 @@ npm i -g @gobius/t3ctl
 # 2. mint a token — run this on the machine hosting T3 Code
 npx t3 auth session issue --label t3ctl --ttl 30d --token-only
 
-# 3. register that host under a short name of your choosing
-t3ctl host add laptop http://localhost:3773 eyJ2Ijox...
+# 3. register that host — t3ctl probes it and names it after the machine
+t3ctl host add http://localhost:3773 eyJ2Ijox...
 
 # 4. see everything
 t3ctl ls
@@ -81,14 +81,40 @@ t3ctl ls --json | jq -r '.projects[].threads[] | select(.status=="running") | .t
 The JSON shape is `{projects: [{host, id, title, workspaceRoot, threads: [{id,
 title, branch, status, provider, updatedAt}]}], unreachable: [{host, error}]}`.
 
-### `t3ctl host add <name> <origin> <token>`
+### `t3ctl host add <origin> [token] [--name <name>]`
 
-Register (or overwrite) a host. `<name>` is whatever you want to call it locally;
-`<origin>` is a scheme + host + optional port, with any trailing slash trimmed.
+Register (or update) a host. `<origin>` is a scheme + host + optional port, with
+any trailing slash trimmed — the scheme is required.
+
+Before writing anything, t3ctl fetches the host's environment descriptor from
+`/.well-known/t3/environment`. That endpoint is unauthenticated, so it confirms
+you are pointed at a real T3 Code server *before* a token is involved: a wrong
+origin fails with `not a T3 Code server` instead of a confusing 401 on your first
+`ls`. The descriptor's `environmentId`, `label` and `serverVersion` are stored
+alongside the token.
 
 ```sh
-t3ctl host add desktop https://studio.tailnet-1234.ts.net eyJ2Ijox...
+t3ctl host add https://studio.tailnet-1234.ts.net eyJ2Ijox...
 ```
+
+The host is named after the machine's own label (`SPR-Gobius-D` becomes
+`spr-gobius-d`); pass `--name` to choose your own. Re-running `host add` for an
+origin you already have updates that entry in place and keeps the stored token if
+you don't pass a new one.
+
+t3ctl warns you when:
+
+- the new host's `serverVersion` differs from your other hosts — the API is not a
+  stable public interface, so a version split is worth knowing about
+- an origin you already registered now reports a **different `environmentId`**,
+  meaning it points at a different machine than it used to and the stored token
+  belongs to the old one
+
+The token is optional so you can register a host before minting one, but reads
+will fail until you add it.
+
+The older `t3ctl host add <name> <origin> <token>` form still works and prints a
+deprecation notice.
 
 ### `t3ctl host rm <name>`
 
@@ -98,7 +124,8 @@ t3ctl host rm desktop
 
 ### `t3ctl hosts`
 
-List registered hosts with truncated tokens. `t3ctl host` with no subcommand does
+List registered hosts, probing each one in parallel for its label, environment id
+(shortened), server version and reachability. `t3ctl host` with no subcommand does
 the same thing.
 
 ```sh
@@ -106,9 +133,12 @@ t3ctl hosts
 ```
 
 ```
-laptop           http://localhost:3773  token:eyJ2Ijox…
-desktop          https://studio.tailnet-1234.ts.net  token:eyJ2Ijox…
+● laptop         SPR-Gobius-D       9d9d9921  0.0.38-nightly.20260901.1250  http://localhost:3773
+✕ desktop        Desktop            11111111  0.0.31-nightly.20260801.0900  https://studio.tailnet-1234.ts.net  cannot reach …
 ```
+
+Unreachable hosts are dimmed and show the values last recorded, not live ones.
+`ls` deliberately does *not* probe — it stays a single request per host.
 
 ### `t3ctl project create <title> <workspace-root>`
 
@@ -264,9 +294,9 @@ reachable URL works.** There's nothing to configure beyond `host add`.
 and give each host its own short name:
 
 ```sh
-t3ctl host add laptop  http://localhost:3773                  eyJ2Ijox...
-t3ctl host add desktop https://studio.tailnet-1234.ts.net     eyJ2Ijox...
-t3ctl host add builder http://10.0.0.42:3773                  eyJ2Ijox...
+t3ctl host add http://localhost:3773               eyJ2Ijox...
+t3ctl host add https://studio.tailnet-1234.ts.net  eyJ2Ijox...
+t3ctl host add http://10.0.0.42:3773               eyJ2Ijox...
 t3ctl ls -t
 ```
 
