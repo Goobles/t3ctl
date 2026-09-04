@@ -6,11 +6,21 @@ name: release
 on:
   push:
     branches: ["main"]
+  # A stage can be rejected, or expire, after the GitHub release already exists.
+  # release-please then reports release_created=false forever, so a rerun can
+  # never re-stage. This is the manual path back.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to stage, e.g. v0.4.0"
+        required: true
+        type: string
 
 permissions: {}
 
 jobs:
   release-please:
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     permissions:
       contents: write # create the release branch, tag and GitHub release
@@ -30,8 +40,15 @@ jobs:
   # not trigger a second workflow.
   stage:
     needs: release-please
-    if: needs.release-please.outputs.release_created == 'true'
+    # always() so a skipped release-please (manual dispatch) does not skip this.
+    if: |
+      always() && (
+        needs.release-please.outputs.release_created == 'true' ||
+        github.event_name == 'workflow_dispatch'
+      )
     runs-on: ubuntu-latest
+    env:
+      TAG: ${{ inputs.tag || needs.release-please.outputs.tag_name }}
 
     # Trust boundary. npm's trusted publisher pins this workflow filename AND
     # this environment; add required reviewers here to gate on a human.
@@ -46,7 +63,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ needs.release-please.outputs.tag_name }}
+          ref: ${{ inputs.tag || needs.release-please.outputs.tag_name }}
           persist-credentials: false
 
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
@@ -65,8 +82,6 @@ jobs:
           pkg="$(node -p 'require("./package.json").version')"
           echo "tag=$tag package.json=$pkg"
           [ "$tag" = "$pkg" ] || { echo "::error::tag v$tag does not match package.json $pkg"; exit 1; }
-        env:
-          TAG: ${{ needs.release-please.outputs.tag_name }}
 
       - name: Smoke test
         run: |
