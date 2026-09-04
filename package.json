@@ -1,6 +1,6 @@
 {
   "name": "@gobius/t3ctl",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "type": "module",
   "description": "Controller CLI for T3 Code hosts — list and drive threads across machines",
   "keywords": [
