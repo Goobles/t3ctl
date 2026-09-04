@@ -83,11 +83,18 @@ jobs:
           echo "tag=$tag package.json=$pkg"
           [ "$tag" = "$pkg" ] || { echo "::error::tag v$tag does not match package.json $pkg"; exit 1; }
 
-      - name: Smoke test
-        run: |
-          node --check t3ctl.mjs
-          node t3ctl.mjs | head -1
-          npm pack --dry-run
+      # t3ctl now has a runtime dependency, so it cannot even start without an
+      # install. Note `node t3ctl.mjs | head -1` would NOT catch that: the pipe
+      # masks the exit code and the step would pass while broken.
+      - name: Install
+        run: npm ci --ignore-scripts
+
+      # tsc typechecks as it emits, so this is the typecheck too.
+      - name: Build
+        run: npm run build
+
+      - name: Test
+        run: npm test
 
       # Stages only. The trusted publisher is stage-only, so this cannot make a
       # version public — a maintainer approves it with 2FA on npmjs.com or via

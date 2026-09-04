@@ -236,6 +236,32 @@ construction. What produces a reachable origin:
   touching the network, so `t3ctl host add` with no arguments prints usage. Keep
   it that way — the no-host paths are exercised in CI.
 
+## Working on it
+
+TypeScript, compiled with `tsc` to `dist/`, which is what gets published.
+
+```sh
+npm ci
+npm run build        # tsc -> dist/ (typechecks as it emits)
+npm test             # runs test/*.test.mjs against dist/
+node dist/t3ctl.js --help
+```
+
+`npm test` does not build. Both workflows are install -> build -> test, so the
+steps stay honest about what failed; running the tests without a build gives a
+clear message rather than a wall of assertion errors.
+
+Tests drive the built CLI as a subprocess and assert on the contract a user
+sees — help, exit codes, argument rejection — rather than on internals. They
+run with `HOME` pointed at a nonexistent directory and touch no network, so
+every case works with no hosts registered. CI runs exactly `npm test`; there
+are no assertions living only in the workflow.
+
+`strict` and `noUncheckedIndexedAccess` are both on. Note the workflows run
+`npm ci --ignore-scripts`, so `prepack`/`prepublishOnly` never fire — the build
+is an explicit step in both CI and release. Without it an empty `dist/` would
+be staged.
+
 ## Releasing
 
 Publishing runs in CI via **npm trusted publishing (OIDC)**. There is no

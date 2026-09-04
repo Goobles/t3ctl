@@ -21,10 +21,10 @@
     "url": "https://github.com/Goobles/t3ctl/issues"
   },
   "bin": {
-    "t3ctl": "t3ctl.mjs"
+    "t3ctl": "./dist/t3ctl.js"
   },
   "files": [
-    "t3ctl.mjs",
+    "dist",
     "README.md",
     "LICENSE"
   ],
@@ -33,5 +33,17 @@
   },
   "publishConfig": {
     "access": "public"
+  },
+  "dependencies": {
+    "commander": "^15.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^26.4.1",
+    "typescript": "^7.0.2"
+  },
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "test": "node --test test/*.test.mjs"
   }
 }

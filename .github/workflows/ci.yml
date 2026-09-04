@@ -29,33 +29,12 @@ jobs:
         with:
           node-version: ${{ matrix.node }}
 
-      # Zero dependencies and no build step, so there is nothing to install.
-      - name: Parse
-        run: node --check t3ctl.mjs
+      - name: Install
+        run: npm ci --ignore-scripts
 
-      - name: CLI runs and prints help
-        run: |
-          out="$(node t3ctl.mjs)"
-          echo "$out"
-          echo "$out" | grep -q 't3ctl ls' || { echo "::error::help output missing expected commands"; exit 1; }
+      # tsc typechecks as it emits, so this is the typecheck too.
+      - name: Build
+        run: npm run build
 
-      # Exercise the arg-parsing paths that don't need a host, so a typo in the
-      # command table fails here rather than at release time.
-      - name: Subcommand usage paths
-        run: |
-          node t3ctl.mjs project create 2>&1 | grep -q 'usage:' || { echo "::error::project create usage missing"; exit 1; }
-          node t3ctl.mjs thread create  2>&1 | grep -q 'usage:' || { echo "::error::thread create usage missing"; exit 1; }
-          node t3ctl.mjs thread start   2>&1 | grep -q 'usage:' || { echo "::error::thread start usage missing"; exit 1; }
-          node t3ctl.mjs host add       2>&1 | grep -q 'usage:' || { echo "::error::host add usage missing"; exit 1; }
-          node t3ctl.mjs host rm        2>&1 | grep -q 'usage:' || { echo "::error::host rm usage missing"; exit 1; }
-
-      - name: Package is publishable
-        run: npm pack --dry-run
-
-      # The release job enforces this too, but catching it on the PR means a bad
-      # version never reaches a tag in the first place.
-      - name: bin target exists and is executable
-        run: |
-          bin="$(node -p 'require("./package.json").bin.t3ctl')"
-          test -f "$bin" || { echo "::error::bin target $bin missing"; exit 1; }
-          head -1 "$bin" | grep -q '^#!/usr/bin/env node' || { echo "::error::$bin missing shebang"; exit 1; }
+      - name: Test
+        run: npm test
