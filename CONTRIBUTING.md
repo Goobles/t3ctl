@@ -6,11 +6,13 @@ read the [README](README.md) instead.
 
 ## Working on this
 
-t3ctl is a single dependency-free ESM file (`t3ctl.mjs`) targeting Node >= 22.
-There is no build step and no test suite yet — run it directly:
+t3ctl is a single TypeScript file (`src/t3ctl.ts`) targeting Node >= 22,
+compiled to `dist/`. See [Working on it](#working-on-it) for the build and test
+loop:
 
 ```sh
-node t3ctl.mjs ls -t
+npm ci && npm run build
+node dist/t3ctl.js ls -t
 ```
 
 [T3 Code](https://github.com/pingdotgg/t3code) is MIT-licensed open source.
@@ -179,6 +181,58 @@ anything else is considered:
 If you add a status, add it to `ICON` too — `ls` prints `?` for anything
 unmapped rather than crashing.
 
+## Reading the state database
+
+`export prompts` is the one command that reads T3 Code's storage instead of its
+API, so it is worth explaining why.
+
+The API can answer "which prompts did a human type today" only in N+1 requests:
+the snapshot lists threads but carries **no messages**, so every candidate
+thread needs its own `GET /api/orchestration/threads/:id`. The host's own
+SQLite answers it in one join. On a machine with 200-odd threads that is the
+difference between a few hundred requests and 30ms.
+
+The store is `~/.t3/userdata/state.sqlite`. Three projection tables matter, and
+they are projections — rebuilt from `orchestration_events`, never authoritative:
+
+| Table | Columns used |
+|---|---|
+| `projection_thread_messages` | `message_id`, `thread_id`, `role`, `text`, `created_at` |
+| `projection_threads` | `thread_id`, `project_id`, `deleted_at` |
+| `projection_projects` | `project_id`, `workspace_root`, `deleted_at` |
+
+Reading them is a stability bet of the same kind as the HTTP endpoints, but a
+separate one: a T3 Code release could rename a column without touching the API.
+If that happens, the HTTP strategy still works — which is part of why both
+strategies survive.
+
+**The invariant: every strategy returns the same rows.** A prompt must not
+appear or vanish depending on how a host happens to be reachable. `PROMPT_SQL`
+is one constant, and the HTTP path deliberately filters only `deletedAt` — it
+does *not* also skip archived threads, because the SQL does not. If you change
+what one strategy excludes, change both.
+
+The HTTP path does prefilter which threads it fetches (`mayHavePrompts`), but
+only on facts that cannot hide a row: a thread whose `updatedAt` predates the
+window has had no message in it, and one created after the window closed has
+none either. Threads with unknown timestamps are fetched.
+
+### Things that bit
+
+- **`node:sqlite` was flagged when it landed.** It arrived in Node 22.5 behind
+  `--experimental-sqlite` and is unflagged on current releases (CI proves it on
+  22.23 and 24), but `engines` says `>=22`, which still admits the flagged ones.
+  A top-level `import` would break *every* command there — including `--help` —
+  so it is imported lazily inside the sqlite path.
+- **No copy is needed to read it.** The store is in WAL mode, so a reader
+  neither blocks the running app nor is blocked by it. (Tools that copy it first
+  are working around read-only opens of a WAL database with no `-shm` present.)
+  The copy alternative costs ~500 MB of disk churn on every run.
+
+Timestamps are compared as ISO instants throughout, and `--since`/`--until` are
+a half-open `[since, until)` UTC window — a bare `YYYY-MM-DD` is a UTC day
+boundary, not local midnight.
+
 ## Transports
 
 t3ctl only ever sees an origin string, so it is transport-agnostic by
@@ -221,6 +275,9 @@ construction. What produces a reachable origin:
   for `ls`, wrong for polling — a poller should use `snapshotSequence` for
   incremental sync. t3ctl re-fetches the whole snapshot on every write command
   in order to resolve a project/thread reference, which is wasteful but simple.
+- `export prompts` has two strategies for the same rows and only one of them
+  goes through the API. They are kept in step by hand — see [Reading the state
+  database](#reading-the-state-database).
 - `ls` fans out to every registered host and has no `--host` filter; the write
   commands take `--host` and require it when more than one host is registered.
 - Tokens are stored in plaintext in `~/.config/t3ctl/hosts.json` (dir `0700`,
