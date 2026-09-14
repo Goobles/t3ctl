@@ -203,15 +203,14 @@ they are projections — rebuilt from `orchestration_events`, never authoritativ
 
 Reading them is a stability bet of the same kind as the HTTP endpoints, but a
 separate one: a T3 Code release could rename a column without touching the API.
-If that happens, the HTTP strategy still works — which is part of why all three
+If that happens, the HTTP strategy still works — which is part of why both
 strategies survive.
 
 **The invariant: every strategy returns the same rows.** A prompt must not
 appear or vanish depending on how a host happens to be reachable. `PROMPT_SQL`
-is one constant shared by the local and ssh paths for that reason, and the HTTP
-path deliberately filters only `deletedAt` — it does *not* also skip archived
-threads, because the SQL does not. If you change what one strategy excludes,
-change all three.
+is one constant, and the HTTP path deliberately filters only `deletedAt` — it
+does *not* also skip archived threads, because the SQL does not. If you change
+what one strategy excludes, change both.
 
 The HTTP path does prefilter which threads it fetches (`mayHavePrompts`), but
 only on facts that cannot hide a row: a thread whose `updatedAt` predates the
@@ -224,18 +223,11 @@ none either. Threads with unknown timestamps are fetched.
   `--experimental-sqlite` and is unflagged on current releases (CI proves it on
   22.23 and 24), but `engines` says `>=22`, which still admits the flagged ones.
   A top-level `import` would break *every* command there — including `--help` —
-  so it is imported lazily inside the sqlite path, and the ssh strategy retries
-  the remote `node` once with the flag.
-- **The database is ~500 MB.** The obvious ssh implementation — `cat` the file
-  and query it locally — moves half a gigabyte to return a few kilobytes. The
-  query runs on the far side instead; only rows come back.
+  so it is imported lazily inside the sqlite path.
 - **No copy is needed to read it.** The store is in WAL mode, so a reader
   neither blocks the running app nor is blocked by it. (Tools that copy it first
   are working around read-only opens of a WAL database with no `-shm` present.)
-- **The remote script travels on stdin.** `ssh host node - "$HOME/..." '<since>'
-  '<until>'` keeps the program itself out of the remote shell's hands; only the
-  two bounds are interpolated, and they are matched against a strict ISO
-  pattern first.
+  The copy alternative costs ~500 MB of disk churn on every run.
 
 Timestamps are compared as ISO instants throughout, and `--since`/`--until` are
 a half-open `[since, until)` UTC window — a bare `YYYY-MM-DD` is a UTC day
@@ -283,7 +275,7 @@ construction. What produces a reachable origin:
   for `ls`, wrong for polling — a poller should use `snapshotSequence` for
   incremental sync. t3ctl re-fetches the whole snapshot on every write command
   in order to resolve a project/thread reference, which is wasteful but simple.
-- `export prompts` has three strategies for the same rows and only one of them
+- `export prompts` has two strategies for the same rows and only one of them
   goes through the API. They are kept in step by hand — see [Reading the state
   database](#reading-the-state-database).
 - `ls` fans out to every registered host and has no `--host` filter; the write

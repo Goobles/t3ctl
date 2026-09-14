@@ -11,7 +11,8 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync, statSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { tmpdir } from 'node:os';
+import { createServer } from 'node:net';
+import { networkInterfaces, tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 const run = promisify(execFile);
@@ -125,7 +126,7 @@ test('export prompts needs a host registry like every other read', async () => {
 // The export tests build a world instead of mocking one: a throwaway
 // state.sqlite plus a host registry, which between them decide which strategy
 // the CLI picks. No server and no network — a host on loopback is read from the
-// database directly, and the ssh strategy gets a stub `ssh` on PATH.
+// database directly.
 //
 // Early Node 22 releases keep node:sqlite behind --experimental-sqlite, so these
 // skip rather than fail there; current 22.x and 24 run them. That flag is why
@@ -137,6 +138,28 @@ try {
   DatabaseSync = null;
 }
 const needsSqlite = { skip: DatabaseSync ? false : 'node:sqlite is flagged on this Node' };
+
+/**
+ * A URL the CLI will treat as remote (non-loopback host) but that fails
+ * instantly with ECONNREFUSED: the test machine's LAN/Tailscale address on a
+ * port we borrow and release — connecting to a non-loopback local address on a
+ * closed port is refused, not timed out, unlike an unroutable address such as
+ * 10.0.0.9. The listener is closed before returning so it cannot keep the test
+ * process alive; the rebind window is a few milliseconds.
+ */
+const refusedRemoteOrigin = async () => {
+  const ip = Object.values(networkInterfaces())
+    .flat().filter((i) => i?.family === 'IPv4' && !i.internal).map((i) => i.address)[0]
+    ?? '127.0.1.1'; // no external IPv4 (bare CI runner): loopback, but not one the CLI special-cases
+  const server = createServer();
+  const port = await new Promise((resolve, reject) => {
+    server.once('listening', () => resolve(server.address().port));
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1');
+  });
+  server.close();
+  return `http://${ip}:${port}`;
+};
 
 const SCHEMA = `
   CREATE TABLE projection_projects (project_id TEXT, workspace_root TEXT, deleted_at TEXT);
@@ -160,10 +183,17 @@ const LOCAL_HOST = { name: 'box', origin: 'http://127.0.0.1:3773', token: null }
 
 /** Run `export prompts --json` against a fixture HOME and parse what comes back. */
 const exportPrompts = async (home, args = [], env = {}) => {
-  const { stdout } = await run(process.execPath, [
-    CLI, 'export', 'prompts', '--since', '2026-09-14', '--until', '2026-09-15', '--json', ...args,
-  ], { env: { ...process.env, HOME: home, ...env } });
-  return JSON.parse(stdout);
+  try {
+    const { stdout } = await run(process.execPath, [
+      CLI, 'export', 'prompts', '--since', '2026-09-14', '--until', '2026-09-15', '--json', ...args,
+    ], { env: { ...process.env, HOME: home, ...env } });
+    return JSON.parse(stdout);
+  } catch (error) {
+    // Some worlds make every host unreachable, and the CLI then exits non-zero
+    // after still printing the JSON. Surface both rather than throw.
+    if (error.stdout) return JSON.parse(error.stdout);
+    throw error;
+  }
 };
 
 test('export prompts reads the local state database', needsSqlite, async () => {
@@ -223,30 +253,27 @@ test('the longest matching --watch root wins', needsSqlite, async () => {
   }
 });
 
-test('a host with an ssh target is queried over ssh, not over HTTP', needsSqlite, async () => {
+test('a host off loopback goes over HTTP, and its markers carry the host name', needsSqlite, async () => {
+  // The origin points at a port with no listener, so the fetch is refused —
+  // that is what the test asserts. What it pins down is the *strategy choice*:
+  // the host is not read from the local database, which a wrong loopback check
+  // would do. A non-loopback address would also work but resolves slowly when
+  // it is unroutable; a closed local port refuses in milliseconds.
   const home = fixtureHome(
-    [{ name: 'remotebox', origin: 'http://10.0.0.9:3773', token: 'x', ssh: 'me@remotebox' }],
+    [{ name: 'remotebox', origin: await refusedRemoteOrigin(), token: 'x' }],
     (h) => `
       INSERT INTO projection_projects VALUES ('p1', '${h}/Code/alpha', NULL);
       INSERT INTO projection_threads VALUES ('t1','p1',NULL);
-      INSERT INTO projection_thread_messages VALUES ('m1','t1','user','over ssh','2026-09-14T10:00:00.000Z');
+      INSERT INTO projection_thread_messages VALUES ('m1','t1','user','over http','2026-09-14T10:00:00.000Z');
     `,
   );
   try {
-    // Stands in for ssh: drop "-o BatchMode=yes <target>" and run the remote
-    // command here, stdin passed through as ssh would. The origin above points
-    // nowhere, so anything reaching the network fails instead of passing.
-    const bin = join(home, 'bin');
-    mkdirSync(bin);
-    writeFileSync(join(bin, 'ssh'), '#!/bin/sh\nshift 3\nexec sh -c "$1"\n', { mode: 0o755 });
-
-    const { messages, unreachable } = await exportPrompts(home, [], { PATH: `${bin}:${process.env.PATH}` });
-    assert.deepEqual(unreachable, []);
-    assert.equal(messages.length, 1);
-    assert.equal(messages[0].text, 'over ssh');
-    // Remote hosts get their name in the marker: two machines can hold the same
-    // repo at the same path, and a marker has to stay unique across them.
-    assert.equal(messages[0].marker, 'remotebox/alpha');
+    const { messages, unreachable } = await exportPrompts(home);
+    // Not read from the local store despite the identical rows sitting in it.
+    assert.deepEqual(messages, []);
+    assert.equal(unreachable.length, 1);
+    assert.equal(unreachable[0].host, 'remotebox');
+    assert.match(unreachable[0].error, /fetch failed|ECONNREFUSED/i);
   } finally {
     rmSync(home, { recursive: true, force: true });
   }

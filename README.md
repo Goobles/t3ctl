@@ -323,24 +323,13 @@ Same rows either way; only the cost differs.
 | Host | How | Cost |
 |---|---|---|
 | Origin on loopback | Reads `~/.t3/userdata/state.sqlite` directly | One query |
-| `"ssh"` set in `hosts.json` | Runs the query over ssh, streams rows back | One round trip |
 | Anything else | Snapshot, then one fetch per thread that could match | N+1 requests |
 
-The database is in WAL mode, so reading it alongside a running T3 Code is safe
-and needs no copy — which matters, because it runs to hundreds of megabytes.
-
-The ssh strategy is opt-in and hand-configured: add an `"ssh"` field to a host
-in `~/.config/t3ctl/hosts.json` and it is used instead of HTTP.
-
-```json
-{ "name": "studio", "origin": "https://studio.tailnet-1234.ts.net",
-  "token": "eyJ2Ijox...", "ssh": "me@studio" }
-```
-
-It needs `node` on the far machine. Current Node has `node:sqlite` built in; on
-an older one that still wants `--experimental-sqlite`, t3ctl retries with the
-flag automatically. It never copies the database: the query runs there and only
-the rows come back.
+The snapshot is filtered by each thread's `updatedAt` before anything is
+fetched, so a host with hundreds of idle threads still only requests the ones
+active in the window. The database is in WAL mode, so reading it alongside a
+running T3 Code is safe and needs no copy — which matters, because it runs to
+hundreds of megabytes.
 
 ## Referring to projects and threads
 

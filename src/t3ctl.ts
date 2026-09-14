@@ -4,7 +4,6 @@
 // Spike scope: host registry + read-only listing.
 
 import fs from 'node:fs';
-import { spawn } from 'node:child_process';
 import { Command } from 'commander';
 import type { OptionValues } from 'commander';
 import os from 'node:os';
@@ -18,8 +17,6 @@ type Host = {
   name: string;
   origin: string;
   token: string | null;
-  /** `[user@]host` for `export prompts`. Hand-written in hosts.json; nothing sets it. */
-  ssh?: string;
   environmentId?: string;
   label?: string;
   serverVersion?: string;
@@ -537,7 +534,7 @@ const cmdThreadSimple = async (verb: string, ref: string, flags: Flags): Promise
 // to learn the thread ids, then one fetch per thread, since snapshot threads
 // carry no messages — for data that is one join in the host's own database.
 //
-// Three strategies, cheapest first. They are deliberately written to return the
+// Two strategies, cheapest first. They are deliberately written to return the
 // same rows: a prompt must not appear or vanish depending on how a host happens
 // to be reachable. That is why the HTTP path filters only `deletedAt`, matching
 // the SQL, and does not also drop archived threads.
@@ -561,11 +558,10 @@ type Prompt = {
   marker: string;
 };
 
-type Strategy = 'sqlite' | 'ssh' | 'http';
+type Strategy = 'sqlite' | 'http';
 
 const STRATEGY_LABEL: Record<Strategy, string> = {
   sqlite: 'local state.sqlite',
-  ssh: 'state.sqlite over ssh',
   http: 'snapshot + per-thread fetch',
 };
 
@@ -605,7 +601,8 @@ const cleanPrompt = (text: string): string => {
   return (tagged?.[1] ?? text).replace(/\s+/g, ' ').trim();
 };
 
-// One statement, shared by the local and ssh strategies so they cannot drift.
+// One statement, shared by every strategy that reads the local store directly,
+// so it cannot drift from what the HTTP path reconstructs.
 const PROMPT_SQL = `SELECT m.message_id, m.thread_id, m.text, m.created_at, p.workspace_root
 FROM projection_thread_messages m
 JOIN projection_threads t ON t.thread_id = m.thread_id
@@ -615,9 +612,6 @@ WHERE m.role = 'user'
   AND p.deleted_at IS NULL
   AND m.created_at >= ? AND m.created_at < ?
 ORDER BY m.created_at`;
-
-/** `created_at` is stored as an ISO instant, so the bounds must be exactly that too. */
-const ISO_INSTANT = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
 
 /**
  * A bare `--since 2026-09-14` is the UTC day boundary, not local midnight: the
@@ -657,50 +651,6 @@ const queryLocal = async (since: string, until: string): Promise<PromptRow[]> =>
   } finally {
     db.close();
   }
-};
-
-// Copying the database would move hundreds of megabytes to answer with a few
-// kilobytes, so the query runs on the far side and only rows come back. The
-// script travels on stdin, which keeps it out of the remote shell's hands
-// entirely; only the two bounds are interpolated, and those are checked against
-// ISO_INSTANT first.
-const REMOTE_QUERY = `const { DatabaseSync } = require('node:sqlite');
-const [file, since, until] = process.argv.slice(2);
-const db = new DatabaseSync(file, { readOnly: true });
-process.stdout.write(JSON.stringify(db.prepare(${JSON.stringify(PROMPT_SQL)}).all(since, until)));
-db.close();`;
-
-const sshQuery = (target: string, bounds: [string, string], nodeFlags: string[]): Promise<string> =>
-  new Promise((resolve, reject) => {
-    const argv = [...nodeFlags, '-', `"$HOME/${STATE_DB}"`, ...bounds.map((b) => `'${b}'`)];
-    const child = spawn('ssh', ['-o', 'BatchMode=yes', target, `node ${argv.join(' ')}`], {
-      stdio: ['pipe', 'pipe', 'pipe'],
-    });
-    let out = '';
-    let err = '';
-    child.stdout.setEncoding('utf8').on('data', (c: string) => { out += c; });
-    child.stderr.setEncoding('utf8').on('data', (c: string) => { err += c; });
-    child.on('error', reject);
-    child.on('close', (code) => (code === 0
-      ? resolve(out)
-      : reject(new Error(err.trim().split('\n').at(-1) || `ssh ${target} exited ${code}`))));
-    child.stdin.end(REMOTE_QUERY);
-  });
-
-const queryOverSsh = async (target: string, since: string, until: string): Promise<PromptRow[]> => {
-  for (const bound of [since, until]) {
-    if (!ISO_INSTANT.test(bound)) throw new Error(`refusing to send a malformed bound over ssh: ${bound}`);
-  }
-  let raw: string;
-  try {
-    raw = await sshQuery(target, [since, until], []);
-  } catch (error) {
-    // An early Node 22 on the far machine keeps node:sqlite behind a flag. Retry
-    // once rather than make the user care which Node it happens to run.
-    if (!/node:sqlite|experimental-sqlite|UNKNOWN_BUILTIN_MODULE/.test(errorMessage(error))) throw error;
-    raw = await sshQuery(target, [since, until], ['--experimental-sqlite']);
-  }
-  return JSON.parse(raw) as PromptRow[];
 };
 
 /** `Date.parse` returns NaN for junk and for null; both mean "cannot compare". */
@@ -768,8 +718,8 @@ const queryOverHttp = async (host: Host, since: string, until: string): Promise<
 
 /**
  * Loopback means the database this process can already open is the very one the
- * host serves, so read it and skip the network. Otherwise an `ssh` target in
- * hosts.json beats HTTP, because one round trip beats N+1.
+ * host serves, so read it and skip the network entirely. Everything else goes
+ * over HTTP.
  */
 const LOOPBACK = new Set(['localhost', '127.0.0.1', '::1', '[::1]']);
 
@@ -778,13 +728,11 @@ const strategyFor = (host: Host): Strategy => {
   try {
     hostname = new URL(host.origin).hostname;
   } catch { /* an unparseable origin is not loopback; let the HTTP path report it */ }
-  if (LOOPBACK.has(hostname)) return 'sqlite';
-  return host.ssh ? 'ssh' : 'http';
+  return LOOPBACK.has(hostname) ? 'sqlite' : 'http';
 };
 
 const readPrompts = (host: Host, strategy: Strategy, since: string, until: string): Promise<PromptRow[]> => {
   if (strategy === 'sqlite') return queryLocal(since, until);
-  if (strategy === 'ssh') return queryOverSsh(host.ssh ?? '', since, until);
   return queryOverHttp(host, since, until);
 };
 
