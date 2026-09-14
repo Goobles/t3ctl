@@ -337,9 +337,10 @@ in `~/.config/t3ctl/hosts.json` and it is used instead of HTTP.
   "token": "eyJ2Ijox...", "ssh": "me@studio" }
 ```
 
-It needs `node` on the far machine (Node 24, or 22 with `--experimental-sqlite`
-— t3ctl retries with the flag automatically). It never copies the database: the
-query runs there and only the rows come back.
+It needs `node` on the far machine. Current Node has `node:sqlite` built in; on
+an older one that still wants `--experimental-sqlite`, t3ctl retries with the
+flag automatically. It never copies the database: the query runs there and only
+the rows come back.
 
 ## Referring to projects and threads
 

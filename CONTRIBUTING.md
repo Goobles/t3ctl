@@ -220,11 +220,12 @@ none either. Threads with unknown timestamps are fetched.
 
 ### Things that bit
 
-- **`node:sqlite` is flagged on Node 22.** It is unflagged from Node 24, but
-  `engines` still says `>=22`, so a top-level `import` would break *every*
-  command there — including `--help`. It is imported lazily inside the sqlite
-  path instead, and the ssh strategy retries the remote `node` once with
-  `--experimental-sqlite`.
+- **`node:sqlite` was flagged when it landed.** It arrived in Node 22.5 behind
+  `--experimental-sqlite` and is unflagged on current releases (CI proves it on
+  22.23 and 24), but `engines` says `>=22`, which still admits the flagged ones.
+  A top-level `import` would break *every* command there — including `--help` —
+  so it is imported lazily inside the sqlite path, and the ssh strategy retries
+  the remote `node` once with the flag.
 - **The database is ~500 MB.** The obvious ssh implementation — `cat` the file
   and query it locally — moves half a gigabyte to return a few kilobytes. The
   query runs on the far side instead; only rows come back.
