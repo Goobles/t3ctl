@@ -295,6 +295,82 @@ t3ctl thread delete "scratch experiment"
 
 `delete` is not prompted and not undoable from t3ctl — check with `ls -t` first.
 
+### `t3ctl export prompts --since <date> [--until <date>]`
+
+Every prompt you typed in a window, across every registered host, with the
+project each one happened in. Read-only, and built for other tools to consume
+rather than for reading yourself — time trackers, activity logs, weeknotes.
+
+```sh
+t3ctl export prompts --since 2026-09-14 --until 2026-09-15
+```
+```
+29 prompts  2026-09-14T00:00:00.000Z -> 2026-09-15T00:00:00.000Z
+
+agentbox  29  local state.sqlite
+  @clients/dsl  28
+  t3ctl          1
+```
+
+| Option | |
+|---|---|
+| `--since <date>` | Required. Start of the window, inclusive. |
+| `--until <date>` | End of the window, exclusive. Defaults to now. |
+| `--host <name>` | Just this host. Defaults to all of them. |
+| `--watch <path>` | Only projects under this root. Repeatable. Defaults to `~/Code`. |
+| `--json` | The full records instead of the summary. |
+
+A bare `YYYY-MM-DD` is a **UTC** day boundary, not local midnight — the stored
+timestamps are UTC and an export should mean the same window wherever it runs.
+Pass a full ISO instant (`2026-09-14T09:00:00+02:00`) when you want a different
+edge. The window is half-open: `[since, until)`.
+
+`--watch` is also the filter. A prompt in a project outside every watched root
+is not exported, because it has no marker to file it under.
+
+With `--json`:
+
+```json
+{
+  "messages": [
+    {
+      "host": "agentbox",
+      "threadId": "f54ddbd8-92e1-402b-b228-a45e948e2f08",
+      "messageId": "8e7ea607-39db-4572-9373-92d3ac764bc7",
+      "createdAt": "2026-09-14T10:32:47.421Z",
+      "text": "which data is being fetched from /api/data?",
+      "workspaceRoot": "/home/agent/Code/@clients/dsl",
+      "marker": "@clients/dsl"
+    }
+  ],
+  "unreachable": []
+}
+```
+
+`text` is the prompt on one line: `<user_query>` wrappers removed, whitespace
+collapsed. `marker` is the project path relative to the watched root it sits
+under — prefixed with the host name for every host but the local one, since two
+machines routinely hold the same repo at the same path.
+
+A host that can't be read lands in `unreachable` and the rest still return, so
+one asleep laptop doesn't cost you the export. The exit code is non-zero only
+when *every* host failed.
+
+#### How each host is read
+
+Same rows either way; only the cost differs.
+
+| Host | How | Cost |
+|---|---|---|
+| Origin on loopback | Reads `~/.t3/userdata/state.sqlite` directly | One query |
+| Anything else | Snapshot, then one fetch per thread that could match | N+1 requests |
+
+The snapshot is filtered by each thread's `updatedAt` before anything is
+fetched, so a host with hundreds of idle threads still only requests the ones
+active in the window. The database is in WAL mode, so reading it alongside a
+running T3 Code is safe and needs no copy — which matters, because it runs to
+hundreds of megabytes.
+
 ## Referring to projects and threads
 
 You rarely need to paste a UUID.
@@ -402,8 +478,8 @@ Worth knowing before you build a workflow on this:
   messages — a state the desktop UI never produces. Follow it with `thread start`,
   or the thread just sits there.
 - **Not everything the API supports is wired up.** No `pin`, `unsettle`,
-  `snooze`/`unsnooze`, no reading message content, no live tailing of a running
-  turn. `unpin` exists without `pin` because only some of these share a payload
+  `snooze`/`unsnooze`, no live tailing of a running turn. `export prompts` reads
+  your own prompts; nothing reads agent output. `unpin` exists without `pin` because only some of these share a payload
   shape — see [CONTRIBUTING.md](CONTRIBUTING.md).
 - **`ls` fetches full snapshots.** Fine interactively; too heavy to poll in a
   loop.

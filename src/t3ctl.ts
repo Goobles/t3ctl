@@ -52,6 +52,7 @@ type Thread = {
   title: string;
   branch?: string | null;
   worktreePath?: string | null;
+  createdAt?: string;
   updatedAt: string;
   deletedAt?: string | null;
   archivedAt?: string | null;
@@ -64,6 +65,17 @@ type Thread = {
   latestTurn?: { state?: string } | null;
   proposedPlans?: unknown[];
   titleRegeneration?: unknown | null;
+  /** Only ever populated by the per-thread endpoint; the snapshot leaves it empty. */
+  messages?: ThreadMessage[];
+};
+
+/** A message as `thread.message-sent` carries it, which is what the detail endpoint serialises. */
+type ThreadMessage = {
+  messageId?: string;
+  id?: string;
+  role?: string;
+  text?: string;
+  createdAt?: string;
 };
 
 type Project = {
@@ -802,9 +814,12 @@ const cmdThreadRename = async (thread: Thread, host: Host, title: string): Promi
 
 // Lighter than the full snapshot; retitle polls this so it does not refetch every
 // thread's history once a second.
-const threadDetail = async (host: Host, threadId: string): Promise<Thread> => {
+// `turnLimit` is null for callers that want the whole history (export), 1 for
+// callers that only want to poll a field (retitle).
+const threadDetail = async (host: Host, threadId: string, turnLimit: number | null = 1): Promise<Thread> => {
   await ensureTunnel(host);
-  const res = await fetch(`${host.origin}/api/orchestration/threads/${threadId}?turnLimit=1`, {
+  const query = turnLimit === null ? '' : `?turnLimit=${turnLimit}`;
+  const res = await fetch(`${host.origin}/api/orchestration/threads/${threadId}${query}`, {
     headers: { authorization: `Bearer ${host.token}` },
     signal: AbortSignal.timeout(host.timeoutMs ?? 15000),
   });
@@ -890,6 +905,293 @@ const cmdThreadSimple = async (verb: string, ref: string, flags: Flags): Promise
     type: `thread.${verb}`, commandId: crypto.randomUUID(), threadId: thread.id,
   });
   console.log(`${verb}d ${bold(thread.title || thread.id)}\n  id  ${thread.id}\n  seq ${sequence}`);
+};
+
+// ---- export -------------------------------------------------------------
+// `export prompts` answers one narrow question for other tools: which prompts
+// did a human type, where, and when. It is the only read path that avoids the
+// HTTP API when it can, because the API answers it in N+1 requests — a snapshot
+// to learn the thread ids, then one fetch per thread, since snapshot threads
+// carry no messages — for data that is one join in the host's own database.
+//
+// Two strategies, cheapest first. They are deliberately written to return the
+// same rows: a prompt must not appear or vanish depending on how a host happens
+// to be reachable. That is why the HTTP path filters only `deletedAt`, matching
+// the SQL, and does not also drop archived threads.
+
+/** A row as the SQL returns it. The HTTP strategy fabricates the same shape. */
+type PromptRow = {
+  message_id: string;
+  thread_id: string;
+  text: string;
+  created_at: string;
+  workspace_root: string;
+};
+
+type Prompt = {
+  host: string;
+  threadId: string;
+  messageId: string;
+  createdAt: string;
+  text: string;
+  workspaceRoot: string;
+  marker: string;
+};
+
+type Strategy = 'sqlite' | 'http';
+
+const STRATEGY_LABEL: Record<Strategy, string> = {
+  sqlite: 'local state.sqlite',
+  http: 'snapshot + per-thread fetch',
+};
+
+/** Fixed by T3 Code. Read relative to whichever machine's home directory applies. */
+const STATE_DB = '.t3/userdata/state.sqlite';
+
+const expandHome = (p: string): string => path.resolve(p.replace(/^~(?=$|\/)/, os.homedir()));
+
+/**
+ * Where a prompt happened, named the way a human would: the workspace path made
+ * relative to the watched root it sits under. Longest matching root wins, so
+ * `~/Code` and `~/Code/@clients` both configured gives `afa`, not `@clients/afa`.
+ * A workspace under no watched root has no marker and the prompt is dropped.
+ */
+const markerForWorkspace = (workspaceRoot: string, watched: string[]): string | null => {
+  const ws = workspaceRoot.replace(/\/+$/, '');
+  let best: string | null = null;
+  let bestLen = -1;
+  for (const root of watched) {
+    const r = root.replace(/\/+$/, '');
+    if (ws === r) return ws.split('/').pop() ?? ws;
+    if (ws.startsWith(`${r}/`) && r.length > bestLen) {
+      best = ws.slice(r.length + 1);
+      bestLen = r.length;
+    }
+  }
+  return best;
+};
+
+/**
+ * Prompts arrive with the harness's wrapping still on them. Mirrors
+ * `cleanPrompt` in spr-time-entrier, which is the consumer this shape is for:
+ * unwrap `<user_query>` when present, then collapse whitespace to one line.
+ */
+const cleanPrompt = (text: string): string => {
+  const tagged = text.match(/<user_query>\s*([\s\S]*?)\s*<\/user_query>/);
+  return (tagged?.[1] ?? text).replace(/\s+/g, ' ').trim();
+};
+
+// One statement, shared by every strategy that reads the local store directly,
+// so it cannot drift from what the HTTP path reconstructs.
+const PROMPT_SQL = `SELECT m.message_id, m.thread_id, m.text, m.created_at, p.workspace_root
+FROM projection_thread_messages m
+JOIN projection_threads t ON t.thread_id = m.thread_id
+JOIN projection_projects p ON p.project_id = t.project_id
+WHERE m.role = 'user'
+  AND t.deleted_at IS NULL
+  AND p.deleted_at IS NULL
+  AND m.created_at >= ? AND m.created_at < ?
+ORDER BY m.created_at`;
+
+/**
+ * A bare `--since 2026-09-14` is the UTC day boundary, not local midnight: the
+ * rows being filtered are UTC, and an export should describe the same window
+ * whichever machine runs it. Anything else is handed to `Date` as written.
+ */
+const isoBound = (value: string, flag: string): string => {
+  const raw = /^\d{4}-\d{2}-\d{2}$/.test(value) ? `${value}T00:00:00.000Z` : value;
+  const at = new Date(raw);
+  if (Number.isNaN(at.getTime())) throw new Error(`${flag}: not a date I can read: ${value}`);
+  return at.toISOString();
+};
+
+/**
+ * node:sqlite arrived in Node 22.5 behind `--experimental-sqlite`. Current
+ * releases have it unflagged (verified on 22.23 and 24), but `engines` allows
+ * `>=22`, which still admits the flagged ones. Importing it lazily means only
+ * this command fails there, instead of the whole CLI failing to start.
+ */
+const loadSqlite = async (): Promise<typeof import('node:sqlite').DatabaseSync> => {
+  try {
+    return (await import('node:sqlite')).DatabaseSync;
+  } catch {
+    throw new Error('reading state.sqlite needs node:sqlite — upgrade to Node >= 22.13, or pass --experimental-sqlite on 22.5-22.12');
+  }
+};
+
+const queryLocal = async (since: string, until: string): Promise<PromptRow[]> => {
+  const file = path.join(os.homedir(), STATE_DB);
+  if (!fs.existsSync(file)) throw new Error(`no T3 Code database at ${file}`);
+  const DatabaseSync = await loadSqlite();
+  // The database is in WAL mode, so this reader neither blocks the running app
+  // nor is blocked by it, and no copy is needed — it is ~500 MB.
+  const db = new DatabaseSync(file, { readOnly: true });
+  try {
+    return db.prepare(PROMPT_SQL).all(since, until) as unknown as PromptRow[];
+  } finally {
+    db.close();
+  }
+};
+
+/** `Date.parse` returns NaN for junk and for null; both mean "cannot compare". */
+const instant = (value?: string | null): number | null => {
+  const t = value ? Date.parse(value) : Number.NaN;
+  return Number.isNaN(t) ? null : t;
+};
+
+/**
+ * Which threads are worth a request. `updatedAt` moves with every new message,
+ * so a thread untouched since the window opened cannot hold one, and a thread
+ * created after it closed cannot either. Anything unknown is fetched.
+ */
+const mayHavePrompts = (t: Thread, since: number, until: number): boolean => {
+  if (t.deletedAt) return false;
+  const updated = instant(t.updatedAt);
+  if (updated !== null && updated < since) return false;
+  const created = instant(t.createdAt);
+  if (created !== null && created >= until) return false;
+  return true;
+};
+
+/** Bounded fan-out: a host with 200 live threads should not get 200 sockets at once. */
+const mapPool = async <T, R>(items: T[], limit: number, fn: (item: T) => Promise<R>): Promise<R[]> => {
+  const out = new Array<R>(items.length);
+  // Every worker pulls from the same iterator, so each entry goes to exactly one
+  // of them and the last to finish is the last item, not the last worker.
+  const queue = items.entries();
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, async () => {
+    for (const [i, item] of queue) out[i] = await fn(item);
+  }));
+  return out;
+};
+
+const queryOverHttp = async (host: Host, since: string, until: string): Promise<PromptRow[]> => {
+  const snap = await snapshot(host);
+  const roots = new Map(snap.projects.filter((p) => !p.deletedAt).map((p) => [p.id, p.workspaceRoot]));
+  const from = Date.parse(since);
+  const to = Date.parse(until);
+  const threads = snap.threads.filter((t) => roots.has(t.projectId) && mayHavePrompts(t, from, to));
+
+  const perThread = await mapPool(threads, 8, async (t) => {
+    const workspaceRoot = roots.get(t.projectId);
+    if (workspaceRoot === undefined) return [];
+    const detail = await threadDetail(host, t.id, null);
+    const rows: PromptRow[] = [];
+    for (const m of detail.messages ?? []) {
+      if (m.role !== 'user') continue;
+      const at = instant(m.createdAt);
+      if (at === null || at < from || at >= to) continue;
+      const messageId = m.messageId ?? m.id;
+      if (messageId === undefined) continue;
+      rows.push({
+        message_id: messageId,
+        thread_id: t.id,
+        text: m.text ?? '',
+        created_at: new Date(at).toISOString(),
+        workspace_root: workspaceRoot,
+      });
+    }
+    return rows;
+  });
+  return perThread.flat();
+};
+
+/**
+ * Loopback means the database this process can already open is the very one the
+ * host serves, so read it and skip the network entirely. Everything else goes
+ * over HTTP.
+ */
+const LOOPBACK = new Set(['localhost', '127.0.0.1', '::1', '[::1]']);
+
+const strategyFor = (host: Host): Strategy => {
+  let hostname = '';
+  try {
+    hostname = new URL(host.origin).hostname;
+  } catch { /* an unparseable origin is not loopback; let the HTTP path report it */ }
+  return LOOPBACK.has(hostname) ? 'sqlite' : 'http';
+};
+
+const readPrompts = (host: Host, strategy: Strategy, since: string, until: string): Promise<PromptRow[]> => {
+  if (strategy === 'sqlite') return queryLocal(since, until);
+  return queryOverHttp(host, since, until);
+};
+
+type ExportOptions = { since: string; until?: string; host?: string; watch?: string[]; json?: boolean };
+
+const cmdExportPrompts = async (o: ExportOptions): Promise<void> => {
+  const since = isoBound(o.since, '--since');
+  const until = o.until ? isoBound(o.until, '--until') : new Date().toISOString();
+  if (until <= since) throw new Error(`--until (${until}) must be after --since (${since})`);
+
+  const registered = readHosts();
+  if (!registered.length) throw new Error('no hosts registered — run: t3ctl host add <origin> <token>');
+  const hosts = o.host ? registered.filter((h) => h.name === o.host) : registered;
+  if (!hosts.length) throw new Error(`no such host: ${o.host}`);
+
+  const watched = (o.watch?.length ? o.watch : ['~/Code']).map(expandHome);
+
+  const settled = await Promise.allSettled(hosts.map(async (h) => {
+    const strategy = strategyFor(h);
+    return { strategy, rows: await readPrompts(h, strategy, since, until) };
+  }));
+
+  const messages: Prompt[] = [];
+  const unreachable: { host: string; error: string }[] = [];
+  const reached: { host: string; strategy: Strategy; count: number }[] = [];
+
+  settled.forEach((result, i) => {
+    const host = hosts[i];
+    if (!host) return;
+    if (result.status === 'rejected') {
+      unreachable.push({ host: host.name, error: errorMessage(result.reason) });
+      return;
+    }
+    const { strategy, rows } = result.value;
+    let count = 0;
+    for (const row of rows) {
+      const marker = markerForWorkspace(row.workspace_root, watched);
+      if (marker === null) continue; // outside every watched root
+      messages.push({
+        host: host.name,
+        threadId: row.thread_id,
+        messageId: row.message_id,
+        createdAt: row.created_at,
+        text: cleanPrompt(row.text),
+        workspaceRoot: row.workspace_root,
+        // Markers have to stay unique across machines, and two hosts routinely
+        // hold a checkout of the same repo at the same path. The local host is
+        // the unprefixed one so single-machine consumers see plain names.
+        marker: strategy === 'sqlite' ? marker : `${host.name}/${marker}`,
+      });
+      count++;
+    }
+    reached.push({ host: host.name, strategy, count });
+  });
+
+  messages.sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.messageId.localeCompare(b.messageId));
+
+  if (o.json) {
+    console.log(JSON.stringify({ messages, unreachable }, null, 2));
+  } else {
+    const n = messages.length;
+    console.log(`${bold(String(n))} prompt${n === 1 ? '' : 's'}  ${dim(`${since} -> ${until}`)}`);
+    for (const { host, strategy, count } of reached) {
+      console.log(`\n${bold(host)}  ${count}  ${dim(STRATEGY_LABEL[strategy])}`);
+      const tally = new Map<string, number>();
+      for (const m of messages) {
+        if (m.host === host) tally.set(m.marker, (tally.get(m.marker) ?? 0) + 1);
+      }
+      const width = Math.max(0, ...[...tally.keys()].map((k) => k.length));
+      for (const [marker, hits] of [...tally].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))) {
+        console.log(`  ${marker.padEnd(width)}  ${hits}`);
+      }
+    }
+  }
+
+  for (const u of unreachable) console.error(`${ICON.error} ${u.host} ${dim(u.error)}`);
+  // Partial results are still useful and `unreachable` reports what is missing,
+  // so only a total failure is an error.
+  if (unreachable.length === hosts.length) process.exitCode = 1;
 };
 
 // ---- cli ----------------------------------------------------------------
@@ -987,6 +1289,22 @@ host.command('ls').description('list registered hosts and probe each one')
 
 program.command('hosts').description('list registered hosts and probe each one (alias of `host ls`)')
   .action(() => cmdHostsList(readHosts()));
+
+// Repeatable, because a workspace tree is not always one root. No default value
+// is handed to commander: it would print `(default: [])` in the help, which is
+// not what happens when the flag is omitted.
+const addWatch = (value: string, previous?: string[]): string[] => [...(previous ?? []), value];
+
+const exportGroup = program.command('export').description('read-only exports for other tools');
+
+exportGroup.command('prompts')
+  .description('every prompt a human typed, across hosts, with the project it happened in')
+  .requiredOption('--since <date>', 'window start, inclusive — a bare YYYY-MM-DD is a UTC day boundary')
+  .option('--until <date>', 'window end, exclusive (default: now)')
+  .option('--host <name>', 'only this registered host (default: every one of them)')
+  .option('--watch <path>', 'only prompts in projects under this root; repeatable (default: ~/Code)', addWatch)
+  .option('--json', 'emit JSON instead of a summary')
+  .action((o: OptionValues) => cmdExportPrompts(o as ExportOptions));
 
 const project = program.command('project').description('manage projects');
 hostOption(project.command('create')
