@@ -244,7 +244,11 @@ construction. What produces a reachable origin:
 - **LAN** — `t3 serve --host "$(tailscale ip -4)"`, or any bound interface.
   Default port is `3773`, but `t3 serve` will pick the next free port if it's
   taken, so read the URL it prints.
-- **SSH** — any manual port-forward works. T3 Code's own SSH *launch* feature
+- **SSH** — `t3ctl host add you@box` bootstraps the machine itself: detects the
+  running server via its runtime file, installs T3 Code's boot service if none
+  is running, mints a token over ssh, and keeps a self-healing ssh ControlMaster
+  forwarding the remote loopback to a local port (the origin stored for the
+  host). A manual port-forward works too. T3 Code's own SSH *launch* feature
   (the desktop app starting a remote server and forwarding for you) is
   desktop-only today.
 - **T3 Connect relay** (`relay.t3.codes`) — **NOT PLANNED for t3ctl.** This is
@@ -283,9 +287,31 @@ construction. What produces a reachable origin:
 - Tokens are stored in plaintext in `~/.config/t3ctl/hosts.json` (dir `0700`,
   file `0600`). No keychain integration.
 - `host add` accepts two shapes and tells them apart by scheme: a first argument
-  matching `^https?://` is the origin (current form), otherwise it is the legacy
-  `<name> <origin> <token>`, which warns. The cost is that an origin must carry a
-  scheme — `host add localhost:3773` is rejected rather than guessed at.
+  matching `^https?://` is the origin (current form), otherwise it is an ssh
+  login (`agent@box`), which bootstraps the machine. The cost is that an origin
+  must carry a scheme — `host add localhost:3773` is rejected rather than guessed
+  at, and the ssh branch explicitly rejects anything containing `:` so a
+  scheme-less origin cannot be misread as an ssh target (ssh targets never carry
+  a colon; ports belong to origins).
+- The ssh branch (`cmdHostAddSsh` in `src/t3ctl.ts`) runs one POSIX sh script
+  over ssh with the op as argv (`sh -s -- detect|install|token ...`), parsed
+  bottom-up for its `T3CTL {…}` stdout markers — the same defensive parsing as
+  T3 Code's own SSH path, because `t3 auth` can leak Effect error logs onto
+  stdout. It reads `~/.t3/userdata/server-runtime.json` on the remote for the
+  server port (pid-checked, loopback-checked, never hardcoded), mints the token
+  itself with `t3 auth session issue`, and keeps a local ssh ControlMaster
+  (`-fN -o ControlPersist=yes`) forwarding to the remote loopback. Liveness is
+  always the HTTP probe of the local end, never `ssh -O check` — a live master
+  does not prove the forward works, and the remote port can change on restart.
+  The npx-cache guard exists because npm extracts a package before its native
+  builds: a failed node-pty build leaves the cache without a `t3` bin while
+  `npx --yes` exits 0, which would otherwise surface only as a readiness
+  timeout minutes later.
+- The ssh form needs npm locally to resolve the exact `t3` version (the boot
+  service pins it); `--t3-version` bypasses that. macOS remotes only start the
+  installed launchd service at login — an ssh install with nobody at the console
+  installs fine but cannot start the server; Linux systemd user units start
+  unattended (modulo linger).
 - Stored descriptor fields go stale: `hosts` shows live values where it can and
   dims the row when it falls back to what was last recorded. Nothing re-probes in
   the background.
