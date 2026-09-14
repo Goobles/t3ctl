@@ -9,8 +9,10 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { readFileSync, statSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync, statSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 const run = promisify(execFile);
 const CLI = fileURLToPath(new URL('../dist/t3ctl.js', import.meta.url));
@@ -47,7 +49,7 @@ test('--help lists the commands', async () => {
   const { code, stdout } = await cli('--help');
   assert.equal(code, 0);
   assert.match(stdout, /Commands:/);
-  for (const c of ['ls', 'host', 'hosts', 'project', 'thread']) {
+  for (const c of ['ls', 'host', 'hosts', 'project', 'thread', 'export']) {
     assert.match(stdout, new RegExp(`^\\s+${c}\\b`, 'm'), `missing command: ${c}`);
   }
 });
@@ -60,6 +62,7 @@ test('every command has its own help', async () => {
     ['thread', 'retitle'], ['thread', 'interrupt'],
     ['thread', 'settle'], ['thread', 'archive'], ['thread', 'unarchive'],
     ['thread', 'unpin'], ['thread', 'delete'],
+    ['export', 'prompts'],
   ];
   for (const c of commands) {
     const { code, stdout } = await cli(...c, '--help');
@@ -82,6 +85,9 @@ test('bad input exits non-zero', async () => {
     ['host', 'rm'],
     ['project', 'create'],
     ['bogus'],
+    ['export', 'prompts'],                                  // --since is required
+    ['export', 'prompts', '--since', 'not-a-date'],
+    ['export', 'prompts', '--since', '2026-09-15', '--until', '2026-09-14'],  // inverted window
     ['ls', '--nope'],
     ['host', 'add', 'name', 'http://x:1', 'token'], // the removed legacy form
   ];
@@ -108,4 +114,139 @@ test('the published bin target exists and is executable', () => {
   const stat = statSync(CLI);
   assert.ok(stat.isFile());
   assert.match(readFileSync(CLI, 'utf8').split('\n')[0], /^#!\/usr\/bin\/env node$/);
+});
+
+test('export prompts needs a host registry like every other read', async () => {
+  const { code, stdout, stderr } = await cli('export', 'prompts', '--since', '2026-09-14');
+  assert.notEqual(code, 0);
+  assert.match(stdout + stderr, /no hosts registered/);
+});
+
+// The export tests build a world instead of mocking one: a throwaway
+// state.sqlite plus a host registry, which between them decide which strategy
+// the CLI picks. No server and no network — a host on loopback is read from the
+// database directly, and the ssh strategy gets a stub `ssh` on PATH.
+//
+// node:sqlite is flagged on Node 22, so these skip there rather than fail. That
+// same flag is why the CLI imports it lazily.
+let DatabaseSync;
+try {
+  ({ DatabaseSync } = await import('node:sqlite'));
+} catch {
+  DatabaseSync = null;
+}
+const needsSqlite = { skip: DatabaseSync ? false : 'node:sqlite is flagged on this Node' };
+
+const SCHEMA = `
+  CREATE TABLE projection_projects (project_id TEXT, workspace_root TEXT, deleted_at TEXT);
+  CREATE TABLE projection_threads (thread_id TEXT, project_id TEXT, deleted_at TEXT);
+  CREATE TABLE projection_thread_messages (message_id TEXT, thread_id TEXT, role TEXT, text TEXT, created_at TEXT);
+`;
+
+/** A HOME with a host registry and a seeded state database. Returns its path. */
+const fixtureHome = (hosts, seed) => {
+  const home = mkdtempSync(join(tmpdir(), 't3ctl-export-'));
+  mkdirSync(join(home, '.t3', 'userdata'), { recursive: true });
+  mkdirSync(join(home, '.config', 't3ctl'), { recursive: true });
+  writeFileSync(join(home, '.config', 't3ctl', 'hosts.json'), JSON.stringify({ hosts }));
+  const db = new DatabaseSync(join(home, '.t3', 'userdata', 'state.sqlite'));
+  db.exec(SCHEMA + seed(home));
+  db.close();
+  return home;
+};
+
+const LOCAL_HOST = { name: 'box', origin: 'http://127.0.0.1:3773', token: null };
+
+/** Run `export prompts --json` against a fixture HOME and parse what comes back. */
+const exportPrompts = async (home, args = [], env = {}) => {
+  const { stdout } = await run(process.execPath, [
+    CLI, 'export', 'prompts', '--since', '2026-09-14', '--until', '2026-09-15', '--json', ...args,
+  ], { env: { ...process.env, HOME: home, ...env } });
+  return JSON.parse(stdout);
+};
+
+test('export prompts reads the local state database', needsSqlite, async () => {
+  const home = fixtureHome([LOCAL_HOST], (h) => `
+    INSERT INTO projection_projects VALUES
+      ('p1', '${h}/Code/alpha', NULL),
+      ('p2', '${h}/elsewhere/beta', NULL),
+      ('p3', '${h}/Code/gone', '2026-01-01T00:00:00.000Z');
+    INSERT INTO projection_threads VALUES
+      ('t1','p1',NULL), ('t2','p2',NULL), ('t3','p3',NULL), ('t4','p1','2026-01-01T00:00:00.000Z');
+    INSERT INTO projection_thread_messages VALUES
+      ('m1','t1','user','  hello   there  ','2026-09-14T10:00:00.000Z'),
+      ('m2','t1','assistant','not a prompt','2026-09-14T11:00:00.000Z'),
+      ('m3','t1','user','<user_query>
+unwrap me
+</user_query>','2026-09-14T12:00:00.000Z'),
+      ('m4','t2','user','outside the watched root','2026-09-14T13:00:00.000Z'),
+      ('m5','t3','user','project is deleted','2026-09-14T13:00:00.000Z'),
+      ('m6','t4','user','thread is deleted','2026-09-14T13:00:00.000Z'),
+      ('m7','t1','user','the day before','2026-09-13T23:59:59.999Z'),
+      ('m8','t1','user','the day after','2026-09-15T00:00:00.000Z');
+  `);
+  try {
+    const { messages, unreachable } = await exportPrompts(home);
+    assert.deepEqual(unreachable, []);
+    // m2 is not a prompt, m4 is outside ~/Code, m5 and m6 hang off deleted rows,
+    // m7 and m8 fall outside the half-open window. That leaves m1 and m3.
+    assert.deepEqual(messages.map((m) => m.messageId), ['m1', 'm3']);
+    assert.equal(messages[0].text, 'hello there');   // whitespace collapsed
+    assert.equal(messages[1].text, 'unwrap me');     // <user_query> unwrapped
+    assert.equal(messages[0].marker, 'alpha');       // no host prefix: this host is local
+    assert.equal(messages[0].host, 'box');
+    assert.equal(messages[0].workspaceRoot, `${home}/Code/alpha`);
+    assert.equal(messages[0].createdAt, '2026-09-14T10:00:00.000Z');
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('the longest matching --watch root wins', needsSqlite, async () => {
+  const home = fixtureHome([LOCAL_HOST], (h) => `
+    INSERT INTO projection_projects VALUES ('p1', '${h}/Code/clients/acme', NULL);
+    INSERT INTO projection_threads VALUES ('t1','p1',NULL);
+    INSERT INTO projection_thread_messages VALUES ('m1','t1','user','hi','2026-09-14T10:00:00.000Z');
+  `);
+  try {
+    const wide = await exportPrompts(home, ['--watch', `${home}/Code`]);
+    assert.equal(wide.messages[0].marker, 'clients/acme');
+
+    const nested = await exportPrompts(home, ['--watch', `${home}/Code`, '--watch', `${home}/Code/clients`]);
+    assert.equal(nested.messages[0].marker, 'acme');
+
+    const none = await exportPrompts(home, ['--watch', `${home}/nowhere`]);
+    assert.deepEqual(none.messages, []);
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('a host with an ssh target is queried over ssh, not over HTTP', needsSqlite, async () => {
+  const home = fixtureHome(
+    [{ name: 'remotebox', origin: 'http://10.0.0.9:3773', token: 'x', ssh: 'me@remotebox' }],
+    (h) => `
+      INSERT INTO projection_projects VALUES ('p1', '${h}/Code/alpha', NULL);
+      INSERT INTO projection_threads VALUES ('t1','p1',NULL);
+      INSERT INTO projection_thread_messages VALUES ('m1','t1','user','over ssh','2026-09-14T10:00:00.000Z');
+    `,
+  );
+  try {
+    // Stands in for ssh: drop "-o BatchMode=yes <target>" and run the remote
+    // command here, stdin passed through as ssh would. The origin above points
+    // nowhere, so anything reaching the network fails instead of passing.
+    const bin = join(home, 'bin');
+    mkdirSync(bin);
+    writeFileSync(join(bin, 'ssh'), '#!/bin/sh\nshift 3\nexec sh -c "$1"\n', { mode: 0o755 });
+
+    const { messages, unreachable } = await exportPrompts(home, [], { PATH: `${bin}:${process.env.PATH}` });
+    assert.deepEqual(unreachable, []);
+    assert.equal(messages.length, 1);
+    assert.equal(messages[0].text, 'over ssh');
+    // Remote hosts get their name in the marker: two machines can hold the same
+    // repo at the same path, and a marker has to stay unique across them.
+    assert.equal(messages[0].marker, 'remotebox/alpha');
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
 });
