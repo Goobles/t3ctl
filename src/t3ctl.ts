@@ -641,7 +641,7 @@ const loadSqlite = async (): Promise<typeof import('node:sqlite').DatabaseSync> 
   try {
     return (await import('node:sqlite')).DatabaseSync;
   } catch {
-    throw new Error('reading state.sqlite needs node:sqlite — run on Node >= 24, or Node 22 with --experimental-sqlite');
+    throw new Error('reading state.sqlite needs node:sqlite — upgrade to Node >= 22.13, or pass --experimental-sqlite on 22.5-22.12');
   }
 };
 
