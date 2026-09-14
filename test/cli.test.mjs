@@ -127,8 +127,9 @@ test('export prompts needs a host registry like every other read', async () => {
 // the CLI picks. No server and no network — a host on loopback is read from the
 // database directly, and the ssh strategy gets a stub `ssh` on PATH.
 //
-// node:sqlite is flagged on Node 22, so these skip there rather than fail. That
-// same flag is why the CLI imports it lazily.
+// Early Node 22 releases keep node:sqlite behind --experimental-sqlite, so these
+// skip rather than fail there; current 22.x and 24 run them. That flag is why
+// the CLI imports it lazily.
 let DatabaseSync;
 try {
   ({ DatabaseSync } = await import('node:sqlite'));

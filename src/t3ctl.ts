@@ -632,9 +632,10 @@ const isoBound = (value: string, flag: string): string => {
 };
 
 /**
- * node:sqlite is unflagged from Node 24 but still needs `--experimental-sqlite`
- * on Node 22, which package.json supports. Importing it lazily means only this
- * one command fails there, instead of the whole CLI failing to start.
+ * node:sqlite arrived in Node 22.5 behind `--experimental-sqlite`. Current
+ * releases have it unflagged (verified on 22.23 and 24), but `engines` allows
+ * `>=22`, which still admits the flagged ones. Importing it lazily means only
+ * this command fails there, instead of the whole CLI failing to start.
  */
 const loadSqlite = async (): Promise<typeof import('node:sqlite').DatabaseSync> => {
   try {
@@ -694,8 +695,8 @@ const queryOverSsh = async (target: string, since: string, until: string): Promi
   try {
     raw = await sshQuery(target, [since, until], []);
   } catch (error) {
-    // Node 22 keeps node:sqlite behind a flag. Retry once rather than make the
-    // user care which Node the far machine happens to run.
+    // An early Node 22 on the far machine keeps node:sqlite behind a flag. Retry
+    // once rather than make the user care which Node it happens to run.
     if (!/node:sqlite|experimental-sqlite|UNKNOWN_BUILTIN_MODULE/.test(errorMessage(error))) throw error;
     raw = await sshQuery(target, [since, until], ['--experimental-sqlite']);
   }
