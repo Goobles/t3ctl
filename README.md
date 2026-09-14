@@ -113,8 +113,48 @@ t3ctl warns you when:
 The token is optional so you can register a host before minting one, but reads
 will fail until you add it.
 
-The older `t3ctl host add <name> <origin> <token>` form still works and prints a
-deprecation notice.
+### `t3ctl host add <ssh-target> [--name <name>] [--ttl <duration>]`
+
+Register a host given **only its ssh login** — no URL, no token, no port:
+
+```sh
+t3ctl host add agent@goobles-agentbox
+```
+
+That one command bootstraps the machine end to end:
+
+1. **Probes it over ssh** for a running T3 Code server. The server records its
+   port in `~/.t3/userdata/server-runtime.json` on the remote, so the port is
+   discovered, never assumed (it is 3773 or whatever free port the server fell
+   back to).
+2. **Installs the server if none is running** — `t3 service install`, T3 Code's
+   own per-user launchd/systemd service (no sudo; macOS and Linux). The exact
+   `t3` CLI version is resolved locally via npm (`latest`, falling back to
+   `nightly`); override with `--t3-version <version-or-tag>`. The remote npm
+   output streams past — a cold cache can download for a few minutes.
+3. **Mints a token for you** — `t3 auth session issue` on the remote, labeled
+   `t3ctl:<name>`, TTL 30d by default (`--ttl` changes it). The session id is
+   printed along with the exact revoke command for that host.
+4. **Tunnels to it** — an ssh ControlMaster forwards a local port to the remote
+   server (loopback-only by design; nothing is exposed on the remote's network).
+   The master outlives t3ctl, and every command silently rebuilds it when it
+   dies or the remote port changed.
+
+Registering again for the same login is idempotent: it refreshes the tunnel and
+reuses the stored token unless the login now lands on a *different machine*
+(different `environmentId`), in which case a fresh token is minted.
+
+Give it a name with `--name` (otherwise it is named after the remote's own
+machine label, same as the origin form). Notes:
+
+- `t3ctl host rm <name>` tears the tunnel down with the entry.
+- **macOS remotes need someone logged in at the console** — a launchd agent
+  starts at login, so an ssh install with nobody logged in installs fine but
+  cannot start the server. Linux (systemd user service) has no such gap.
+- If the remote lacks node for non-interactive shells, install Node there (a
+  version manager may need configuring for non-login shells); if a native
+  dependency fails to build, a C toolchain is missing (`build-essential` /
+  `gcc-c++` / `xcode-select --install`).
 
 ### `t3ctl host rm <name>`
 
@@ -312,13 +352,17 @@ settled shows as `running`.
 t3ctl only ever stores an origin string, so **any transport that gives a host a
 reachable URL works.** There's nothing to configure beyond `host add`.
 
+- **SSH login** — `t3ctl host add you@box` does everything: server install if
+  needed, token minting, and a managed tunnel (see its section above). Good for
+  hosts you don't want exposed at all.
 - **Tailscale** — on the host, `npx t3 serve --tailscale-serve` publishes it at
   `https://machine.tailnet.ts.net/`. Register that URL.
 - **LAN** — `npx t3 serve --host 0.0.0.0` (or a specific interface), then register
   `http://192.168.1.x:3773`. Read the URL `t3 serve` prints; it picks another port
   if the default is taken.
-- **SSH port-forward** — `ssh -N -L 3773:localhost:3773 you@box`, then register
-  `http://localhost:3773`. Good for hosts you don't want exposed at all.
+- **Manual SSH port-forward** — `ssh -N -L 3773:localhost:3773 you@box` in a
+  terminal you keep open, then register `http://localhost:3773`. The `host add
+  you@box` form automates exactly this and keeps the forward alive for you.
 
 **One token per host.** Tokens are issued by the server they belong to, so run
 `npx t3 auth session issue --label t3ctl --ttl 30d --token-only` on each machine
@@ -328,11 +372,12 @@ and give each host its own short name:
 t3ctl host add http://localhost:3773               eyJ2Ijox...
 t3ctl host add https://studio.tailnet-1234.ts.net  eyJ2Ijox...
 t3ctl host add http://10.0.0.42:3773               eyJ2Ijox...
+t3ctl host add you@elsewhere                       # token minted for you
 t3ctl ls -t
 ```
 
-`ls` then fans out to all three at once. Machines that are asleep or offline show
-up as `unreachable` and don't block the rest.
+`ls` then fans out to all of them at once. Machines that are asleep or offline
+show up as `unreachable` and don't block the rest.
 
 T3 Code's own **T3 Connect relay** (what the mobile app uses when you're off your
 tailnet) is **not planned**: the relay's `dpop-token` exchange only accepts a
@@ -349,8 +394,10 @@ Worth knowing before you build a workflow on this:
   and payloads can change without warning** and a T3 Code update may break t3ctl
   until it catches up.
 - **A host is only reachable while its T3 Code server is running.** t3ctl can't
-  wake a machine, launch a server, or queue work for later. If the desktop app is
-  closed and no `t3 serve` is running, that host is `unreachable`.
+  wake a machine or queue work for later. If the desktop app is closed and no
+  `t3 serve` is running, that host is `unreachable` — except an ssh-registered
+  host, whose boot service keeps a server running (on macOS only while someone
+  is logged in at that console).
 - **`thread create` doesn't run anything.** It leaves an idle thread with no
   messages — a state the desktop UI never produces. Follow it with `thread start`,
   or the thread just sits there.

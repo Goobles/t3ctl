@@ -3,7 +3,10 @@
 // Peer of the mobile app: pairs once per host, then reads/controls remotely.
 // Spike scope: host registry + read-only listing.
 
+import { spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import fs from 'node:fs';
+import net from 'node:net';
 import { Command } from 'commander';
 import type { OptionValues } from 'commander';
 import os from 'node:os';
@@ -21,6 +24,11 @@ type Host = {
   label?: string;
   serverVersion?: string;
   timeoutMs?: number;
+  /** ssh login the host is reached through; origin is the local tunnel end. */
+  ssh?: string;
+  sshLocalPort?: number;
+  sshRemotePort?: number;
+  t3Version?: string;
 };
 
 type Descriptor = {
@@ -70,7 +78,7 @@ type Snapshot = { snapshotSequence: number; projects: Project[]; threads: Thread
 
 /** Option names as the command implementations spell them (kebab-case). */
 type Flags = Partial<Record<
-  'host' | 'model' | 'branch' | 'worktree' | 'name' | 'timeout' | 'runtime-mode' | 'interaction-mode',
+  'host' | 'model' | 'branch' | 'worktree' | 'name' | 'timeout' | 'runtime-mode' | 'interaction-mode' | 'ttl' | 't3-version',
   string
 >>;
 
@@ -96,6 +104,7 @@ const writeHosts = (hosts: Host[]): void => {
 };
 
 const snapshot = async (host: Host): Promise<Snapshot> => {
+  await ensureTunnel(host);
   const res = await fetch(`${host.origin}/api/orchestration/snapshot`, {
     headers: host.token ? { authorization: `Bearer ${host.token}` } : {},
     signal: AbortSignal.timeout(host.timeoutMs ?? 15000),
@@ -293,6 +302,7 @@ const cmdHostAdd = async (pos: string[], flags: Flags, hosts: Host[]): Promise<v
 
 const cmdHostsList = async (hosts: Host[]): Promise<void> => {
   if (!hosts.length) return console.log('(no hosts)');
+  await Promise.allSettled(hosts.filter((h) => h.ssh).map((h) => ensureTunnel(h)));
   const probes = await Promise.allSettled(hosts.map((h) => probe(h.origin)));
   const drifted: { h: Host; live: Descriptor }[] = [];
   hosts.forEach((h, i) => {
@@ -306,12 +316,380 @@ const cmdHostsList = async (hosts: Host[]): Promise<void> => {
     // Values for an unreachable host are whatever was last stored, so dim the
     // whole row to keep remembered data visually distinct from probed data.
     const cell = (text: string, width: number) => (live ? text.padEnd(width) : dim(text.padEnd(width)));
-    console.log(`${icon} ${live ? bold(h.name.padEnd(14)) : dim(h.name.padEnd(14))} ${cell(label, 18)} ${dim(env.padEnd(9))} ${cell(version, 28)} ${dim(h.origin)}` +
+    const where = dim(h.ssh ? `${h.ssh} -> ${h.origin}` : h.origin);
+    console.log(`${icon} ${live ? bold(h.name.padEnd(14)) : dim(h.name.padEnd(14))} ${cell(label, 18)} ${dim(env.padEnd(9))} ${cell(version, 28)} ${where}` +
       (live || !p || p.status !== 'rejected' ? '' : ` ${dim(errorMessage(p.reason))}`));
   });
   for (const { h, live } of drifted) {
     warn(`${h.name} (${h.origin}) is now a DIFFERENT environment\n` +
       `  was ${h.environmentId} (${h.label ?? 'unknown'})\n  now ${live.environmentId} (${live.label})`);
+  }
+};
+
+// ---- ssh hosts ----------------------------------------------------------
+// `t3ctl host add agent@box` fully bootstraps a remote T3 Code host: detect a
+// running server, install the boot service if none, mint a token, and keep a
+// local ssh port-forward alive. Three properties of T3 Code make "just an ssh
+// login" enough:
+//   * the server records {pid, port} in ~/.t3/userdata/server-runtime.json, so
+//     the port is discoverable, never hardcoded (3773 or an ephemeral fallback,
+//     rewritten on every start);
+//   * `t3 auth session issue` mints a bearer token filesystem-locally — no HTTP,
+//     no --port — valid for the already-running server sharing ~/.t3, so t3ctl
+//     can mint its own token over ssh;
+//   * `t3 service install` is per-user launchd/systemd (no sudo, macOS/Linux).
+// Remote shell scripts pass data back on stdout as lines starting with a
+// marker, parsed bottom-up: `t3 auth` can leak Effect error logs onto stdout
+// (the desktop's own SSH path parses the same way, tunnel.ts:791).
+
+// npm package is literally `t3`; exact versions are pinned because the boot
+// service installs that same version into its pinned runtime.
+const SSH_READY_MS = 90_000; // server readiness after install (npm download can be slow)
+const TUNNEL_WAIT_MS = 30_000; // ssh auth may prompt interactively; give it time
+const PROBE_MS = 2500; // liveness probe of the local tunnel end
+const T3_PACKAGE = 't3';
+
+const SSH_SCRIPT = `set -eu
+# PATH discovery for NON-INTERACTIVE ssh shells, trimmed from T3 Code's own
+# remote runner (packages/ssh/src/tunnel.ts REMOTE_NODE_ENV_SCRIPT): plain PATH
+# additions, version-manager shims, nvm. Engine checks and the "prefer installed
+# t3" branch are dropped on purpose — t3ctl pins an exact version and runs npx.
+prepend_path_if_dir() {
+  if [ -d "$1" ]; then
+    case ":$PATH:" in
+      *":$1:"*) ;;
+      *) PATH="$1:$PATH" ;;
+    esac
+  fi
+}
+ensure_node_path() {
+  command -v node >/dev/null 2>&1 && return 0
+  prepend_path_if_dir "$HOME/.local/bin"
+  prepend_path_if_dir "$HOME/bin"
+  prepend_path_if_dir "/opt/homebrew/bin"
+  prepend_path_if_dir "/usr/local/bin"
+  prepend_path_if_dir "/usr/bin"
+  prepend_path_if_dir "/bin"
+  if [ -z "\${VOLTA_HOME:-}" ]; then VOLTA_HOME="$HOME/.volta"; fi
+  prepend_path_if_dir "$VOLTA_HOME/bin"
+  prepend_path_if_dir "$HOME/.asdf/shims"
+  prepend_path_if_dir "$HOME/.asdf/bin"
+  if [ ! -x "$HOME/.asdf/shims/node" ] && [ -s "$HOME/.asdf/asdf.sh" ]; then . "$HOME/.asdf/asdf.sh"; fi
+  prepend_path_if_dir "$HOME/.local/share/mise/shims"
+  prepend_path_if_dir "$HOME/.mise/shims"
+  if ! command -v node >/dev/null 2>&1 && command -v mise >/dev/null 2>&1; then eval "$(mise activate sh)" >/dev/null 2>&1 || true; fi
+  if [ -z "\${FNM_DIR:-}" ]; then FNM_DIR="$HOME/.local/share/fnm"; fi
+  prepend_path_if_dir "$FNM_DIR"
+  prepend_path_if_dir "$HOME/.fnm"
+  if ! command -v node >/dev/null 2>&1 && command -v fnm >/dev/null 2>&1; then
+    eval "$(fnm env --shell bash)" >/dev/null 2>&1 || true
+    fnm use --silent-if-unchanged >/dev/null 2>&1 || fnm use default >/dev/null 2>&1 || true
+  fi
+  prepend_path_if_dir "$HOME/.nodenv/bin"
+  prepend_path_if_dir "$HOME/.nodenv/shims"
+  if ! command -v node >/dev/null 2>&1 && command -v nodenv >/dev/null 2>&1; then eval "$(nodenv init -)" >/dev/null 2>&1 || true; fi
+  if [ -z "\${NVM_DIR:-}" ]; then NVM_DIR="$HOME/.nvm"; fi
+  if [ -s "$NVM_DIR/nvm.sh" ]; then
+    . "$NVM_DIR/nvm.sh"
+    if ! command -v node >/dev/null 2>&1 && command -v nvm >/dev/null 2>&1; then
+      nvm use --silent default >/dev/null 2>&1 || nvm use --silent node >/dev/null 2>&1 || nvm use --silent --lts >/dev/null 2>&1 || true
+    fi
+  fi
+  if ! command -v node >/dev/null 2>&1 && [ -d "$NVM_DIR/versions/node" ]; then
+    for NODE_BIN in "$NVM_DIR"/versions/node/*/bin; do
+      if [ -x "$NODE_BIN/node" ]; then PATH="$NODE_BIN:$PATH"; fi
+    done
+  fi
+  command -v node >/dev/null 2>&1
+}
+# npm extracts a package before running its deps' native builds; a failed
+# node-pty build leaves the npx cache WITHOUT a t3 bin while \`npx --yes\` still
+# exits 0 (same guard as T3 Code's require_installed_t3_cli). Resolve up front
+# so the failure is reported here, with npm's own output on stderr.
+require_t3_cli() {
+  T3_CLI_PATH="$(npx --yes --package t3@"$1" -- sh -c 'command -v t3' 2>/dev/null || true)"
+  if [ -n "$T3_CLI_PATH" ]; then return 0; fi
+  printf 'npm installed t3@"%s" but produced no t3 executable — usually a native dependency (node-pty) failed to build. Install a C toolchain on this host (Debian/Ubuntu: build-essential, Fedora/RHEL: gcc-c++ make, macOS: xcode-select --install) and retry.\\n' "$1" >&2
+  return 1
+}
+# detect: is there a T3 Code server running on this machine? The runtime file is
+# rewritten on every server start and cleared on shutdown, so its pid is
+# checked before its port is trusted (stale file, reused port).
+RUNTIME_JSON="$HOME/.t3/userdata/server-runtime.json"
+detect() {
+  if ! ensure_node_path; then
+    printf 'T3CTL {"node":false}\\n'
+    return 0
+  fi
+  node - "$RUNTIME_JSON" <<'NODE'
+const fs = require('node:fs');
+try {
+  const r = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
+  const pid = Number(r.pid), port = Number(r.port);
+  if (!Number.isInteger(pid) || pid <= 0 || !Number.isInteger(port)) throw 0;
+  const origin = new URL(String(r.origin ?? ''));
+  if (origin.protocol !== 'http:' || !['127.0.0.1', 'localhost'].includes(origin.hostname)) throw 0;
+  process.kill(pid, 0);
+  process.stdout.write('T3CTL {"running":true,"port":' + port + '}\\n');
+} catch {
+  process.stdout.write('T3CTL {"running":false}\\n');
+}
+NODE
+}
+case "$1" in
+  detect) detect ;;
+  install)
+    ensure_node_path || { printf 'no node on this machine — install Node 22+ (non-interactive shells may need a version manager configured)\\n' >&2; exit 1; }
+    require_t3_cli "$2" || exit 1
+    exec npx --yes --package t3@"$2" t3 service install
+    ;;
+  token)
+    ensure_node_path || { printf 'no node on this machine\\n' >&2; exit 1; }
+    require_t3_cli "$2" || exit 1
+    exec npx --yes --package t3@"$2" t3 auth session issue --json --label "$3" --ttl "$4"
+    ;;
+  *) printf 'unknown op: %s\\n' "$1" >&2; exit 2 ;;
+esac
+`;
+
+// One ssh invocation, script on stdin (`sh -s -- op version ...` — POSIX,
+// works on dash/busybox). install/token stream stderr through to the user;
+// the piped stdin is required for the script itself. `streamStderr` matters:
+// a cold npx on the remote downloads the whole t3 package, which can take
+// minutes, and a buffered stderr shows the user nothing while it runs.
+type SshResult = { status: number; stdout: string; stderr: string };
+
+const sshRun = (target: string, args: string[], { streamStderr = false } = {}): SshResult => {
+  const res = spawnSync('ssh', ['-o', 'ConnectTimeout=15', target, 'sh', '-s', '--', ...args], {
+    input: SSH_SCRIPT,
+    encoding: 'utf8',
+    maxBuffer: 8 * 1024 * 1024,
+    stdio: streamStderr ? ['pipe', 'pipe', 'inherit'] : 'pipe',
+  });
+  if ((res.error as NodeJS.ErrnoException | undefined)?.code === 'ENOENT') throw new Error('ssh not found locally');
+  return { status: res.status ?? 1, stdout: String(res.stdout ?? ''), stderr: String(res.stderr ?? '') };
+};
+
+type DetectResult = { node?: boolean; running?: boolean; port?: number };
+
+// Bottom-up scan for the last T3CTL JSON marker — immune to npm chatter above it.
+const sshDetect = (target: string): DetectResult => {
+  const res = sshRun(target, ['detect']);
+  if (res.status !== 0) throw new Error(`ssh to ${target} failed (exit ${res.status})${res.stderr.trim() ? `: ${res.stderr.trim().split('\n').slice(-2).join('\n')}` : ''}`);
+  const line = res.stdout.split('\n').reverse().find((l) => l.startsWith('T3CTL {'));
+  if (!line) throw new Error(`detect on ${target} produced no answer`);
+  return JSON.parse(line.slice('T3CTL '.length)) as DetectResult;
+};
+
+const sshToken = (target: string, version: string, label: string, ttl: string): { token: string; sessionId?: string } => {
+  // First run downloads t3@<version> into the remote npx cache — minutes with
+  // nothing to show unless npm's progress on stderr streams through.
+  const res = sshRun(target, ['token', version, label, ttl], { streamStderr: true });
+  if (res.status !== 0) throw new Error(`token minting failed on ${target}${res.stderr.trim() ? `: ${res.stderr.trim().split('\n').slice(-3).join('\n')}` : ''}`);
+  // The session JSON is pretty-printed over many lines and stray Effect error
+  // lines can precede it, so accumulate bottom-up until an object with a token
+  // field parses — the token is the only reliable anchor.
+  const lines = res.stdout.split('\n').filter((l) => l.trim() !== '');
+  let buf = '';
+  for (let i = lines.length - 1; i >= 0; i--) {
+    buf = `${lines[i]}\n${buf}`;
+    try {
+      const parsed = JSON.parse(buf) as { token?: string; sessionId?: string };
+      if (typeof parsed.token === 'string' && parsed.token) return { token: parsed.token, sessionId: parsed.sessionId };
+    } catch { /* keep accumulating */ }
+  }
+  throw new Error(`no token in output from ${target}`);
+};
+
+// --t3-version wins; else ask npm locally for the exact latest, nightly only as
+// a fallback. An exact version is required by the boot service's pinned runtime.
+const resolveT3Version = (flags: Flags): string => {
+  if (flags['t3-version']) return flags['t3-version'];
+  if (spawnSync('npm', ['--version'], { stdio: 'ignore' }).status !== 0) {
+    throw new Error('npm not found locally — install npm or pass --t3-version <version-or-tag>');
+  }
+  const res = spawnSync('npm', ['view', `${T3_PACKAGE}@latest`, 'version'], { encoding: 'utf8' });
+  if (res.status === 0 && res.stdout.trim()) return res.stdout.trim();
+  const nightly = spawnSync('npm', ['view', `${T3_PACKAGE}@nightly`, 'version'], { encoding: 'utf8' });
+  if (nightly.status === 0 && nightly.stdout.trim()) return nightly.stdout.trim();
+  throw new Error(`cannot resolve a t3 CLI version via npm — pass --t3-version (tried: ${res.stderr?.trim().split('\n')[0] ?? 'npm failed'})`);
+};
+
+const freePort = async (): Promise<number> =>
+  // TOCTOU between this probe and ssh binding the port is real; ExitOnForwardFailure
+  // turns the loss into a nonzero ssh exit, which spawnMaster retries on.
+  new Promise((resolve, reject) => {
+    const s = net.createServer();
+    s.listen(0, '127.0.0.1', () => {
+      const p = s.address();
+      s.close(() => resolve(p && typeof p === 'object' ? p.port : 0));
+    });
+    s.on('error', reject);
+  });
+
+const ctlPath = (target: string, port?: number): string => path.join(CONFIG_DIR,
+  `ssh-${createHash('sha256').update(`${target}:${port ?? ''}`).digest('hex').slice(0, 12)}`);
+
+// ssh -fN + ControlPersist=yes keeps the master alive after t3ctl exits
+// (ssh_config(5)); -f with ExitOnForwardFailure=yes means a clean return from
+// spawnSync implies the local listener exists. stderr stays visible so
+// passphrase prompts (ssh opens /dev/tty itself) and bind errors surface.
+const spawnMaster = async (ssh: string, sshRemotePort: number): Promise<number> => {
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const port = await freePort();
+    const res = spawnSync('ssh', [
+      '-M', '-S', ctlPath(ssh, port), '-fN',
+      '-o', 'ConnectTimeout=15', '-o', 'ControlPersist=yes',
+      '-o', 'ExitOnForwardFailure=yes', '-o', 'ServerAliveInterval=15',
+      '-o', 'StrictHostKeyChecking=accept-new',
+      '-L', `${port}:127.0.0.1:${sshRemotePort}`, ssh,
+    ], { stdio: ['ignore', 'ignore', 'inherit'] });
+    if (res.status === 0) return port;
+    if ((res.error as NodeJS.ErrnoException | undefined)?.code === 'ENOENT') throw new Error('ssh not found locally');
+  }
+  throw new Error(`could not establish the ssh tunnel to ${ssh} (3 attempts)`);
+};
+
+const waitForOrigin = async (origin: string, deadline: number): Promise<boolean> => {
+  while (Date.now() < deadline) {
+    if (await probe(origin, PROBE_MS).then(() => true, () => false)) return true;
+    await new Promise((r) => setTimeout(r, 1000));
+  }
+  return false;
+};
+
+// Single-flight per host name: cmdLs fans out concurrently and every write
+// command re-enters here.
+const tunnelJobs = new Map<string, Promise<void>>();
+const ensureTunnel = (host: Host): Promise<void> => {
+  if (!host.ssh) return Promise.resolve();
+  const inFlight = tunnelJobs.get(host.name);
+  if (inFlight) return inFlight;
+  const job = (async () => {
+    const target = host.ssh; // captured: TS cannot narrow the optional inside the closure
+    if (!target) return;
+    // Liveness is the HTTP probe, never `ssh -O check` — a live master does not
+    // prove the forward works, and the remote port can change on server restart.
+    if (await probe(host.origin, PROBE_MS).then(() => true, () => false)) return;
+    spawnSync('ssh', ['-O', 'exit', '-S', ctlPath(target, host.sshLocalPort), target], { stdio: 'ignore' });
+    const detect = sshDetect(target);
+    if (!detect.running) throw new Error(`${target}: no T3 Code server is running — rerun: t3ctl host add ${target}`);
+    // Re-pick the local port if something else grabbed it; the origin changes
+    // with it, so persist both.
+    const localPort = await spawnMaster(target, detect.port ?? 3773);
+    const origin = `http://127.0.0.1:${localPort}`;
+    writeHosts(readHosts().map((h) => h.name === host.name ? { ...h, sshLocalPort: localPort, sshRemotePort: detect.port ?? 3773, origin } : h));
+    if (!(await waitForOrigin(origin, Date.now() + TUNNEL_WAIT_MS))) {
+      throw new Error(`${host.ssh}: the ssh tunnel is up but ${origin} is not answering (is the server still running on the remote port?)`);
+    }
+  })().finally(() => tunnelJobs.delete(host.name));
+  tunnelJobs.set(host.name, job);
+  return job;
+};
+
+// `t3ctl host add agent@box` — the full bootstrap. Idempotent: rerunning
+// refreshes the tunnel and keeps the stored token unless the machine behind
+// the login changed (different environmentId).
+const cmdHostAddSsh = async (target: string, flags: Flags, hosts: Host[]): Promise<void> => {
+  const version = resolveT3Version(flags);
+
+  console.log(`probing ${bold(target)} over ssh`);
+  let detect = sshDetect(target);
+  if (detect.node === false) {
+    throw new Error(`${target} has no node on PATH for non-interactive ssh — install Node 22+ there (a version manager may need configuring for non-login shells)`);
+  }
+
+  if (!detect.running) {
+    console.log(`no T3 Code server on ${target} — installing the t3 boot service (t3@${version})`);
+    console.log(dim(`  this downloads packages on ${target} and can take a few minutes; its output follows`));
+    // No timeout: t3code itself allows 10 minutes for the pinned-runtime npm
+    // install, and the user watches the output stream by.
+    const res = sshRun(target, ['install', version], { streamStderr: true });
+    if (res.status !== 0) throw new Error(`t3 service install failed on ${target} (exit ${res.status})`);
+
+    const deadline = Date.now() + SSH_READY_MS;
+    let ready: DetectResult | null = null;
+    while (Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 3000));
+      try {
+        ready = await sshDetect(target);
+        if (ready.running) break;
+      } catch { /* transient ssh hiccups while the service boots */ }
+    }
+    if (!ready?.running) {
+      // Nothing is written to the registry — the origin is not proven yet
+      // (probe-first discipline). A tunnel master is only spawned after the
+      // probe below, so there is nothing to clean up here either.
+      usage(`the boot service was installed on ${target} but no server became ready within ${SSH_READY_MS / 1000}s.\n` +
+        `  Check its service log on ${target}: ~/.t3/userdata/logs/boot-service.log\n` +
+        `  On a Mac this usually means nobody is logged in at that console — a launchd\n` +
+        `  agent starts at login, and an ssh install alone cannot start it.\n` +
+        `  Rerunning t3ctl host add ${target} is safe once the server is up.`);
+      return;
+    }
+    detect = ready;
+  }
+
+  // The stored local port may be taken by now; spawnMaster retries with fresh
+  // ports and returns whichever won.
+  const existing = hosts.find((h) => h.ssh === target);
+  const localPort = await spawnMaster(target, detect.port ?? 3773);
+  const origin = `http://127.0.0.1:${localPort}`;
+  try {
+    if (!(await waitForOrigin(origin, Date.now() + TUNNEL_WAIT_MS))) {
+      throw new Error(`the tunnel is up but ${origin} is not answering — is the server listening on 127.0.0.1:${detect.port ?? 3773} on ${target}?`);
+    }
+    const descriptor = await probe(origin);
+
+    // A changed environmentId on a known login means it now lands on a
+    // different machine — same warning as a changed origin, same consequence.
+    if (existing?.environmentId && existing.environmentId !== descriptor.environmentId) {
+      warn(`${target} is now a DIFFERENT environment\n` +
+        `  was ${existing.environmentId} (${existing.label ?? 'unknown'})\n` +
+        `  now ${descriptor.environmentId} (${descriptor.label})\n` +
+        `  the token stored for "${existing.name}" was issued by the old one and will be replaced`);
+    }
+
+    const name = flags.name ?? existing?.name ?? uniqueName(slugify(descriptor.label), hosts);
+    let token = existing?.token ?? null;
+    let session: { token: string; sessionId?: string } | null = null;
+    if (!token || (existing?.environmentId && existing.environmentId !== descriptor.environmentId)) {
+      const issued = sshToken(target, version, `t3ctl:${name}`, flags.ttl ?? '30d');
+      token = issued.token;
+      session = issued;
+    }
+
+    const others = hosts.filter((h) => h.name !== name && h.origin !== origin && h.serverVersion);
+    const skewed = [...new Set(others.flatMap((h) => (h.serverVersion ? [h.serverVersion] : [])))]
+      .filter((v) => v !== descriptor.serverVersion);
+    if (skewed.length) warn(`serverVersion ${descriptor.serverVersion} differs from other hosts: ${skewed.join(', ')}`);
+
+    // A master on a superseded local port would linger forever otherwise.
+    if (existing?.sshLocalPort && existing.sshLocalPort !== localPort) {
+      spawnSync('ssh', ['-O', 'exit', '-S', ctlPath(target, existing.sshLocalPort), target], { stdio: 'ignore' });
+    }
+
+    writeHosts(hosts.filter((h) => h.name !== name && h.ssh !== target).concat({
+      name, origin, token,
+      environmentId: descriptor.environmentId,
+      label: descriptor.label,
+      serverVersion: descriptor.serverVersion,
+      ssh: target, sshLocalPort: localPort, sshRemotePort: detect.port ?? 3773, t3Version: version,
+    }));
+
+    console.log(`added ${bold(name)} -> ${origin} (via ssh)\n  label   ${descriptor.label}\n` +
+      `  env     ${descriptor.environmentId}\n  version ${descriptor.serverVersion}\n` +
+      `  tunnel  127.0.0.1:${localPort} -> 127.0.0.1:${detect.port ?? 3773} on ${target}`);
+    if (session) {
+      console.log(`  session ${session.sessionId ?? '?'} (label t3ctl:${name})\n` +
+        `  revoke on ${target} with: npx t3 auth session revoke ${session.sessionId ?? '?'}`);
+    } else {
+      console.log('  token   reusing the stored session');
+    }
+  } catch (error) {
+    // Keep no half-registered host: the master would outlive t3ctl otherwise.
+    spawnSync('ssh', ['-O', 'exit', '-S', ctlPath(target, localPort), target], { stdio: 'ignore' });
+    throw error;
   }
 };
 
@@ -337,6 +715,7 @@ const pickHost = (flags: Flags): Host => {
 };
 
 const dispatch = async (host: Host, command: OrchestrationCommand): Promise<{ sequence: number }> => {
+  await ensureTunnel(host);
   const res = await fetch(`${host.origin}/api/orchestration/dispatch`, {
     method: 'POST',
     headers: { ...(host.token ? { authorization: `Bearer ${host.token}` } : {}), 'content-type': 'application/json' },
@@ -424,6 +803,7 @@ const cmdThreadRename = async (thread: Thread, host: Host, title: string): Promi
 // Lighter than the full snapshot; retitle polls this so it does not refetch every
 // thread's history once a second.
 const threadDetail = async (host: Host, threadId: string): Promise<Thread> => {
+  await ensureTunnel(host);
   const res = await fetch(`${host.origin}/api/orchestration/threads/${threadId}?turnLimit=1`, {
     headers: { authorization: `Bearer ${host.token}` },
     signal: AbortSignal.timeout(host.timeoutMs ?? 15000),
@@ -561,18 +941,43 @@ program.command('ls')
 const host = program.command('host').description('manage the host registry');
 
 host.command('add')
-  .argument('<origin>', 'base URL of the host, e.g. https://box.tailnet.ts.net:3773')
-  .argument('[token]', 'bearer token from `t3 auth session issue` on that host')
-  .description('register a host, probing /.well-known/t3/environment first')
+  .argument('<origin>', 'base URL of the host, e.g. https://box.tailnet.ts.net:3773 — or an ssh login like agent@box to bootstrap that machine end to end')
+  .argument('[token]', 'bearer token from `t3 auth session issue` on that host (origin form only)')
+  .description('register a host — from a URL, or from its ssh login alone')
   .option('--name <name>', 'override the label detected from the host')
-  .action((origin: string, token: string, o: OptionValues) => cmdHostAdd([origin, token].filter(Boolean), toFlags(o), readHosts()));
+  .option('--ttl <duration>', 'session lifetime for the ssh form, e.g. 30d (default 30d)', '30d')
+  .option('--t3-version <version>', 'exact t3 CLI version to install remotely (default: npm-resolved latest, nightly as fallback)')
+  .action(async (origin: string, token: string | undefined, o: OptionValues) => {
+    const flags = toFlags(o);
+    const hosts = readHosts();
+    // Two shapes, told apart by scheme: an http(s) origin pairs with an existing
+    // server; anything else is an ssh login that bootstraps one.
+    if (isOrigin(origin)) {
+      return cmdHostAdd([origin, ...(token ? [token] : [])], flags, hosts);
+    }
+    // An origin missing its scheme is still the old, deliberate rejection — not
+    // guessed at, and not misread as an ssh target (ssh targets never carry a
+    // colon; ports belong to origins).
+    if (origin.includes(':')) {
+      return usage('an origin needs a scheme, e.g. http://localhost:3773');
+    }
+    if (token) {
+      throw new Error('a token argument only makes sense with an <origin>; the ssh form mints its own');
+    }
+    return cmdHostAddSsh(origin, flags, hosts);
+  });
 
 host.command('rm')
   .argument('<name>', 'registered host name')
   .description('remove a host from the registry')
   .action((name: string) => {
     const hosts = readHosts();
-    if (!hosts.some((h) => h.name === name)) throw new Error(`no such host: ${name}`);
+    const gone = hosts.find((h) => h.name === name);
+    if (!gone) throw new Error(`no such host: ${name}`);
+    // Taking the ssh master down with the entry; a missing socket just exits 255.
+    if (gone.ssh) {
+      spawnSync('ssh', ['-O', 'exit', '-S', ctlPath(gone.ssh, gone.sshLocalPort), gone.ssh], { stdio: 'ignore' });
+    }
     writeHosts(hosts.filter((h) => h.name !== name));
     console.log(`removed ${name}`);
   });
