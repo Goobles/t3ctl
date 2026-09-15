@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.6.0](https://github.com/Goobles/t3ctl/compare/v0.5.0...v0.6.0) (2026-09-14)
+
+
+### Features
+
+* add `export prompts` ([#13](https://github.com/Goobles/t3ctl/issues/13)) ([6479648](https://github.com/Goobles/t3ctl/commit/6479648503ee818cfe24421bca51b19963f240ab))
+* register a host from its ssh login alone ([b793cef](https://github.com/Goobles/t3ctl/commit/b793ceff554a447185209414b43e81c0352d1c5c))
+* register a host from its ssh login alone ([2f08702](https://github.com/Goobles/t3ctl/commit/2f0870209d291652effabf48d87eafe79856a0ca))
+
 ## [0.5.0](https://github.com/Goobles/t3ctl/compare/v0.4.0...v0.5.0) (2026-09-04)
 
 
