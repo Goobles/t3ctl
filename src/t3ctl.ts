@@ -740,7 +740,9 @@ const pickHost = (flags: Flags): Host => {
 // descriptor cannot tell them apart; server-runtime.json names the one that
 // started last, and a live pid there on a different port is the tell.
 
-type Rival = { origin: string; pid?: number; serverVersion?: string; startedAt?: string };
+// `moved`: the host's own port no longer answers, so there is one server and it
+// simply restarted elsewhere — not two servers splitting the data dir.
+type Rival = { origin: string; pid?: number; serverVersion?: string; startedAt?: string; moved?: boolean };
 
 const RUNTIME_JSON = '.t3/userdata/server-runtime.json';
 
@@ -765,6 +767,7 @@ const localRival = async (host: Host): Promise<Rival | null> => {
   return {
     origin: theirs.origin, pid, serverVersion: live.serverVersion,
     startedAt: typeof r.startedAt === 'string' ? r.startedAt : undefined,
+    moved: !mine,
   };
 };
 
@@ -783,13 +786,16 @@ const findRival = (host: Host): Promise<Rival | null> =>
   host.ssh ? Promise.resolve().then(() => sshRival(host)) : localRival(host);
 
 const rivalMessage = (host: Host, rival: Rival): string =>
-  `${host.name} (${host.origin}) is not the only T3 Code server on this data dir — ` +
+  (rival.moved
+    ? `${host.name} (${host.origin}) is not answering; its T3 Code server now runs at `
+    : `${host.name} (${host.origin}) is not the only T3 Code server on this data dir — `) +
   `${rival.origin}${rival.serverVersion ? ` (${rival.serverVersion}` : ''}` +
   `${rival.pid ? `, pid ${rival.pid}` : ''}${rival.startedAt ? `, started ${rival.startedAt}` : ''}` +
-  `${rival.serverVersion ? ')' : ''} started after it.\n` +
-  `  Each server only sees threads created through itself, so the app talking to one\n` +
-  `  gets "Thread … does not exist" for threads made on the other.\n` +
-  `  Stop the stale server, or point t3ctl at the current one:\n` +
+  `${rival.serverVersion ? ')' : ''}${rival.moved ? '' : ' started after it'}.\n` +
+  (rival.moved ? '  Point t3ctl at it:\n' :
+    `  Each server only sees threads created through itself, so the app talking to one\n` +
+    `  gets "Thread … does not exist" for threads made on the other.\n` +
+    `  Stop the stale server, or point t3ctl at the current one:\n`) +
   (host.ssh
     ? `    t3ctl host rm ${host.name} && t3ctl host add ${host.ssh} --name ${host.name}`
     : `    t3ctl host add ${rival.origin} --name ${host.name}`);

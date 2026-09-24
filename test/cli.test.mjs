@@ -365,3 +365,15 @@ test('host add --name re-points a host to another port and keeps its token', asy
     assert.deepEqual(hosts.map((h) => [h.name, h.origin, h.token]), [['box', b.origin, 'tok']]);
   } finally { a.close(); b.close(); rmSync(home, { recursive: true, force: true }); }
 });
+
+test('a host whose server restarted on another port is reported as moved, not split', async () => {
+  const b = await fakeT3('0.0.43');
+  const dead = await refusedRemoteOrigin().then((o) => o.replace(/\/\/[^:]+:/, '//127.0.0.1:'));
+  const home = splitHome({ name: 'box', origin: dead, token: 'tok', environmentId: ENV_ID }, b.origin);
+  try {
+    const { stderr } = await cliIn(home, 'hosts');
+    assert.match(stderr, /is not answering; its T3 Code server now runs at/);
+    assert.doesNotMatch(stderr, /not the only/);
+    assert.match(stderr, new RegExp(`t3ctl host add ${b.origin} --name box`));
+  } finally { b.close(); rmSync(home, { recursive: true, force: true }); }
+});
