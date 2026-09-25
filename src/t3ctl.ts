@@ -176,7 +176,7 @@ const cmdLs = async ({ threads: showThreads, all: showAll, json: asJson }: LsOpt
   const hosts = readHosts();
   if (!hosts.length) return console.error('No hosts registered. Run: t3ctl host add <origin> <token>');
 
-  const { ok, failed } = await collect(hosts);
+  const [{ ok, failed }] = await Promise.all([collect(hosts), warnRivals(hosts)]);
 
   if (asJson) {
     const out = ok.flatMap(({ host, snap }) => snap.projects
@@ -281,7 +281,10 @@ const cmdHostAdd = async (pos: string[], flags: Flags, hosts: Host[]): Promise<v
 
   const origin = parsed.origin.replace(/\/$/, '');
   const descriptor = await probe(origin);
-  const existing = hosts.find((h) => h.origin === origin);
+  // Re-pointing a named host at another port of the same environment (see the
+  // split-brain guard) keeps its token: both ports serve one auth database.
+  const existing = hosts.find((h) => h.origin === origin) ??
+    hosts.find((h) => !h.ssh && h.name === flags.name && h.environmentId === descriptor.environmentId);
 
   // A changed environmentId on a known origin means the origin now points at a
   // different machine — the stored token almost certainly belongs to the old one.
@@ -336,6 +339,7 @@ const cmdHostsList = async (hosts: Host[]): Promise<void> => {
     warn(`${h.name} (${h.origin}) is now a DIFFERENT environment\n` +
       `  was ${h.environmentId} (${h.label ?? 'unknown'})\n  now ${live.environmentId} (${live.label})`);
   }
+  await warnRivals(hosts);
 };
 
 // ---- ssh hosts ----------------------------------------------------------
@@ -726,8 +730,91 @@ const pickHost = (flags: Flags): Host => {
   return only;
 };
 
+// ---- split-brain guard --------------------------------------------------
+// Two T3 Code servers can end up running against one ~/.t3 — say the boot
+// service on 3773 and a desktop-launched one on 3774. They share state.sqlite
+// but each keeps its own in-memory read model, built at startup and advanced
+// only by its own commands. A thread created through one is unknown to the
+// other, which then rejects every command on it with "Thread '…' does not
+// exist for command '…'". Both report the same environmentId, so the
+// descriptor cannot tell them apart; server-runtime.json names the one that
+// started last, and a live pid there on a different port is the tell.
+
+// `moved`: the host's own port no longer answers, so there is one server and it
+// simply restarted elsewhere — not two servers splitting the data dir.
+type Rival = { origin: string; pid?: number; serverVersion?: string; startedAt?: string; moved?: boolean };
+
+const RUNTIME_JSON = '.t3/userdata/server-runtime.json';
+
+const localRival = async (host: Host): Promise<Rival | null> => {
+  let ours: URL;
+  try { ours = new URL(host.origin); } catch { return null; }
+  if (!LOOPBACK.has(ours.hostname)) return null;
+  let r: { pid?: unknown; origin?: unknown; startedAt?: unknown };
+  try { r = JSON.parse(fs.readFileSync(path.join(os.homedir(), RUNTIME_JSON), 'utf8')); } catch { return null; }
+  const pid = Number(r.pid);
+  let theirs: URL;
+  try { theirs = new URL(String(r.origin ?? '')); } catch { return null; }
+  if (!Number.isInteger(pid) || pid <= 0 || theirs.port === ours.port) return null;
+  try { process.kill(pid, 0); } catch { return null; }
+  // Same environmentId means same ~/.t3, i.e. the same database behind both ports.
+  const [live, mine] = await Promise.all([
+    probe(theirs.origin, PROBE_MS).catch(() => null),
+    probe(host.origin, PROBE_MS).catch(() => null),
+  ]);
+  const env = mine?.environmentId ?? host.environmentId;
+  if (!live || !env || live.environmentId !== env) return null;
+  return {
+    origin: theirs.origin, pid, serverVersion: live.serverVersion,
+    startedAt: typeof r.startedAt === 'string' ? r.startedAt : undefined,
+    moved: !mine,
+  };
+};
+
+// Over ssh the remote runtime file is only re-read when the tunnel is rebuilt,
+// so a server that keeps running on the old port hides a newer one the same way.
+const sshRival = (host: Host): Rival | null => {
+  // ensureTunnel may have just re-pointed the tunnel and rewritten the registry.
+  const current = readHosts().find((h) => h.name === host.name) ?? host;
+  if (!current.ssh || !current.sshRemotePort) return null;
+  const detect = sshDetect(current.ssh);
+  if (!detect.running || !detect.port || detect.port === current.sshRemotePort) return null;
+  return { origin: `${current.ssh}:${detect.port} (remote)` };
+};
+
+const findRival = (host: Host): Promise<Rival | null> =>
+  host.ssh ? Promise.resolve().then(() => sshRival(host)) : localRival(host);
+
+const rivalMessage = (host: Host, rival: Rival): string =>
+  (rival.moved
+    ? `${host.name} (${host.origin}) is not answering; its T3 Code server now runs at `
+    : `${host.name} (${host.origin}) is not the only T3 Code server on this data dir — `) +
+  `${rival.origin}${rival.serverVersion ? ` (${rival.serverVersion}` : ''}` +
+  `${rival.pid ? `, pid ${rival.pid}` : ''}${rival.startedAt ? `, started ${rival.startedAt}` : ''}` +
+  `${rival.serverVersion ? ')' : ''}${rival.moved ? '' : ' started after it'}.\n` +
+  (rival.moved ? '  Point t3ctl at it:\n' :
+    `  Each server only sees threads created through itself, so the app talking to one\n` +
+    `  gets "Thread … does not exist" for threads made on the other.\n` +
+    `  Stop the stale server, or point t3ctl at the current one:\n`) +
+  (host.ssh
+    ? `    t3ctl host rm ${host.name} && t3ctl host add ${host.ssh} --name ${host.name}`
+    : `    t3ctl host add ${rival.origin} --name ${host.name}`);
+
+// Writes are what strand threads, so they refuse; reads only warn.
+const assertNoRival = async (host: Host): Promise<void> => {
+  const rival = await findRival(host);
+  if (rival) throw new Error(rivalMessage(host, rival));
+};
+
+// ssh hosts are skipped here: a detect round-trip per host per `ls` is too slow.
+const warnRivals = async (hosts: Host[]): Promise<void> => {
+  const rivals = await Promise.all(hosts.map((h) => (h.ssh ? null : localRival(h).catch(() => null))));
+  hosts.forEach((h, i) => { const r = rivals[i]; if (r) warn(rivalMessage(h, r)); });
+};
+
 const dispatch = async (host: Host, command: OrchestrationCommand): Promise<{ sequence: number }> => {
   await ensureTunnel(host);
+  await assertNoRival(host);
   const res = await fetch(`${host.origin}/api/orchestration/dispatch`, {
     method: 'POST',
     headers: { ...(host.token ? { authorization: `Bearer ${host.token}` } : {}), 'content-type': 'application/json' },

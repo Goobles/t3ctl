@@ -12,6 +12,7 @@ import { promisify } from 'node:util';
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync, statSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { createServer } from 'node:net';
+import { createServer as createHttpServer } from 'node:http';
 import { networkInterfaces, tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -277,4 +278,102 @@ test('a host off loopback goes over HTTP, and its markers carry the host name', 
   } finally {
     rmSync(home, { recursive: true, force: true });
   }
+});
+
+// ---- split-brain guard ------------------------------------------------------
+// Two fake servers on loopback that report the same environmentId, i.e. two T3
+// Code processes sharing one ~/.t3. server-runtime.json names B, the one that
+// started last; a host registered at A must refuse to write.
+
+const ENV_ID = 'e3b97f3f-0000-4000-8000-000000000000';
+
+const fakeT3 = async (serverVersion) => {
+  const dispatched = [];
+  const server = createHttpServer((req, res) => {
+    const json = (body) => { res.setHeader('content-type', 'application/json'); res.end(JSON.stringify(body)); };
+    if (req.url === '/.well-known/t3/environment') return json({ environmentId: ENV_ID, label: 'box', serverVersion });
+    if (req.url === '/api/orchestration/snapshot') {
+      return json({ projects: [{ id: 'p1', title: 'alpha', workspaceRoot: '/tmp', updatedAt: '2026-01-01' }], threads: [] });
+    }
+    if (req.url === '/api/orchestration/dispatch') {
+      let body = '';
+      req.on('data', (c) => { body += c; });
+      req.on('end', () => { dispatched.push(JSON.parse(body)); json({ sequence: 1 }); });
+      return;
+    }
+    res.statusCode = 404; res.end();
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  return { origin: `http://127.0.0.1:${server.address().port}`, dispatched, close: () => server.close() };
+};
+
+const splitHome = (host, runtimeOrigin) => {
+  const home = mkdtempSync(join(tmpdir(), 't3ctl-split-'));
+  mkdirSync(join(home, '.t3', 'userdata'), { recursive: true });
+  mkdirSync(join(home, '.config', 't3ctl'), { recursive: true });
+  writeFileSync(join(home, '.config', 't3ctl', 'hosts.json'), JSON.stringify({ hosts: [host] }));
+  // pid is this test process: alive for as long as the CLI runs.
+  writeFileSync(join(home, '.t3', 'userdata', 'server-runtime.json'), JSON.stringify({
+    version: 1, pid: process.pid, origin: runtimeOrigin, startedAt: '2026-09-24T16:14:26.068Z',
+  }));
+  return home;
+};
+
+const cliIn = async (home, ...args) => {
+  try {
+    const { stdout, stderr } = await run(process.execPath, [CLI, ...args], { env: { ...process.env, HOME: home } });
+    return { code: 0, stdout, stderr };
+  } catch (error) {
+    return { code: error.code ?? 1, stdout: error.stdout ?? '', stderr: error.stderr ?? '' };
+  }
+};
+
+test('writes refuse a host that is not the newest server on its data dir', async () => {
+  const [a, b] = [await fakeT3('0.0.41'), await fakeT3('0.0.43')];
+  const home = splitHome({ name: 'box', origin: a.origin, token: 'tok', environmentId: ENV_ID }, b.origin);
+  try {
+    const { code, stderr } = await cliIn(home, 'thread', 'create', 'alpha', 'hello');
+    assert.notEqual(code, 0);
+    assert.match(stderr, /not the only T3 Code server/);
+    assert.match(stderr, new RegExp(`t3ctl host add ${b.origin} --name box`));
+    assert.equal(a.dispatched.length, 0, 'nothing may reach the stale server');
+    assert.equal(b.dispatched.length, 0);
+
+    const ls = await cliIn(home, 'hosts');
+    assert.equal(ls.code, 0, 'reads only warn');
+    assert.match(ls.stderr, /not the only T3 Code server/);
+  } finally { a.close(); b.close(); rmSync(home, { recursive: true, force: true }); }
+});
+
+test('writes go through when the host is the server named in server-runtime.json', async () => {
+  const a = await fakeT3('0.0.43');
+  const home = splitHome({ name: 'box', origin: a.origin, token: 'tok', environmentId: ENV_ID }, a.origin);
+  try {
+    const { code, stderr } = await cliIn(home, 'thread', 'create', 'alpha', 'hello');
+    assert.equal(code, 0, stderr);
+    assert.equal(a.dispatched[0]?.type, 'thread.create');
+  } finally { a.close(); rmSync(home, { recursive: true, force: true }); }
+});
+
+test('host add --name re-points a host to another port and keeps its token', async () => {
+  const [a, b] = [await fakeT3('0.0.41'), await fakeT3('0.0.43')];
+  const home = splitHome({ name: 'box', origin: a.origin, token: 'tok', environmentId: ENV_ID }, b.origin);
+  try {
+    const { code, stderr } = await cliIn(home, 'host', 'add', b.origin, '--name', 'box');
+    assert.equal(code, 0, stderr);
+    const { hosts } = JSON.parse(readFileSync(join(home, '.config', 't3ctl', 'hosts.json'), 'utf8'));
+    assert.deepEqual(hosts.map((h) => [h.name, h.origin, h.token]), [['box', b.origin, 'tok']]);
+  } finally { a.close(); b.close(); rmSync(home, { recursive: true, force: true }); }
+});
+
+test('a host whose server restarted on another port is reported as moved, not split', async () => {
+  const b = await fakeT3('0.0.43');
+  const dead = await refusedRemoteOrigin().then((o) => o.replace(/\/\/[^:]+:/, '//127.0.0.1:'));
+  const home = splitHome({ name: 'box', origin: dead, token: 'tok', environmentId: ENV_ID }, b.origin);
+  try {
+    const { stderr } = await cliIn(home, 'hosts');
+    assert.match(stderr, /is not answering; its T3 Code server now runs at/);
+    assert.doesNotMatch(stderr, /not the only/);
+    assert.match(stderr, new RegExp(`t3ctl host add ${b.origin} --name box`));
+  } finally { b.close(); rmSync(home, { recursive: true, force: true }); }
 });

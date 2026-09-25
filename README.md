@@ -110,6 +110,28 @@ t3ctl warns you when:
   meaning it points at a different machine than it used to and the stored token
   belongs to the old one
 
+### Two servers on one machine
+
+Nothing stops two T3 Code servers from running against the same `~/.t3` — for
+example the boot service on 3773 and a desktop-launched server on 3774. They
+share one database but each keeps its own in-memory view, so a thread created
+through one is invisible to the other, and the app then fails with
+`Thread '…' does not exist for command '…'`. Both report the same
+`environmentId`, so the descriptor can't tell them apart.
+
+Before every write, t3ctl compares the host with the live server recorded in
+`~/.t3/userdata/server-runtime.json` (the one that started last). If that is a
+different port serving the same environment, the write is refused and nothing is
+sent; `ls` and `hosts` print the same warning. Stop the stale server, or re-point
+the host — its token carries over, since both ports use one auth database:
+
+```sh
+t3ctl host add http://127.0.0.1:3774 --name agentbox
+```
+
+The check runs for loopback hosts, and for ssh hosts on writes (one extra ssh
+round-trip to read the remote runtime file).
+
 The token is optional so you can register a host before minting one, but reads
 will fail until you add it.
 
