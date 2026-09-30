@@ -117,7 +117,9 @@ thread.turn.interrupt { commandId, threadId }
 `full-access` (default `full-access`). `ProviderInteractionMode` is `default`
 or `plan` (default `default`).
 
-`modelSelection` is `{instanceId, model}`. `instanceId` is the segment before
+`modelSelection` is `{instanceId, model, options?}`, where `options` is an
+array of `{id, value}` and `value` is a string or a boolean
+(`ProviderOptionSelection` in `packages/contracts/src/model.ts`). `instanceId` is the segment before
 the *first* slash, and `model` keeps the rest — opencode models are themselves
 slashed, e.g. `opencode/github-copilot/gpt-5.4` parses to
 `{instanceId: "opencode", model: "github-copilot/gpt-5.4"}`.
