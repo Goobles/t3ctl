@@ -355,6 +355,26 @@ test('writes go through when the host is the server named in server-runtime.json
   } finally { a.close(); rmSync(home, { recursive: true, force: true }); }
 });
 
+test('--option sets model options, with true and false sent as booleans', async () => {
+  const a = await fakeT3('0.0.43');
+  const home = splitHome({ name: 'box', origin: a.origin, token: 'tok', environmentId: ENV_ID }, a.origin);
+  try {
+    const { code, stdout, stderr } = await cliIn(home, 'thread', 'create', 'alpha', 'hello',
+      '--model', 'claudeAgent/claude-opus-5-5', '--option', 'effort=low', '--option', 'fastMode=false', '--option', 'effort=medium');
+    assert.equal(code, 0, stderr);
+    assert.deepEqual(a.dispatched[0]?.modelSelection, {
+      instanceId: 'claudeAgent', model: 'claude-opus-5-5',
+      options: [{ id: 'effort', value: 'medium' }, { id: 'fastMode', value: false }],
+    });
+    assert.match(stdout, /claude-opus-5-5 \(effort=medium, fastMode=false\)/);
+
+    const bad = await cliIn(home, 'thread', 'create', 'alpha', 'hello', '--option', 'effort');
+    assert.notEqual(bad.code, 0);
+    assert.match(bad.stderr, /--option must be <id>=<value>/);
+    assert.equal(a.dispatched.length, 1);
+  } finally { a.close(); rmSync(home, { recursive: true, force: true }); }
+});
+
 test('host add --name re-points a host to another port and keeps its token', async () => {
   const [a, b] = [await fakeT3('0.0.41'), await fakeT3('0.0.43')];
   const home = splitHome({ name: 'box', origin: a.origin, token: 'tok', environmentId: ENV_ID }, b.origin);

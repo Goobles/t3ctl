@@ -229,6 +229,7 @@ Flags:
 | Flag | Default | Meaning |
 |---|---|---|
 | `--model <instance>/<model>` | `claudeAgent/claude-opus-5` | Provider instance and model |
+| `--option <id>=<value>` | none | Model option, e.g. `effort=high`; repeatable |
 | `--branch <name>` | none | Git branch for the thread |
 | `--worktree <path>` | none | Explicit worktree path |
 | `--runtime-mode <mode>` | `full-access` | `approval-required`, `auto-accept-edits`, `auto`, `full-access` |
@@ -237,6 +238,14 @@ Flags:
 
 `--model` splits on the **first** slash, so slashed model names work as-is:
 `--model opencode/github-copilot/gpt-5.4`.
+
+`--option` sets one of the model's options, the same ones the app's model picker
+shows. The ids come from the provider, e.g. `effort`, `fastMode` and
+`contextWindow` for Claude. `true` and `false` are sent as booleans:
+
+```sh
+t3ctl thread create t3ctl "tidy the tests" --model claudeAgent/claude-opus-5-5 --option effort=medium --option fastMode=false
+```
 
 ### `t3ctl thread send <thread> <message...>`
 
@@ -257,9 +266,10 @@ started rewrite the readme for users
   seq   4471
 ```
 
-Accepts `--model`, `--runtime-mode`, `--interaction-mode`, and `--host`. Unlike
+Accepts `--model`, `--option`, `--runtime-mode`, `--interaction-mode`, and `--host`. Unlike
 `thread create`, `--model` has no default here: the thread's existing model is
-reused unless you override it.
+reused unless you override it. `--option` changes options on top of the thread's
+model, or on top of `--model` when you pass one.
 
 ### `t3ctl thread rename <thread> <new title...>`
 

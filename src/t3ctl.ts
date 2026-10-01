@@ -38,7 +38,10 @@ type Descriptor = {
   platform?: { os: string; arch: string };
 };
 
-type ModelSelection = { instanceId: string; model: string };
+/** A provider option such as `effort` or `fastMode`; the provider decides which ids it knows. */
+type ModelOption = { id: string; value: string | boolean };
+
+type ModelSelection = { instanceId: string; model: string; options?: ModelOption[] };
 
 type Session = {
   status: string;
@@ -92,7 +95,7 @@ type Snapshot = { snapshotSequence: number; projects: Project[]; threads: Thread
 type Flags = Partial<Record<
   'host' | 'model' | 'branch' | 'worktree' | 'name' | 'timeout' | 'runtime-mode' | 'interaction-mode' | 'ttl' | 't3-version',
   string
->>;
+>> & { option?: string[] };
 
 /** An orchestration command; `type` selects the shape the server validates. */
 type OrchestrationCommand = { type: string; commandId: string } & Record<string, unknown>;
@@ -853,6 +856,33 @@ const resolveThread = (snap: Snapshot, ref: string): Thread => {
 };
 
 
+// instanceId is the segment before the FIRST slash; the model keeps the rest,
+// because opencode model ids are themselves slashed ("github-copilot/gpt-5.4").
+const parseModel = (raw: string): ModelSelection => {
+  const slash = raw.indexOf('/');
+  if (slash < 1) throw new Error(`--model must be <instance>/<model>, got "${raw}"`);
+  return { instanceId: raw.slice(0, slash), model: raw.slice(slash + 1) };
+};
+
+// `--option id=value` sets one entry of modelSelection.options, replacing an
+// entry with the same id. The server accepts strings and booleans, so `true`
+// and `false` are sent as booleans (`fastMode=true`), anything else as a string.
+const withOptions = (selection: ModelSelection, raw: string[] = []): ModelSelection => {
+  if (raw.length === 0) return selection;
+  const options = new Map((selection.options ?? []).map((o) => [o.id, o]));
+  for (const entry of raw) {
+    const eq = entry.indexOf('=');
+    const id = entry.slice(0, eq).trim();
+    const text = entry.slice(eq + 1).trim();
+    if (eq < 0 || !id || !text) throw new Error(`--option must be <id>=<value>, got "${entry}"`);
+    options.set(id, { id, value: text === 'true' ? true : text === 'false' ? false : text });
+  }
+  return { ...selection, options: [...options.values()] };
+};
+
+const describeModel = (m: ModelSelection): string => `${m.instanceId}/${m.model}` +
+  (m.options?.length ? ` (${m.options.map((o) => `${o.id}=${o.value}`).join(', ')})` : '');
+
 // thread.turn.start is ONE command carrying the first message inline — this is
 // what the UI fires immediately after thread.create, which is why a thread with
 // no messages is a state the UI never produces. The client-side schema requires
@@ -867,17 +897,13 @@ const cmdThreadStart = async (thread: Thread, host: Host, text: string, flags: F
     interactionMode: flags['interaction-mode'] ?? 'default',
     createdAt: new Date().toISOString(),
   };
-  if (flags.model) {
-    const slash = flags.model.indexOf('/');
-    if (slash < 1) throw new Error(`--model must be <instance>/<model>, got "${flags.model}"`);
-    command.modelSelection = { instanceId: flags.model.slice(0, slash), model: flags.model.slice(slash + 1) };
-  } else if (thread.modelSelection) {
-    command.modelSelection = thread.modelSelection;
-  }
+  const base = flags.model ? parseModel(flags.model) : thread.modelSelection;
+  if (!base && flags.option?.length) throw new Error('--option needs a model; the thread has none, so pass --model too');
+  if (base) command.modelSelection = withOptions(base, flags.option);
   const { sequence } = await dispatch(host, command);
   const m = command['modelSelection'] as ModelSelection | undefined;
   console.log(`started ${bold(thread.title || thread.id)}\n  id    ${thread.id}` +
-    (m ? `\n  model ${m.instanceId}/${m.model}` : '') +
+    (m ? `\n  model ${describeModel(m)}` : '') +
     `\n  mode  ${command.runtimeMode} / ${command.interactionMode}\n  seq   ${sequence}`);
 };
 
@@ -966,12 +992,7 @@ const cmdThreadCreate = async (projectRef: string, title: string, flags: Flags):
   const host = pickHost(flags);
   const project = resolveProject(await snapshot(host), projectRef);
   if (!project) throw new Error(`no project matching "${projectRef}" on ${host.name}`);
-  // instanceId is the segment before the FIRST slash; the model keeps the rest,
-  // because opencode model ids are themselves slashed ("github-copilot/gpt-5.4").
-  const raw = flags.model ?? 'claudeAgent/claude-opus-5';
-  const slash = raw.indexOf('/');
-  if (slash < 1) throw new Error(`--model must be <instance>/<model>, got "${raw}"`);
-  const modelSelection = { instanceId: raw.slice(0, slash), model: raw.slice(slash + 1) };
+  const modelSelection = withOptions(parseModel(flags.model ?? 'claudeAgent/claude-opus-5'), flags.option);
   const threadId = crypto.randomUUID();
   const { sequence } = await dispatch(host, {
     type: 'thread.create', commandId: crypto.randomUUID(),
@@ -982,7 +1003,7 @@ const cmdThreadCreate = async (projectRef: string, title: string, flags: Flags):
     worktreePath: flags.worktree ?? null,
     createdAt: new Date().toISOString(),
   });
-  console.log(`created thread ${bold(title)} in ${project.title} on ${host.name}\n  id    ${threadId}\n  model ${modelSelection.instanceId}/${modelSelection.model}\n  seq   ${sequence}`);
+  console.log(`created thread ${bold(title)} in ${project.title} on ${host.name}\n  id    ${threadId}\n  model ${describeModel(modelSelection)}\n  seq   ${sequence}`);
 };
 
 const cmdThreadSimple = async (verb: string, ref: string, flags: Flags): Promise<void> => {
@@ -1289,6 +1310,7 @@ const FLAG_NAMES = {
   host: 'host', model: 'model', branch: 'branch', worktree: 'worktree',
   name: 'name', timeout: 'timeout',
   runtimeMode: 'runtime-mode', interactionMode: 'interaction-mode',
+  option: 'option',
 };
 // Only carry options that were actually supplied. Emitting every key
 // unconditionally made `'name' in flags` always true, which made host add bail
@@ -1318,6 +1340,7 @@ program
   .showHelpAfterError('(run `t3ctl --help` or `t3ctl <command> --help`)')
   .configureHelp({ showGlobalOptions: true });
 
+const addOption = (value: string, previous?: string[]): string[] => [...(previous ?? []), value];
 const hostOption = (cmd: Command) => cmd.option('--host <name>', 'which registered host to talk to (required when several are registered)');
 
 program.command('ls')
@@ -1407,6 +1430,7 @@ hostOption(thread.command('create')
   .argument('<title...>', 'thread title; everything after the project is used')
   .description('create a thread (idle — use `thread send` to run it)')
   .option('--model <instance/model>', 'e.g. claudeAgent/claude-opus-5', 'claudeAgent/claude-opus-5')
+  .option('--option <id=value>', 'model option, e.g. effort=high; repeatable', addOption)
   .option('--branch <branch>', 'git branch to associate with the thread')
   .option('--worktree <path>', 'git worktree the thread should run in')
   .option('--runtime-mode <mode>', 'approval-required | auto-accept-edits | auto | full-access', 'full-access')
@@ -1419,6 +1443,7 @@ hostOption(thread.command('send')
   .argument('<message...>', 'the message; everything after the thread is sent')
   .description('send a message to a thread and run the agent')
   .option('--model <instance/model>', "override the thread's model for this turn")
+  .option('--option <id=value>', "model option for this turn, e.g. effort=high; repeatable", addOption)
   .option('--runtime-mode <mode>', 'approval-required | auto-accept-edits | auto | full-access')
   .option('--interaction-mode <mode>', 'default | plan'))
   .action(async (ref: string, message: string[], o: OptionValues) => {
