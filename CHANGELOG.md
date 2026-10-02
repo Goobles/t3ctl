@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.8.0](https://github.com/Goobles/t3ctl/compare/v0.7.0...v0.8.0) (2026-10-02)
+
+
+### Features
+
+* expose thread snooze/unsnooze and standalone runtime-mode ([4e8afbc](https://github.com/Goobles/t3ctl/commit/4e8afbc57f6d4bdf5f0306dce0ed9cb4bdeb7324))
+* expose thread snooze/unsnooze and standalone runtime-mode ([78326d7](https://github.com/Goobles/t3ctl/commit/78326d7888e78e1681636d324e7475bef2a7f7ec))
+* mint ssh host tokens with a running desktop app's own CLI ([befee0a](https://github.com/Goobles/t3ctl/commit/befee0a8e8751caaf64a960488f35f4c8725543f))
+* mint ssh host tokens with a running desktop app's own CLI ([e7c0287](https://github.com/Goobles/t3ctl/commit/e7c0287d2472fda0deac209c80b6c1ee1db2ddfc))
+
+
+### Bug Fixes
+
+* fall back to npx when a desktop app was upgraded under its server ([22b28a7](https://github.com/Goobles/t3ctl/commit/22b28a7f1cd587848aae7a0e425d78b61e0ca02b))
+
 ## [0.7.0](https://github.com/Goobles/t3ctl/compare/v0.6.0...v0.7.0) (2026-10-01)
 
 
