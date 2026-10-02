@@ -235,7 +235,7 @@ Flags:
 | `--option <id>=<value>` | none | Model option, e.g. `effort=high`; repeatable |
 | `--branch <name>` | none | Git branch for the thread |
 | `--worktree <path>` | none | Explicit worktree path |
-| `--runtime-mode <mode>` | `full-access` | `approval-required`, `auto-accept-edits`, `auto`, `full-access` |
+| `--runtime-mode <mode>` | `full-access` | `approval-required`, `auto-accept-edits`, `auto`, `full-access` — see [Runtime modes](#runtime-modes) for the app's names |
 | `--interaction-mode <mode>` | `default` | `default` or `plan` |
 | `--host <name>` | the only host | Which host to act on |
 
@@ -269,7 +269,8 @@ started rewrite the readme for users
   seq   4471
 ```
 
-Accepts `--model`, `--option`, `--runtime-mode`, `--interaction-mode`, and `--host`. Unlike
+Accepts `--model`, `--option`, `--runtime-mode` (see [Runtime
+modes](#runtime-modes)), `--interaction-mode`, and `--host`. Unlike
 `thread create`, `--model` has no default here: the thread's existing model is
 reused unless you override it. `--option` changes options on top of the thread's
 model, or on top of `--model` when you pass one.
@@ -315,6 +316,77 @@ Stop the turn that's currently running.
 ```sh
 t3ctl thread interrupt "rewrite the readme"
 ```
+
+### `t3ctl thread snooze <thread> <when>` / `unsnooze <thread>`
+
+Hide a thread until a wake time. Snoozed threads show as `☾` in `ls` and drop out
+of the app's active list until the time passes; `unsnooze` brings one back now.
+
+```sh
+t3ctl thread snooze "flaky release workflow" 3d
+t3ctl thread snooze "review the api docs" monday
+t3ctl thread snooze 0f5c1e2a-... 2026-10-05T07:00:00.000Z
+t3ctl thread unsnooze "flaky release workflow"
+```
+
+```
+snoozed flaky release workflow
+  until 2026-10-05T07:00:00.000Z  (05/10/2026, 09:00:00 local)
+  id    0f5c1e2a-...
+  seq   4512
+```
+
+`<when>` accepts three forms, and nothing else:
+
+| Form | Example | Means |
+|---|---|---|
+| ISO time | `2026-10-05T07:00:00.000Z` | Exactly that instant. A time with no zone is read as local. |
+| Duration from now | `45m`, `2h`, `3d`, `1w` | Minutes, hours, days, weeks. |
+| Named day | `tomorrow`, `monday`…`sunday`, `next-week` | **09:00 local** on that day. |
+
+Named days are always strictly ahead: `monday` on a Monday means the *next*
+Monday, never this morning. `next-week` is the coming Monday. A wake time in the
+past is rejected rather than sent — the server accepts one but it does nothing.
+
+Waking is not only manual: the thread stops counting as snoozed once the time
+passes, and activity in the thread wakes it server-side. `unsnooze` is for when
+you want it back before either happens.
+
+### `t3ctl thread runtime-mode <thread> <mode>`
+
+Change a thread's runtime mode — what the app calls **Access** — without sending
+a message. Aliased as `thread mode`.
+
+```sh
+t3ctl thread runtime-mode "rewrite the readme" supervised
+t3ctl thread mode 0f5c1e2a-... full
+```
+
+```
+rewrite the readme
+  mode full-access -> approval-required (Supervised)
+  id   0f5c1e2a-...
+  seq  4519
+```
+
+`thread send --runtime-mode` also changes the mode, but only as part of running a
+turn. This is the standalone switch, for setting a thread to `supervised` and
+leaving it there.
+
+#### Runtime modes
+
+Four values, with the names the T3 Code app shows. **Both spellings are accepted
+everywhere a mode is** — here, and in `--runtime-mode` on `thread create` and
+`thread send`:
+
+| Wire value | App name | Also accepted as | What it allows |
+|---|---|---|---|
+| `approval-required` | Supervised | `supervised` | Asks before commands and file changes. |
+| `auto-accept-edits` | Auto-accept edits | — | Auto-approves edits, asks before other actions. |
+| `auto` | Auto | — | Supported providers approve routine actions; others still ask. |
+| `full-access` | Full access | `full` | Commands and edits without prompts. |
+
+`full-access` is the default, for threads and for t3ctl.
 
 ### `t3ctl thread settle|archive|unarchive|unpin|delete <thread>`
 
@@ -446,7 +518,7 @@ count. With `-t`, each thread line starts with its own icon.
 | `●` green | `running` | A turn is in flight right now. The agent is working. |
 | `✕` red | `error` | The session or its most recent turn failed. Needs you. |
 | `◆` yellow | `needs-review` | The agent produced a plan and is waiting for you to approve it. |
-| `☾` grey | `snoozed` | Hidden on purpose until a wake time (set in the app) passes. |
+| `☾` grey | `snoozed` | Hidden on purpose until a wake time passes. Set one with `thread snooze`. |
 | `✓` grey | `settled` | You marked it done. It stays settled until new activity un-settles it. |
 | `·` grey | `idle` | Alive, nothing running, nothing waiting on you. Freshly created threads land here. |
 | `▪` grey | `archived` | Archived. Hidden unless you pass `-a`. |
@@ -512,10 +584,12 @@ Worth knowing before you build a workflow on this:
 - **`thread create` doesn't run anything.** It leaves an idle thread with no
   messages — a state the desktop UI never produces. Follow it with `thread start`,
   or the thread just sits there.
-- **Not everything the API supports is wired up.** No `pin`, `unsettle`,
-  `snooze`/`unsnooze`, no live tailing of a running turn. `export prompts` reads
-  your own prompts; nothing reads agent output. `unpin` exists without `pin` because only some of these share a payload
-  shape — see [CONTRIBUTING.md](CONTRIBUTING.md).
+- **Not everything the API supports is wired up.** No `pin`, no `unsettle`, no
+  live tailing of a running turn, and `--interaction-mode` can only be set while
+  starting a turn, unlike the runtime mode. `export prompts` reads your own
+  prompts; nothing reads agent output. `unpin` exists without `pin` because only
+  some of these share a payload shape — see
+  [CONTRIBUTING.md](CONTRIBUTING.md).
 - **`ls` fetches full snapshots.** Fine interactively; too heavy to poll in a
   loop.
 - **Tokens sit in plaintext** in `~/.config/t3ctl/hosts.json`. No keychain

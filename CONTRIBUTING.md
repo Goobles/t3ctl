@@ -111,11 +111,31 @@ thread.create       { commandId, threadId, projectId, title, modelSelection,
 thread.turn.start   { commandId, threadId, message: {messageId, role, text, attachments},
                       runtimeMode, interactionMode, modelSelection?, titleSeed?, createdAt }
 thread.turn.interrupt { commandId, threadId }
+thread.snooze       { commandId, threadId, snoozedUntil }
+thread.unsnooze     { commandId, threadId, reason: "user" }
+thread.runtime-mode.set { commandId, threadId, runtimeMode, createdAt }
 ```
+
+Note the shape of the last one: the *event* is `thread.runtime-mode-set`, but the
+command that produces it is `thread.runtime-mode.set` — a dot, not a hyphen, in
+the same position. Its sibling `thread.interaction-mode.set` is not wired up.
+
+`thread.snooze` takes only a wake time today. Upstream's comment on the field
+says event-based wake conditions (PR merged, review posted) are expected to
+arrive as an optional `condition` field beside it, so time-based snooze is the
+first kind, not the only intended one.
 
 `RuntimeMode` is one of `approval-required`, `auto-accept-edits`, `auto`,
 `full-access` (default `full-access`). `ProviderInteractionMode` is `default`
 or `plan` (default `default`).
+
+The app labels those four modes Supervised, Auto-accept edits, Auto and Full
+access (its "Access" menu — `ProviderModelPicker` in the client bundle). t3ctl
+accepts both spellings anywhere a mode is taken, which in practice means two
+aliases (`supervised`, `full`); the other two labels already slugify to the wire
+value. `RUNTIME_MODES` keeps the labels next to the values so the two cannot
+drift apart silently, and it is also what prints in `thread runtime-mode`
+output.
 
 `modelSelection` is `{instanceId, model, options?}`, where `options` is an
 array of `{id, value}` and `value` is a string or a boolean
@@ -155,8 +175,9 @@ same generic code path:
   `"user"`: activity un-settles are decided server-side (the decider emits
   `thread.unsettled(reason: "activity")` directly), so a client cannot forge
   the neutral reset.
-- `thread.snooze` — carries `snoozedUntil`.
-- `thread.unsnooze` — carries `reason: "user"`, same reasoning as `unsettle`.
+- `thread.snooze` — carries `snoozedUntil`; `cmdThreadSnooze` builds it.
+- `thread.unsnooze` — carries `reason: "user"`, same reasoning as `unsettle`;
+  `cmdThreadUnsnooze` builds it.
 - `thread.pin` — carries an optional `orderKey` (fractional index).
 - `thread.pin.reorder` — carries a required `orderKey`.
 
