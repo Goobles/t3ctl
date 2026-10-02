@@ -456,7 +456,8 @@ const desktopCli = (pid) => {
       ? require('node:child_process').execFileSync('ps', ['-o', 'comm=', '-p', String(pid)], { encoding: 'utf8' }).trim()
       : fs.readlinkSync('/proc/' + pid + '/exe');
     const asar = path.join(path.dirname(exe), ...(mac ? ['..', 'Resources'] : ['resources']), 'app.asar');
-    return fs.existsSync(asar) ? { exe, bin: path.join(asar, 'apps', 'server', 'dist', 'bin.mjs') } : null;
+    // an app upgraded under its running server leaves /proc/<pid>/exe as "<path> (deleted)"
+    return fs.existsSync(exe) && fs.existsSync(asar) ? { exe, bin: path.join(asar, 'apps', 'server', 'dist', 'bin.mjs') } : null;
   } catch {
     return null;
   }
