@@ -7,14 +7,14 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { execFile } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
 import { promisify } from 'node:util';
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync, statSync } from 'node:fs';
+import { chmodSync, copyFileSync, existsSync, mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync, statSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { createServer } from 'node:net';
 import { createServer as createHttpServer } from 'node:http';
 import { networkInterfaces, tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 
 const run = promisify(execFile);
 const CLI = fileURLToPath(new URL('../dist/t3ctl.js', import.meta.url));
@@ -396,4 +396,98 @@ test('a host whose server restarted on another port is reported as moved, not sp
     assert.doesNotMatch(stderr, /not the only/);
     assert.match(stderr, new RegExp(`t3ctl host add ${b.origin} --name box`));
   } finally { b.close(); rmSync(home, { recursive: true, force: true }); }
+});
+
+// ---- ssh host on a desktop app ---------------------------------------------
+// A fake desktop app (an executable with an app.asar where Electron keeps it)
+// runs a fake server; a fake ssh runs the remote script locally. The token must
+// come from the app's own server bundle, never from npx.
+
+const fakeDesktopHost = async () => {
+  const root = mkdtempSync(join(tmpdir(), 't3ctl-desktop-'));
+  const home = join(root, 'home');
+  mkdirSync(join(home, '.t3', 'userdata'), { recursive: true });
+
+  // the app's path has spaces, as on macOS; its executable is a copy of node, so
+  // the server process's executable really is inside the app
+  const app = join(root, 'T3 Code.app', 'Contents');
+  const exeDir = join(app, process.platform === 'darwin' ? 'MacOS' : 'bin');
+  const asar = process.platform === 'darwin' ? join(app, 'Resources', 'app.asar') : join(exeDir, 'resources', 'app.asar');
+  const exe = join(exeDir, 'T3 Code');
+  const bin = join(asar, 'apps', 'server', 'dist', 'bin.mjs');
+  mkdirSync(dirname(bin), { recursive: true });
+  copyFileSync(process.execPath, exe);
+  chmodSync(exe, 0o755);
+  writeFileSync(bin, `
+import { createServer } from 'node:http';
+import { writeFileSync } from 'node:fs';
+const [cmd] = process.argv.slice(2);
+if (cmd === 'auth') {
+  writeFileSync(${JSON.stringify(join(root, 'auth-call.json'))}, JSON.stringify({ argv: process.argv.slice(2), electron: process.env.ELECTRON_RUN_AS_NODE }));
+  console.log('{\\n  "token": "desktop-token",\\n  "sessionId": "s1"\\n}');
+} else {
+  const server = createServer((req, res) => {
+    if (req.url !== '/.well-known/t3/environment') { res.statusCode = 404; return res.end(); }
+    res.setHeader('content-type', 'application/json');
+    res.end(JSON.stringify({ environmentId: '${ENV_ID}', label: 'mac', serverVersion: '0.0.45' }));
+  });
+  server.listen(0, '127.0.0.1', () => {
+    const { port } = server.address();
+    writeFileSync(${JSON.stringify(join(home, '.t3', 'userdata', 'server-runtime.json'))},
+      JSON.stringify({ version: 1, pid: process.pid, port, origin: 'http://127.0.0.1:' + port }));
+  });
+}
+`);
+
+  // ssh: run `sh -s -- …` locally from one joined string, as real ssh hands it
+  // to the remote shell; -fN forwards a port; -O is a no-op
+  const fakeBin = join(root, 'fakebin');
+  mkdirSync(fakeBin);
+  writeFileSync(join(fakeBin, 'ssh'), `#!${process.execPath}
+const { spawn, spawnSync } = require('node:child_process');
+const args = process.argv.slice(2);
+if (args.includes('-O')) process.exit(0);
+if (args.includes('-fN')) {
+  const [local, , remote] = args[args.indexOf('-L') + 1].split(':');
+  const forward = "require('node:net').createServer((c) => { const r = require('node:net').connect(" + remote + ", '127.0.0.1'); c.pipe(r).pipe(c); c.on('error', () => {}); r.on('error', () => {}); }).listen(" + local + ", '127.0.0.1')";
+  const child = spawn(process.execPath, ['-e', forward], { detached: true, stdio: 'ignore' });
+  require('node:fs').appendFileSync(${JSON.stringify(join(root, 'pids'))}, child.pid + '\\n');
+  child.unref();
+  setTimeout(() => process.exit(0), 300);
+} else {
+  const i = args.indexOf('sh');
+  process.exit(spawnSync('sh', ['-c', args.slice(i).join(' ')], { stdio: 'inherit', env: { ...process.env, HOME: ${JSON.stringify(home)} } }).status ?? 1);
+}
+`);
+  chmodSync(join(fakeBin, 'ssh'), 0o755);
+
+  const server = spawn(exe, [bin, 'serve'], { env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' }, stdio: 'ignore' });
+  const runtime = join(home, '.t3', 'userdata', 'server-runtime.json');
+  for (let i = 0; i < 100 && !existsSync(runtime); i++) await new Promise((r) => setTimeout(r, 50));
+
+  return {
+    root, home, exe, bin, fakeBin,
+    close: () => {
+      server.kill();
+      const pids = existsSync(join(root, 'pids')) ? readFileSync(join(root, 'pids'), 'utf8').split('\n').filter(Boolean) : [];
+      for (const pid of pids) { try { process.kill(Number(pid)); } catch { /* already gone */ } }
+      rmSync(root, { recursive: true, force: true });
+    },
+  };
+};
+
+test('host add over ssh mints the token with a desktop app\'s own server bundle', async () => {
+  const host = await fakeDesktopHost();
+  try {
+    const { code, stdout, stderr } = await run(process.execPath, [CLI, 'host', 'add', 'g@mac', '--name', 'mac', '--t3-version', '0.0.0'], {
+      env: { ...process.env, HOME: host.home, PATH: `${host.fakeBin}:${process.env.PATH}` },
+    }).then((r) => ({ code: 0, ...r }), (e) => ({ code: e.code ?? 1, stdout: e.stdout ?? '', stderr: e.stderr ?? '' }));
+    assert.equal(code, 0, stderr);
+
+    const call = JSON.parse(readFileSync(join(host.root, 'auth-call.json'), 'utf8'));
+    assert.deepEqual(call, { argv: ['auth', 'session', 'issue', '--json', '--label', 't3ctl:mac', '--ttl', '30d'], electron: '1' });
+    const { hosts } = JSON.parse(readFileSync(join(host.home, '.config', 't3ctl', 'hosts.json'), 'utf8'));
+    assert.deepEqual(hosts.map((h) => [h.name, h.ssh, h.token]), [['mac', 'g@mac', 'desktop-token']]);
+    assert.ok(stdout.includes(`ELECTRON_RUN_AS_NODE=1 '${host.exe}' '${host.bin}' auth session revoke s1`), stdout);
+  } finally { host.close(); }
 });
