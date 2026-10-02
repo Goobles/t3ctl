@@ -888,6 +888,72 @@ const resolveThread = (snap: Snapshot, ref: string): Thread => {
 };
 
 
+// RuntimeMode as the contracts spell it, paired with the name the T3 Code app
+// shows for it in its "Access" menu. The app's names are what people actually
+// say out loud, so they are accepted as input too — `supervised` and `full` are
+// the only two that differ from the wire value, the other two already match.
+const RUNTIME_MODES: Record<string, string> = {
+  'approval-required': 'Supervised',
+  'auto-accept-edits': 'Auto-accept edits',
+  auto: 'Auto',
+  'full-access': 'Full access',
+};
+const RUNTIME_MODE_ALIASES: Record<string, string> = {
+  supervised: 'approval-required',
+  full: 'full-access',
+};
+/** One spelling of the accepted values, shared by the help text and the error. */
+const RUNTIME_MODE_HELP = 'approval-required (supervised) | auto-accept-edits | auto | full-access (full)';
+
+const parseRuntimeMode = (raw: string): string => {
+  const given = raw.trim().toLowerCase();
+  const mode = RUNTIME_MODE_ALIASES[given] ?? given;
+  if (!(mode in RUNTIME_MODES)) throw new Error(`unknown runtime mode "${raw}" — expected ${RUNTIME_MODE_HELP}`);
+  return mode;
+};
+
+const runtimeModeLabel = (mode: string): string => RUNTIME_MODES[mode] ?? mode;
+
+// What `thread snooze <when>` accepts. Deliberately three narrow forms rather
+// than a date library: an exact instant, a relative duration, or a named day.
+// Named days wake at WAKE_HOUR local — the start of a workday, not midnight.
+const WAKE_HOUR = 9;
+const WHEN_HELP = 'an ISO time, a duration from now (45m, 2h, 3d, 1w), or a named day '
+  + `(tomorrow, monday…sunday, next-week) which wakes at ${String(WAKE_HOUR).padStart(2, '0')}:00 local`;
+const DURATION_MS: Record<string, number> = { m: 60_000, h: 3_600_000, d: 86_400_000, w: 604_800_000 };
+const WEEKDAYS = ['sunday', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday'];
+
+// Returns the ISO instant to send as `snoozedUntil`. `now` is a parameter so the
+// relative forms are pinned to one clock reading rather than re-reading it.
+const parseWhen = (raw: string, now: Date = new Date()): string => {
+  const given = raw.trim().toLowerCase();
+  const duration = /^(\d+(?:\.\d+)?)([mhdw])$/.exec(given);
+  const unitMs = duration ? DURATION_MS[duration[2] ?? ''] : undefined;
+  const weekday = WEEKDAYS.indexOf(given === 'next-week' ? 'monday' : given);
+
+  let at: Date;
+  if (unitMs) {
+    at = new Date(now.getTime() + Number(duration?.[1]) * unitMs);
+  } else if (given === 'tomorrow' || weekday >= 0) {
+    // A named day walks the local calendar (setHours/setDate) rather than adding
+    // milliseconds, because a day is not always 24 hours long across a DST
+    // change. Always strictly ahead: `monday` on a Monday is the next one.
+    const days = given === 'tomorrow' ? 1 : (weekday - now.getDay() + 7) % 7 || 7;
+    at = new Date(now);
+    at.setHours(WAKE_HOUR, 0, 0, 0);
+    at.setDate(at.getDate() + days);
+  } else {
+    at = new Date(raw);
+    if (Number.isNaN(at.getTime())) throw new Error(`cannot read "${raw}" as a time — expected ${WHEN_HELP}`);
+  }
+
+  // Checked for every form, not just the explicit one: the server accepts a past
+  // wake time and it does nothing, since a thread stops classifying as snoozed
+  // the moment the time passes. `0h` is the same mistake as last Tuesday.
+  if (at <= now) throw new Error(`${at.toISOString()} is in the past — a snooze has to wake in the future`);
+  return at.toISOString();
+};
+
 // instanceId is the segment before the FIRST slash; the model keeps the rest,
 // because opencode model ids are themselves slashed ("github-copilot/gpt-5.4").
 const parseModel = (raw: string): ModelSelection => {
@@ -925,7 +991,7 @@ const cmdThreadStart = async (thread: Thread, host: Host, text: string, flags: F
     commandId: crypto.randomUUID(),
     threadId: thread.id,
     message: { messageId: crypto.randomUUID(), role: 'user', text, attachments: [] },
-    runtimeMode: flags['runtime-mode'] ?? thread.runtimeMode ?? 'full-access',
+    runtimeMode: flags['runtime-mode'] ? parseRuntimeMode(flags['runtime-mode']) : thread.runtimeMode ?? 'full-access',
     interactionMode: flags['interaction-mode'] ?? 'default',
     createdAt: new Date().toISOString(),
   };
@@ -946,6 +1012,39 @@ const cmdThreadInterrupt = async (thread: Thread, host: Host): Promise<void> => 
   console.log(`interrupted ${bold(thread.title || thread.id)}\n  seq ${sequence}`);
 };
 
+const cmdThreadSnooze = async (thread: Thread, host: Host, when: string): Promise<void> => {
+  const snoozedUntil = parseWhen(when);
+  const { sequence } = await dispatch(host, {
+    type: 'thread.snooze', commandId: crypto.randomUUID(), threadId: thread.id, snoozedUntil,
+  });
+  // The wire value is UTC but the user asked for a local time, so print both.
+  console.log(`snoozed ${bold(thread.title || thread.id)}\n  until ${snoozedUntil} ` +
+    `${dim(`(${new Date(snoozedUntil).toLocaleString()} local)`)}\n  id    ${thread.id}\n  seq   ${sequence}`);
+};
+
+// `reason` is always "user": activity wakes are decided server-side, and a wake
+// time that simply passes needs no command at all — the thread stops
+// classifying as snoozed on its own.
+const cmdThreadUnsnooze = async (thread: Thread, host: Host): Promise<void> => {
+  const { sequence } = await dispatch(host, {
+    type: 'thread.unsnooze', commandId: crypto.randomUUID(), threadId: thread.id, reason: 'user',
+  });
+  console.log(`unsnoozed ${bold(thread.title || thread.id)}\n  id  ${thread.id}\n  seq ${sequence}`);
+};
+
+// `thread send --runtime-mode` also changes the mode, but only as part of
+// starting a turn. This is the standalone switch, the same one the app's
+// "Access" menu fires on an idle thread.
+const cmdThreadRuntimeMode = async (thread: Thread, host: Host, raw: string): Promise<void> => {
+  const runtimeMode = parseRuntimeMode(raw);
+  const { sequence } = await dispatch(host, {
+    type: 'thread.runtime-mode.set', commandId: crypto.randomUUID(), threadId: thread.id,
+    runtimeMode, createdAt: new Date().toISOString(),
+  });
+  // The snapshot carries the old mode, so say what changed rather than just what it is now.
+  console.log(`${bold(thread.title || thread.id)}\n  mode ${dim(`${thread.runtimeMode ?? '?'} ->`)} ` +
+    `${runtimeMode} ${dim(`(${runtimeModeLabel(runtimeMode)})`)}\n  id   ${thread.id}\n  seq  ${sequence}`);
+};
 
 
 // thread.meta.update also accepts regenerateTitle:true, which asks the server to
@@ -1029,7 +1128,7 @@ const cmdThreadCreate = async (projectRef: string, title: string, flags: Flags):
   const { sequence } = await dispatch(host, {
     type: 'thread.create', commandId: crypto.randomUUID(),
     threadId, projectId: project.id, title, modelSelection,
-    runtimeMode: flags['runtime-mode'] ?? 'full-access',
+    runtimeMode: parseRuntimeMode(flags['runtime-mode'] ?? 'full-access'),
     interactionMode: flags['interaction-mode'] ?? 'default',
     branch: flags.branch ?? null,
     worktreePath: flags.worktree ?? null,
@@ -1465,7 +1564,7 @@ hostOption(thread.command('create')
   .option('--option <id=value>', 'model option, e.g. effort=high; repeatable', addOption)
   .option('--branch <branch>', 'git branch to associate with the thread')
   .option('--worktree <path>', 'git worktree the thread should run in')
-  .option('--runtime-mode <mode>', 'approval-required | auto-accept-edits | auto | full-access', 'full-access')
+  .option('--runtime-mode <mode>', RUNTIME_MODE_HELP, 'full-access')
   .option('--interaction-mode <mode>', 'default | plan', 'default'))
   .action((ref: string, title: string[], o: OptionValues) => cmdThreadCreate(ref, title.join(' '), toFlags(o)));
 
@@ -1476,7 +1575,7 @@ hostOption(thread.command('send')
   .description('send a message to a thread and run the agent')
   .option('--model <instance/model>', "override the thread's model for this turn")
   .option('--option <id=value>', "model option for this turn, e.g. effort=high; repeatable", addOption)
-  .option('--runtime-mode <mode>', 'approval-required | auto-accept-edits | auto | full-access')
+  .option('--runtime-mode <mode>', RUNTIME_MODE_HELP)
   .option('--interaction-mode <mode>', 'default | plan'))
   .action(async (ref: string, message: string[], o: OptionValues) => {
     const { host: h, thread: t } = await resolve(ref, o);
@@ -1507,6 +1606,33 @@ hostOption(thread.command('interrupt')
   .action(async (ref: string, o: OptionValues) => {
     const { host: h, thread: t } = await resolve(ref, o);
     return cmdThreadInterrupt(t, h);
+  });
+
+hostOption(thread.command('snooze')
+  .argument('<thread>', 'thread id, exact title, or unique substring')
+  .argument('<when>', WHEN_HELP)
+  .description('hide a thread until a wake time'))
+  .action(async (ref: string, when: string, o: OptionValues) => {
+    const { host: h, thread: t } = await resolve(ref, o);
+    return cmdThreadSnooze(t, h, when);
+  });
+
+hostOption(thread.command('unsnooze')
+  .argument('<thread>', 'thread id, exact title, or unique substring')
+  .description('wake a snoozed thread now'))
+  .action(async (ref: string, o: OptionValues) => {
+    const { host: h, thread: t } = await resolve(ref, o);
+    return cmdThreadUnsnooze(t, h);
+  });
+
+hostOption(thread.command('runtime-mode')
+  .alias('mode')
+  .argument('<thread>', 'thread id, exact title, or unique substring')
+  .argument('<mode>', RUNTIME_MODE_HELP)
+  .description("change an existing thread's runtime (security) mode without sending a message"))
+  .action(async (ref: string, mode: string, o: OptionValues) => {
+    const { host: h, thread: t } = await resolve(ref, o);
+    return cmdThreadRuntimeMode(t, h, mode);
   });
 
 const VERB_HELP: Record<string, string> = {

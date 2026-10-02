@@ -62,6 +62,7 @@ test('every command has its own help', async () => {
     ['project', 'create'],
     ['thread', 'create'], ['thread', 'send'], ['thread', 'rename'],
     ['thread', 'retitle'], ['thread', 'interrupt'],
+    ['thread', 'snooze'], ['thread', 'unsnooze'], ['thread', 'runtime-mode'],
     ['thread', 'settle'], ['thread', 'archive'], ['thread', 'unarchive'],
     ['thread', 'unpin'], ['thread', 'delete'],
     ['export', 'prompts'],
@@ -83,6 +84,11 @@ test('bad input exits non-zero', async () => {
     ['thread', 'send'],
     ['thread', 'rename'],
     ['thread', 'retitle'],
+    ['thread', 'snooze'],
+    ['thread', 'snooze', 'anything'],        // <when> is required
+    ['thread', 'unsnooze'],
+    ['thread', 'runtime-mode'],
+    ['thread', 'runtime-mode', 'anything'],  // <mode> is required
     ['host', 'add'],
     ['host', 'rm'],
     ['project', 'create'],
@@ -287,13 +293,13 @@ test('a host off loopback goes over HTTP, and its markers carry the host name', 
 
 const ENV_ID = 'e3b97f3f-0000-4000-8000-000000000000';
 
-const fakeT3 = async (serverVersion) => {
+const fakeT3 = async (serverVersion, threads = []) => {
   const dispatched = [];
   const server = createHttpServer((req, res) => {
     const json = (body) => { res.setHeader('content-type', 'application/json'); res.end(JSON.stringify(body)); };
     if (req.url === '/.well-known/t3/environment') return json({ environmentId: ENV_ID, label: 'box', serverVersion });
     if (req.url === '/api/orchestration/snapshot') {
-      return json({ projects: [{ id: 'p1', title: 'alpha', workspaceRoot: '/tmp', updatedAt: '2026-01-01' }], threads: [] });
+      return json({ projects: [{ id: 'p1', title: 'alpha', workspaceRoot: '/tmp', updatedAt: '2026-01-01' }], threads });
     }
     if (req.url === '/api/orchestration/dispatch') {
       let body = '';
@@ -373,6 +379,138 @@ test('--option sets model options, with true and false sent as booleans', async 
     assert.match(bad.stderr, /--option must be <id>=<value>/);
     assert.equal(a.dispatched.length, 1);
   } finally { a.close(); rmSync(home, { recursive: true, force: true }); }
+});
+
+// ---- snooze and runtime mode -----------------------------------------------
+// Both are write commands against one resolvable thread, so they share a world:
+// a fake server that serves that thread in its snapshot and records what it was
+// sent. What is asserted is the payload shape, because that is what the real
+// server validates strictly — a wrong field name fails there, not here.
+
+const THREAD = {
+  id: '11111111-1111-4111-8111-111111111111', projectId: 'p1',
+  title: 'scratch', updatedAt: '2026-01-01', runtimeMode: 'full-access',
+};
+
+/** A fake host serving THREAD, with the HOME whose registry points at it. */
+const threadWorld = async () => {
+  const server = await fakeT3('0.0.45', [THREAD]);
+  const home = splitHome({ name: 'box', origin: server.origin, token: 'tok', environmentId: ENV_ID }, server.origin);
+  return {
+    ...server, home,
+    close: () => { server.close(); rmSync(home, { recursive: true, force: true }); },
+  };
+};
+
+/** Split a recorded command into its generated id and the rest, which is fixed. */
+const withoutCommandId = (command) => {
+  const { commandId, ...rest } = command;
+  assert.match(commandId, /^[0-9a-f-]{36}$/, 'commandId must be a generated uuid');
+  return rest;
+};
+
+test('snooze sends the wake time as an ISO instant; unsnooze carries reason: user', async () => {
+  const w = await threadWorld();
+  // Relative to now, so the case does not start failing on a fixed calendar date.
+  const wake = new Date(Date.now() + 86_400_000).toISOString();
+  try {
+    const { code, stdout, stderr } = await cliIn(w.home, 'thread', 'snooze', 'scratch', wake);
+    assert.equal(code, 0, stderr);
+    assert.deepEqual(withoutCommandId(w.dispatched[0]), {
+      type: 'thread.snooze', threadId: THREAD.id, snoozedUntil: wake,
+    });
+    assert.match(stdout, /snoozed .*scratch/);
+
+    const woke = await cliIn(w.home, 'thread', 'unsnooze', 'scratch');
+    assert.equal(woke.code, 0, woke.stderr);
+    assert.deepEqual(withoutCommandId(w.dispatched[1]), {
+      type: 'thread.unsnooze', threadId: THREAD.id, reason: 'user',
+    });
+  } finally { w.close(); }
+});
+
+test('snooze accepts a duration and a named day, both resolved locally', async () => {
+  const w = await threadWorld();
+  try {
+    const before = Date.now();
+    assert.equal((await cliIn(w.home, 'thread', 'snooze', 'scratch', '2h')).code, 0);
+    const twoHours = new Date(w.dispatched[0].snoozedUntil).getTime() - before;
+    assert.ok(Math.abs(twoHours - 7_200_000) < 60_000, `2h resolved to ${twoHours}ms from now`);
+
+    assert.equal((await cliIn(w.home, 'thread', 'snooze', 'scratch', 'tomorrow')).code, 0);
+    // Named days wake at 09:00 *local*, which is the whole point of not just
+    // adding 24 hours — so the assertion reads the local clock, not UTC.
+    const tomorrow = new Date(w.dispatched[1].snoozedUntil);
+    assert.equal(tomorrow.getHours(), 9);
+    assert.equal(tomorrow.getMinutes(), 0);
+    assert.equal(tomorrow.getDate(), new Date(before + 86_400_000).getDate());
+
+    assert.equal((await cliIn(w.home, 'thread', 'snooze', 'scratch', 'next-week')).code, 0);
+    const monday = new Date(w.dispatched[2].snoozedUntil);
+    assert.equal(monday.getDay(), 1, 'next-week is the coming Monday');
+    assert.equal(monday.getHours(), 9);
+    assert.ok(monday > new Date(before), 'and it is always ahead, even when run on a Monday');
+  } finally { w.close(); }
+});
+
+test('an unreadable or past wake time is rejected before anything is dispatched', async () => {
+  const w = await threadWorld();
+  try {
+    const nonsense = await cliIn(w.home, 'thread', 'snooze', 'scratch', 'whenever');
+    assert.notEqual(nonsense.code, 0);
+    assert.match(nonsense.stderr, /cannot read "whenever" as a time/);
+
+    const past = await cliIn(w.home, 'thread', 'snooze', 'scratch', new Date(Date.now() - 60_000).toISOString());
+    assert.notEqual(past.code, 0);
+    assert.match(past.stderr, /in the past/);
+
+    // The future check covers the relative forms too, not just explicit times.
+    const zero = await cliIn(w.home, 'thread', 'snooze', 'scratch', '0h');
+    assert.notEqual(zero.code, 0);
+    assert.match(zero.stderr, /in the past/);
+
+    assert.deepEqual(w.dispatched, [], 'a rejected wake time must reach no server');
+  } finally { w.close(); }
+});
+
+test('runtime-mode sets the mode of an existing thread, app names included', async () => {
+  const w = await threadWorld();
+  try {
+    const { code, stdout, stderr } = await cliIn(w.home, 'thread', 'runtime-mode', 'scratch', 'supervised');
+    assert.equal(code, 0, stderr);
+    const { createdAt, ...rest } = withoutCommandId(w.dispatched[0]);
+    assert.deepEqual(rest, {
+      type: 'thread.runtime-mode.set', threadId: THREAD.id, runtimeMode: 'approval-required',
+    });
+    assert.equal(createdAt, new Date(createdAt).toISOString(), 'createdAt must be an ISO instant');
+    // The thread's old mode comes from the snapshot, so the line says what changed.
+    assert.match(stdout, /full-access ->.*approval-required.*\(Supervised\)/);
+
+    // `mode` is the shorter spelling of the same command.
+    assert.equal((await cliIn(w.home, 'thread', 'mode', 'scratch', 'full')).code, 0);
+    assert.equal(w.dispatched[1].runtimeMode, 'full-access');
+
+    const bad = await cliIn(w.home, 'thread', 'mode', 'scratch', 'yolo');
+    assert.notEqual(bad.code, 0);
+    assert.match(bad.stderr, /unknown runtime mode "yolo"/);
+    assert.equal(w.dispatched.length, 2, 'an unknown mode must reach no server');
+  } finally { w.close(); }
+});
+
+test('the app names work wherever --runtime-mode is accepted', async () => {
+  const w = await threadWorld();
+  try {
+    assert.equal((await cliIn(w.home, 'thread', 'create', 'alpha', 'hello', '--runtime-mode', 'supervised')).code, 0);
+    assert.equal(w.dispatched[0].runtimeMode, 'approval-required');
+
+    assert.equal((await cliIn(w.home, 'thread', 'send', 'scratch', 'hi', '--runtime-mode', 'full')).code, 0);
+    assert.equal(w.dispatched[1].runtimeMode, 'full-access');
+
+    const bad = await cliIn(w.home, 'thread', 'create', 'alpha', 'hello', '--runtime-mode', 'yolo');
+    assert.notEqual(bad.code, 0);
+    assert.match(bad.stderr, /unknown runtime mode/);
+    assert.equal(w.dispatched.length, 2);
+  } finally { w.close(); }
 });
 
 test('host add --name re-points a host to another port and keeps its token', async () => {
