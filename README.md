@@ -156,7 +156,10 @@ That one command bootstraps the machine end to end:
    output streams past — a cold cache can download for a few minutes.
 3. **Mints a token for you** — `t3 auth session issue` on the remote, labeled
    `t3ctl:<name>`, TTL 30d by default (`--ttl` changes it). The session id is
-   printed along with the exact revoke command for that host.
+   printed along with the exact revoke command for that host. When the running
+   server is the **desktop app's**, the token comes from the app's own bundled
+   CLI (its executable in node mode, `ELECTRON_RUN_AS_NODE=1`), so nothing is
+   installed from npm and the CLI is exactly the running server's version.
 4. **Tunnels to it** — an ssh ControlMaster forwards a local port to the remote
    server (loopback-only by design; nothing is exposed on the remote's network).
    The master outlives t3ctl, and every command silently rebuilds it when it

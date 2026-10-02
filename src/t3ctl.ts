@@ -356,7 +356,11 @@ const cmdHostsList = async (hosts: Host[]): Promise<void> => {
 //   * `t3 auth session issue` mints a bearer token filesystem-locally — no HTTP,
 //     no --port — valid for the already-running server sharing ~/.t3, so t3ctl
 //     can mint its own token over ssh;
-//   * `t3 service install` is per-user launchd/systemd (no sudo, macOS/Linux).
+//   * `t3 service install` is per-user launchd/systemd (no sudo, macOS/Linux);
+//   * the desktop app runs its server with its own Electron binary in node mode
+//     (ELECTRON_RUN_AS_NODE=1), from the server bundle in its app.asar — and
+//     that bundle is the t3 CLI too, so a token for a desktop server is minted
+//     with the app itself: no npm, and exactly the running server's version.
 // Remote shell scripts pass data back on stdout as lines starting with a
 // marker, parsed bottom-up: `t3 auth` can leak Effect error logs onto stdout
 // (the desktop's own SSH path parses the same way, tunnel.ts:791).
@@ -442,6 +446,22 @@ detect() {
   fi
   node - "$RUNTIME_JSON" <<'NODE'
 const fs = require('node:fs');
+const path = require('node:path');
+// The server's executable is a desktop app's when an Electron app.asar sits where
+// Electron keeps it: Contents/Resources on macOS, resources/ beside it on Linux.
+const desktopCli = (pid) => {
+  try {
+    const mac = process.platform === 'darwin';
+    const exe = mac
+      ? require('node:child_process').execFileSync('ps', ['-o', 'comm=', '-p', String(pid)], { encoding: 'utf8' }).trim()
+      : fs.readlinkSync('/proc/' + pid + '/exe');
+    const asar = path.join(path.dirname(exe), ...(mac ? ['..', 'Resources'] : ['resources']), 'app.asar');
+    // an app upgraded under its running server leaves /proc/<pid>/exe as "<path> (deleted)"
+    return fs.existsSync(exe) && fs.existsSync(asar) ? { exe, bin: path.join(asar, 'apps', 'server', 'dist', 'bin.mjs') } : null;
+  } catch {
+    return null;
+  }
+};
 try {
   const r = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
   const pid = Number(r.pid), port = Number(r.port);
@@ -449,7 +469,8 @@ try {
   const origin = new URL(String(r.origin ?? ''));
   if (origin.protocol !== 'http:' || !['127.0.0.1', 'localhost'].includes(origin.hostname)) throw 0;
   process.kill(pid, 0);
-  process.stdout.write('T3CTL {"running":true,"port":' + port + '}\\n');
+  const desktop = desktopCli(pid);
+  process.stdout.write('T3CTL ' + JSON.stringify(desktop ? { running: true, port, desktop } : { running: true, port }) + '\\n');
 } catch {
   process.stdout.write('T3CTL {"running":false}\\n');
 }
@@ -463,6 +484,10 @@ case "$1" in
     exec npx --yes --package t3@"$2" t3 service install
     ;;
   token)
+    # $5 $6: a desktop app's executable and server bundle, from detect
+    if [ -n "\${5:-}" ]; then
+      exec env ELECTRON_RUN_AS_NODE=1 "$5" "$6" auth session issue --json --label "$3" --ttl "$4"
+    fi
     ensure_node_path || { printf 'no node on this machine\\n' >&2; exit 1; }
     require_t3_cli "$2" || exit 1
     exec npx --yes --package t3@"$2" t3 auth session issue --json --label "$3" --ttl "$4"
@@ -478,8 +503,12 @@ esac
 // minutes, and a buffered stderr shows the user nothing while it runs.
 type SshResult = { status: number; stdout: string; stderr: string };
 
+// ssh joins its arguments into one string for the remote shell, so each is
+// single-quoted to survive it — a desktop app's path has spaces.
+const shellQuote = (arg: string): string => `'${arg.replace(/'/g, `'\\''`)}'`;
+
 const sshRun = (target: string, args: string[], { streamStderr = false } = {}): SshResult => {
-  const res = spawnSync('ssh', ['-o', 'ConnectTimeout=15', target, 'sh', '-s', '--', ...args], {
+  const res = spawnSync('ssh', ['-o', 'ConnectTimeout=15', target, 'sh', '-s', '--', ...args.map(shellQuote)], {
     input: SSH_SCRIPT,
     encoding: 'utf8',
     maxBuffer: 8 * 1024 * 1024,
@@ -489,7 +518,8 @@ const sshRun = (target: string, args: string[], { streamStderr = false } = {}): 
   return { status: res.status ?? 1, stdout: String(res.stdout ?? ''), stderr: String(res.stderr ?? '') };
 };
 
-type DetectResult = { node?: boolean; running?: boolean; port?: number };
+type DesktopCli = { exe: string; bin: string };
+type DetectResult = { node?: boolean; running?: boolean; port?: number; desktop?: DesktopCli };
 
 // Bottom-up scan for the last T3CTL JSON marker — immune to npm chatter above it.
 const sshDetect = (target: string): DetectResult => {
@@ -500,10 +530,10 @@ const sshDetect = (target: string): DetectResult => {
   return JSON.parse(line.slice('T3CTL '.length)) as DetectResult;
 };
 
-const sshToken = (target: string, version: string, label: string, ttl: string): { token: string; sessionId?: string } => {
-  // First run downloads t3@<version> into the remote npx cache — minutes with
-  // nothing to show unless npm's progress on stderr streams through.
-  const res = sshRun(target, ['token', version, label, ttl], { streamStderr: true });
+const sshToken = (target: string, version: string, label: string, ttl: string, desktop?: DesktopCli): { token: string; sessionId?: string } => {
+  // Without a desktop app, the first run downloads t3@<version> into the remote
+  // npx cache — minutes with nothing to show unless npm's progress streams through.
+  const res = sshRun(target, ['token', version, label, ttl, ...(desktop ? [desktop.exe, desktop.bin] : [])], { streamStderr: true });
   if (res.status !== 0) throw new Error(`token minting failed on ${target}${res.stderr.trim() ? `: ${res.stderr.trim().split('\n').slice(-3).join('\n')}` : ''}`);
   // The session JSON is pretty-printed over many lines and stray Effect error
   // lines can precede it, so accumulate bottom-up until an object with a token
@@ -673,7 +703,7 @@ const cmdHostAddSsh = async (target: string, flags: Flags, hosts: Host[]): Promi
     let token = existing?.token ?? null;
     let session: { token: string; sessionId?: string } | null = null;
     if (!token || (existing?.environmentId && existing.environmentId !== descriptor.environmentId)) {
-      const issued = sshToken(target, version, `t3ctl:${name}`, flags.ttl ?? '30d');
+      const issued = sshToken(target, version, `t3ctl:${name}`, flags.ttl ?? '30d', detect.desktop);
       token = issued.token;
       session = issued;
     }
@@ -701,7 +731,9 @@ const cmdHostAddSsh = async (target: string, flags: Flags, hosts: Host[]): Promi
       `  tunnel  127.0.0.1:${localPort} -> 127.0.0.1:${detect.port ?? 3773} on ${target}`);
     if (session) {
       console.log(`  session ${session.sessionId ?? '?'} (label t3ctl:${name})\n` +
-        `  revoke on ${target} with: npx t3 auth session revoke ${session.sessionId ?? '?'}`);
+        `  revoke on ${target} with: ${detect.desktop
+          ? `ELECTRON_RUN_AS_NODE=1 ${shellQuote(detect.desktop.exe)} ${shellQuote(detect.desktop.bin)}`
+          : 'npx t3'} auth session revoke ${session.sessionId ?? '?'}`);
     } else {
       console.log('  token   reusing the stored session');
     }
