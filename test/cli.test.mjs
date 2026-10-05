@@ -553,7 +553,10 @@ const fakeDesktopHost = async () => {
   const asar = process.platform === 'darwin' ? join(app, 'Resources', 'app.asar') : join(exeDir, 'resources', 'app.asar');
   const exe = join(exeDir, 'T3 Code');
   const bin = join(asar, 'apps', 'server', 'dist', 'bin.mjs');
+  // On Linux the asar sits inside exeDir, so this one mkdir makes both; on
+  // macOS the executable lives in Contents/MacOS, a sibling of Resources.
   mkdirSync(dirname(bin), { recursive: true });
+  mkdirSync(exeDir, { recursive: true });
   copyFileSync(process.execPath, exe);
   chmodSync(exe, 0o755);
   writeFileSync(bin, `
