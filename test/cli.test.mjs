@@ -327,13 +327,17 @@ const acceptWebSocket = (server, rpc, answer) => server.on('upgrade', (req, sock
       const message = JSON.parse(body.toString());
       if (message._tag !== 'Request') continue;
       rpc.push({ url: req.url, tag: message.tag, payload: message.payload });
-      send({ _tag: 'Exit', requestId: message.id, exit: answer(message) });
+      const exit = answer(message);
+      if (exit === DROP) return socket.destroy();
+      send({ _tag: 'Exit', requestId: message.id, exit });
     }
   });
   socket.on('error', () => {});
 });
 
 const ok = (value) => ({ _tag: 'Success', value });
+/** An answer that cuts the connection instead of replying. */
+const DROP = Symbol('drop');
 
 /** What a git project answers by default: a feature branch checked out, `main` the default only on origin. */
 const defaultRpc = (request) => request.tag === 'vcs.listRefs'
@@ -373,7 +377,7 @@ const fakeT3 = async (serverVersion, threads = [], answer = defaultRpc) => {
   acceptWebSocket(server, rpc, answer);
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
   return {
-    origin: `http://127.0.0.1:${server.address().port}`, dispatched, rpc,
+    origin: `http://127.0.0.1:${server.address().port}`, dispatched, rpc, server,
     close: () => server.close(),
   };
 };
@@ -584,9 +588,9 @@ test('the app names work wherever --runtime-mode is accepted', async () => {
 // nothing went to the HTTP dispatch endpoint.
 
 /** A fake host whose RPC answers come from `answer`, with the HOME pointing at it. */
-const worktreeWorld = async (answer) => {
+const worktreeWorld = async (answer, hostFields = {}) => {
   const server = await fakeT3('0.0.45', [], answer);
-  const home = splitHome({ name: 'box', origin: server.origin, token: 'tok', environmentId: ENV_ID }, server.origin);
+  const home = splitHome({ name: 'box', origin: server.origin, token: 'tok', environmentId: ENV_ID, ...hostFields }, server.origin);
   return { ...server, home, close: () => { server.close(); rmSync(home, { recursive: true, force: true }); } };
 };
 
@@ -649,17 +653,60 @@ test('--base and --branch are sent as given, and skip the default-branch lookup'
   } finally { w.close(); }
 });
 
+const failWith = (error) => (request) => request.tag === 'vcs.listRefs' ? defaultRpc(request) : {
+  _tag: 'Failure', cause: [{ _tag: 'Fail', error: { _tag: 'OrchestrationDispatchCommandError', ...error } }],
+};
+
 test('a failed worktree setup reports the server\'s reason and what became of the thread', async () => {
-  const reason = 'A separate worktree requires a Git repository and a base branch with a commit.';
-  const w = await worktreeWorld((request) => request.tag === 'vcs.listRefs' ? defaultRpc(request) : {
-    _tag: 'Failure',
-    cause: [{ _tag: 'Fail', error: { _tag: 'OrchestrationDispatchCommandError', message: reason, bootstrapThreadDisposition: 'deleted' } }],
-  });
+  // The two dispositions the server reports, each with a reason it really pairs
+  // it with: requireWorktree is checked before the thread exists (ws.ts), while
+  // a failed checkout comes after createThread and rolls it back.
+  const cases = [
+    [{ message: 'A separate worktree requires a Git repository and a base branch with a commit.', bootstrapThreadDisposition: 'not-created' }, /no thread was created/],
+    [{ message: 'Git command failed in GitVcsDriver.createWorktree: disk full', bootstrapThreadDisposition: 'deleted' }, /the server deleted the thread it had created/],
+  ];
+  for (const [error, outcome] of cases) {
+    const w = await worktreeWorld(failWith(error));
+    try {
+      const { code, stderr } = await cliIn(w.home, 'thread', 'create', 'alpha', 'doomed', '--new-worktree', '--message', 'go');
+      assert.notEqual(code, 0);
+      assert.ok(stderr.includes(error.message), stderr);
+      assert.match(stderr, outcome);
+      assert.doesNotMatch(stderr, /carries on on the server/, 'the server answered, so nothing is left running');
+    } finally { w.close(); }
+  }
+});
+
+test('a connection lost mid-dispatch says the setup may still be running', async () => {
+  const w = await worktreeWorld((request) => request.tag === 'vcs.listRefs' ? defaultRpc(request) : DROP);
   try {
-    const { code, stderr } = await cliIn(w.home, 'thread', 'create', 'alpha', 'doomed', '--new-worktree', '--message', 'go');
+    const { code, stderr } = await cliIn(w.home, 'thread', 'create', 'alpha', 'x', '--new-worktree', '--message', 'go');
     assert.notEqual(code, 0);
-    assert.ok(stderr.includes(reason), stderr);
-    assert.match(stderr, /the server deleted the thread it had created/);
+    assert.match(stderr, /closed before the server answered/);
+    assert.match(stderr, /carries on on the server — check with: t3ctl ls -t/);
+  } finally { w.close(); }
+});
+
+test('a websocket handshake that never completes times out instead of hanging', async () => {
+  const w = await worktreeWorld(undefined, { timeoutMs: 500 });
+  w.server.removeAllListeners('upgrade');
+  w.server.on('upgrade', () => {}); // accept the request, never answer it
+  try {
+    const { code, stderr } = await cliIn(w.home, 'thread', 'create', 'alpha', 'x', '--new-worktree', '--message', 'go');
+    assert.notEqual(code, 0);
+    assert.match(stderr, /websocket handshake got no answer in 500ms/);
+  } finally { w.close(); }
+});
+
+test('a git error, which carries detail rather than message, still says what went wrong', async () => {
+  const w = await worktreeWorld(() => ({
+    _tag: 'Failure',
+    cause: [{ _tag: 'Fail', error: { _tag: 'GitCommandError', operation: 'GitVcsDriver.listRefs', command: 'git', cwd: '/tmp', detail: 'fatal: bad object HEAD' } }],
+  }));
+  try {
+    const { code, stderr } = await cliIn(w.home, 'thread', 'create', 'alpha', 'x', '--new-worktree', '--message', 'go');
+    assert.notEqual(code, 0);
+    assert.match(stderr, /vcs\.listRefs failed: fatal: bad object HEAD/);
   } finally { w.close(); }
 });
 

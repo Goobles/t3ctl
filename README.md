@@ -238,7 +238,7 @@ Flags:
 | `--worktree <path>` | none | Existing worktree path |
 | `--new-worktree` | off | Have the server create a worktree and start the thread in it — see [below](#starting-a-thread-in-a-new-worktree). Needs `--message` |
 | `--base <branch>` | the repo's default branch | With `--new-worktree`: the branch to start from |
-| `--message <text>` | none | With `--new-worktree`: the first message, which starts the agent |
+| `--message <text>` | none | With `--new-worktree`: the first message, which starts the agent. Quote it — see below |
 | `--runtime-mode <mode>` | `full-access` | `approval-required`, `auto-accept-edits`, `auto`, `full-access` — see [Runtime modes](#runtime-modes) for the app's names |
 | `--interaction-mode <mode>` | `default` | `default` or `plan` |
 | `--host <name>` | the only host | Which host to act on |
@@ -279,18 +279,26 @@ project's setup script, and then starts the agent on `--message`. A temporary
 `t3code/<8 hex>` branch is renamed after the conversation's first turn, just
 as in the app. Pass `--branch` to choose the name yourself.
 
-The defaults match the app: the base is the repo's default branch (whatever
-`origin/HEAD` points at), the base is fetched from `origin` first and the local
-branch is used when `origin` has no such branch, and the setup script runs.
-t3ctl waits until the agent has started, which includes a setup script that
-isn't marked async. That can take minutes, and t3ctl gives up after 15.
+Unlike `thread send`, the message is a flag, not the rest of the line, because
+the title already is. Quote it: `--message fix the bug` sends `fix` and makes
+`the bug` part of the title.
 
-If any step before the agent starts fails, the server deletes the thread it
-created, and t3ctl prints the server's reason and exits non-zero. A project that
-isn't a git repository, or a base with no commit, is an error. t3ctl will not
-quietly run the agent in the project checkout instead. If the connection drops
-or t3ctl times out, the setup keeps going on the server; `t3ctl ls -t` shows
-where it got to.
+The base is the repo's default branch, whatever `origin/HEAD` points at. A
+repo whose remote was added by hand may not have `origin/HEAD`, and then t3ctl
+asks for `--base` rather than guessing (the app falls back to the checked-out
+branch). The base is fetched from `origin` first, and the local branch is used
+when `origin` has no such branch. The setup script runs. t3ctl waits until the
+agent has started, which includes a setup script that isn't marked async. That
+can take minutes, and t3ctl gives up after 15.
+
+If the fetch or the checkout fails, the server deletes the thread it created,
+and t3ctl prints the server's reason and exits non-zero. A project that isn't a
+git repository, or a base with no commit, is an error. t3ctl will not quietly
+run the agent in the project checkout instead. A failing setup script is not
+an error: like the app, the server keeps the worktree, marks the setup failed
+on the thread, and starts the agent anyway. If the connection drops or t3ctl
+times out, the setup keeps going on the server; `t3ctl ls -t` shows where it
+got to.
 
 ### `t3ctl thread send <thread> <message...>`
 

@@ -876,7 +876,7 @@ const dispatch = async (host: Host, command: OrchestrationCommand): Promise<{ se
 type RpcExit = {
   _tag: 'Success' | 'Failure';
   value?: unknown;
-  cause?: { _tag: string; error?: { message?: string; bootstrapThreadDisposition?: string }; defect?: unknown }[];
+  cause?: { _tag: string; error?: { message?: string; detail?: string; bootstrapThreadDisposition?: string }; defect?: unknown }[];
 };
 
 type RpcSession = { call: (tag: string, payload: unknown, timeoutMs: number) => Promise<unknown>; close: () => void };
@@ -889,7 +889,10 @@ class RpcError extends Error {
 
 const rpcFailure = (tag: string, exit: RpcExit): RpcError => {
   const failure = exit.cause?.find((c) => c._tag === 'Fail') ?? exit.cause?.[0];
-  const message = failure?.error?.message ?? (failure?.defect !== undefined ? JSON.stringify(failure.defect) : 'no reason given');
+  // Some errors (GitCommandError) build `message` in a getter, so only their
+  // fields cross the wire; `detail` is where those keep the reason.
+  const reason = failure?.error ?? failure?.defect;
+  const message = failure?.error?.message ?? failure?.error?.detail ?? (reason !== undefined ? JSON.stringify(reason) : 'no reason given');
   const error = new RpcError(`${tag} failed: ${message}`);
   error.disposition = failure?.error?.bootstrapThreadDisposition;
   return error;
@@ -909,29 +912,34 @@ const openRpc = async (host: Host): Promise<RpcSession> => {
   const { ticket } = (await res.json()) as { ticket: string };
 
   const ws = new WebSocket(`${host.origin.replace(/^http/, 'ws')}/ws?wsTicket=${encodeURIComponent(ticket)}`);
+  // Node's own handshake timeout is minutes; a tunnel to a wedged server would sit there.
+  const openMs = host.timeoutMs ?? 15000;
   await new Promise<void>((resolve, reject) => {
-    ws.addEventListener('open', () => resolve(), { once: true });
-    ws.addEventListener('error', () => reject(new Error(`${host.name}: websocket connection failed`)), { once: true });
+    // Reject before closing: closing a connecting socket fires `error` synchronously.
+    const timer = setTimeout(() => { reject(new Error(`${host.name}: websocket handshake got no answer in ${openMs}ms`)); ws.close(); }, openMs);
+    ws.addEventListener('open', () => { clearTimeout(timer); resolve(); }, { once: true });
+    ws.addEventListener('error', () => { clearTimeout(timer); reject(new Error(`${host.name}: websocket connection failed`)); }, { once: true });
   });
 
   const pending = new Map<string, { resolve: (v: unknown) => void; reject: (e: Error) => void }>();
+  const failAll = (error: Error) => {
+    for (const p of pending.values()) p.reject(error);
+    pending.clear();
+  };
   ws.addEventListener('message', (event) => {
-    const parsed = JSON.parse(String(event.data)) as unknown;
+    let parsed: unknown;
+    // A throw in here would escape as an uncaught exception, not a clean error line.
+    try { parsed = JSON.parse(String(event.data)); } catch { return failAll(new Error(`${host.name}: unreadable websocket frame`)); }
     for (const m of (Array.isArray(parsed) ? parsed : [parsed]) as { _tag: string; requestId?: string; exit?: RpcExit; defect?: unknown }[]) {
-      if (m._tag === 'Defect') {
-        for (const p of pending.values()) p.reject(new Error(`server defect: ${JSON.stringify(m.defect)}`));
-        pending.clear();
-      }
+      // The server rejected a frame itself (bad JSON, unknown tag), so nothing was dispatched.
+      if (m._tag === 'Defect') failAll(new RpcError(`server rejected the request: ${JSON.stringify(m.defect)}`));
       const p = m._tag === 'Exit' && m.exit ? pending.get(String(m.requestId)) : undefined;
       if (!p || !m.exit) continue;
       pending.delete(String(m.requestId));
       p.resolve(m.exit);
     }
   });
-  ws.addEventListener('close', () => {
-    for (const p of pending.values()) p.reject(new Error(`${host.name}: the connection closed before the server answered`));
-    pending.clear();
-  });
+  ws.addEventListener('close', () => failAll(new Error(`${host.name}: the connection closed before the server answered`)));
   // The server answers a Ping with a Pong; it only keeps an idle socket alive
   // through the ssh tunnel or a proxy while a long bootstrap runs.
   const keepalive = setInterval(() => ws.send(JSON.stringify({ _tag: 'Ping' })), 15_000);
@@ -1248,7 +1256,8 @@ const worktreeFlagProblem = (flags: Flags): string | null => {
 // One thread.turn.start that carries the thread, the worktree and the first
 // message, as the app sends it from a new-thread draft. The server creates the
 // thread, fetches origin/<base>, adds the worktree, runs the setup script, then
-// starts the turn — and deletes the thread again if any step before the turn fails.
+// starts the turn. A failed fetch or checkout deletes the thread again; a failed
+// setup script does not — the server keeps the worktree and starts the agent anyway.
 const cmdThreadCreateInWorktree = async (host: Host, project: Project, title: string, modelSelection: ModelSelection, flags: Flags): Promise<void> => {
   const runtimeMode = parseRuntimeMode(flags['runtime-mode'] ?? 'full-access');
   const interactionMode = flags['interaction-mode'] ?? 'default';
@@ -1743,7 +1752,7 @@ hostOption(thread.command('create')
   .option('--worktree <path>', 'existing git worktree the thread should run in')
   .option('--new-worktree', 'have the server create a worktree and start the thread in it; needs --message')
   .option('--base <branch>', "with --new-worktree: branch to start from (default: the repo's default branch)")
-  .option('--message <text>', 'with --new-worktree: the first message, which starts the agent')
+  .option('--message <text>', 'with --new-worktree: the first message, which starts the agent (quote it)')
   .option('--runtime-mode <mode>', RUNTIME_MODE_HELP, 'full-access')
   .option('--interaction-mode <mode>', 'default | plan', 'default'))
   .action((ref: string, title: string[], o: OptionValues) => cmdThreadCreate(ref, title.join(' '), toFlags(o)));
