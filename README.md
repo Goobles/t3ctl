@@ -221,7 +221,8 @@ t3ctl project create t3ctl ~/Code/t3ctl
 ### `t3ctl thread create <project> <title>`
 
 Create a thread. This produces an **idle thread with no messages** — it does not
-start the agent. Use `thread send` for that.
+start the agent. Use `thread send` for that, or `--new-worktree` to create the
+thread in a fresh worktree and start it in one go.
 
 ```sh
 t3ctl thread create t3ctl "rewrite the readme for users" --branch docs/readme
@@ -233,8 +234,11 @@ Flags:
 |---|---|---|
 | `--model <instance>/<model>` | `claudeAgent/claude-opus-5` | Provider instance and model |
 | `--option <id>=<value>` | none | Model option, e.g. `effort=high`; repeatable |
-| `--branch <name>` | none | Git branch for the thread |
-| `--worktree <path>` | none | Explicit worktree path |
+| `--branch <name>` | none | Git branch for the thread. With `--new-worktree`, the branch to create (default: a temporary `t3code/<8 hex>`) |
+| `--worktree <path>` | none | Existing worktree path |
+| `--new-worktree` | off | Have the server create a worktree and start the thread in it — see [below](#starting-a-thread-in-a-new-worktree). Needs `--message` |
+| `--base <branch>` | the repo's default branch | With `--new-worktree`: the branch to start from |
+| `--message <text>` | none | With `--new-worktree`: the first message, which starts the agent |
 | `--runtime-mode <mode>` | `full-access` | `approval-required`, `auto-accept-edits`, `auto`, `full-access` — see [Runtime modes](#runtime-modes) for the app's names |
 | `--interaction-mode <mode>` | `default` | `default` or `plan` |
 | `--host <name>` | the only host | Which host to act on |
@@ -249,6 +253,44 @@ shows. The ids come from the provider, e.g. `effort`, `fastMode` and
 ```sh
 t3ctl thread create t3ctl "tidy the tests" --model claudeAgent/claude-opus-5-5 --option effort=medium --option fastMode=false
 ```
+
+#### Starting a thread in a new worktree
+
+`--new-worktree` does what the app does when you send the first message of a
+new thread set to a new worktree. No need to run `git worktree add` first:
+
+```sh
+t3ctl thread create t3ctl "fix the flaky test" --new-worktree --message "find out why test/cli.test.mjs flakes on CI"
+```
+```
+preparing t3code/3f9a1c07 from main in a new worktree on laptop — this can take a few minutes
+started fix the flaky test in t3ctl on laptop
+  id       0f5c1e2a-...
+  branch   t3code/3f9a1c07 (from main)
+  worktree /Users/you/.t3/worktrees/t3ctl/t3code-3f9a1c07
+  model    claudeAgent/claude-opus-5
+  mode     full-access / default
+  seq      4471
+```
+
+The server fetches `origin/<base>`, adds the worktree under
+`~/.t3/worktrees/<repo>/` on the host, checks out submodules, runs the
+project's setup script, and then starts the agent on `--message`. A temporary
+`t3code/<8 hex>` branch is renamed after the conversation's first turn, just
+as in the app. Pass `--branch` to choose the name yourself.
+
+The defaults match the app: the base is the repo's default branch (whatever
+`origin/HEAD` points at), the base is fetched from `origin` first and the local
+branch is used when `origin` has no such branch, and the setup script runs.
+t3ctl waits until the agent has started, which includes a setup script that
+isn't marked async. That can take minutes, and t3ctl gives up after 15.
+
+If any step before the agent starts fails, the server deletes the thread it
+created, and t3ctl prints the server's reason and exits non-zero. A project that
+isn't a git repository, or a base with no commit, is an error. t3ctl will not
+quietly run the agent in the project checkout instead. If the connection drops
+or t3ctl times out, the setup keeps going on the server; `t3ctl ls -t` shows
+where it got to.
 
 ### `t3ctl thread send <thread> <message...>`
 

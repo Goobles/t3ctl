@@ -93,9 +93,10 @@ type Snapshot = { snapshotSequence: number; projects: Project[]; threads: Thread
 
 /** Option names as the command implementations spell them (kebab-case). */
 type Flags = Partial<Record<
-  'host' | 'model' | 'branch' | 'worktree' | 'name' | 'timeout' | 'runtime-mode' | 'interaction-mode' | 'ttl' | 't3-version',
+  'host' | 'model' | 'branch' | 'worktree' | 'name' | 'timeout' | 'runtime-mode' | 'interaction-mode' | 'ttl' | 't3-version' |
+  'base' | 'message',
   string
->> & { option?: string[] };
+>> & { option?: string[]; 'new-worktree'?: boolean };
 
 /** An orchestration command; `type` selects the shape the server validates. */
 type OrchestrationCommand = { type: string; commandId: string } & Record<string, unknown>;
@@ -861,6 +862,103 @@ const dispatch = async (host: Host, command: OrchestrationCommand): Promise<{ se
   return body ? (JSON.parse(body) as { sequence: number }) : { sequence: 0 };
 };
 
+// ---- websocket rpc ------------------------------------------------------
+// A few things exist only on the app's WebSocket, not over HTTP. The one t3ctl
+// needs is `bootstrap` on thread.turn.start: the HTTP dispatch hands commands
+// straight to the engine, which ignores the field, so a worktree requested
+// over HTTP is silently never made (apps/server/src/ws.ts,
+// dispatchBootstrapTurnStart). The socket speaks Effect RPC as plain JSON
+// frames: {_tag: 'Request', id, tag, payload, headers} out, {_tag: 'Exit',
+// requestId, exit} back. A browser cannot put a bearer header on a socket, so
+// the server takes a short-lived ticket in the query string instead, minted
+// over authenticated HTTP.
+
+type RpcExit = {
+  _tag: 'Success' | 'Failure';
+  value?: unknown;
+  cause?: { _tag: string; error?: { message?: string; bootstrapThreadDisposition?: string }; defect?: unknown }[];
+};
+
+type RpcSession = { call: (tag: string, payload: unknown, timeoutMs: number) => Promise<unknown>; close: () => void };
+
+/** A failure the server answered with, as opposed to a dropped or timed-out socket. */
+class RpcError extends Error {
+  /** Set on a failed bootstrap: `deleted` (the thread was rolled back) or `not-created`. */
+  disposition?: string;
+}
+
+const rpcFailure = (tag: string, exit: RpcExit): RpcError => {
+  const failure = exit.cause?.find((c) => c._tag === 'Fail') ?? exit.cause?.[0];
+  const message = failure?.error?.message ?? (failure?.defect !== undefined ? JSON.stringify(failure.defect) : 'no reason given');
+  const error = new RpcError(`${tag} failed: ${message}`);
+  error.disposition = failure?.error?.bootstrapThreadDisposition;
+  return error;
+};
+
+// Only write commands open a socket today, so the split-brain guard runs here
+// the same way it does in dispatch.
+const openRpc = async (host: Host): Promise<RpcSession> => {
+  await ensureTunnel(host);
+  await assertNoRival(host);
+  const res = await fetch(`${host.origin}/api/auth/websocket-ticket`, {
+    method: 'POST',
+    headers: host.token ? { authorization: `Bearer ${host.token}` } : {},
+    signal: AbortSignal.timeout(host.timeoutMs ?? 15000),
+  });
+  if (!res.ok) throw new Error(`${host.name}: websocket ticket: HTTP ${res.status} ${await res.text().catch(() => '')}`.trim());
+  const { ticket } = (await res.json()) as { ticket: string };
+
+  const ws = new WebSocket(`${host.origin.replace(/^http/, 'ws')}/ws?wsTicket=${encodeURIComponent(ticket)}`);
+  await new Promise<void>((resolve, reject) => {
+    ws.addEventListener('open', () => resolve(), { once: true });
+    ws.addEventListener('error', () => reject(new Error(`${host.name}: websocket connection failed`)), { once: true });
+  });
+
+  const pending = new Map<string, { resolve: (v: unknown) => void; reject: (e: Error) => void }>();
+  ws.addEventListener('message', (event) => {
+    const parsed = JSON.parse(String(event.data)) as unknown;
+    for (const m of (Array.isArray(parsed) ? parsed : [parsed]) as { _tag: string; requestId?: string; exit?: RpcExit; defect?: unknown }[]) {
+      if (m._tag === 'Defect') {
+        for (const p of pending.values()) p.reject(new Error(`server defect: ${JSON.stringify(m.defect)}`));
+        pending.clear();
+      }
+      const p = m._tag === 'Exit' && m.exit ? pending.get(String(m.requestId)) : undefined;
+      if (!p || !m.exit) continue;
+      pending.delete(String(m.requestId));
+      p.resolve(m.exit);
+    }
+  });
+  ws.addEventListener('close', () => {
+    for (const p of pending.values()) p.reject(new Error(`${host.name}: the connection closed before the server answered`));
+    pending.clear();
+  });
+  // The server answers a Ping with a Pong; it only keeps an idle socket alive
+  // through the ssh tunnel or a proxy while a long bootstrap runs.
+  const keepalive = setInterval(() => ws.send(JSON.stringify({ _tag: 'Ping' })), 15_000);
+
+  let nextId = 0;
+  return {
+    call: (tag, payload, timeoutMs) => new Promise<unknown>((resolve, reject) => {
+      const id = String(++nextId);
+      const timer = setTimeout(() => {
+        pending.delete(id);
+        reject(new Error(`${tag}: no answer within ${timeoutMs / 1000}s`));
+      }, timeoutMs);
+      pending.set(id, {
+        resolve: (exit) => {
+          clearTimeout(timer);
+          const e = exit as RpcExit;
+          if (e._tag === 'Success') resolve(e.value);
+          else reject(rpcFailure(tag, e));
+        },
+        reject: (error) => { clearTimeout(timer); reject(error); },
+      });
+      ws.send(JSON.stringify({ _tag: 'Request', id, tag, payload, headers: [] }));
+    }),
+    close: () => { clearInterval(keepalive); ws.close(); },
+  };
+};
+
 const resolveProject = (snap: Snapshot, ref: string): Project | undefined =>
   snap.projects.find((p) => p.id === ref) ??
   snap.projects.find((p) => !p.deletedAt && p.title === ref) ??
@@ -1119,11 +1217,90 @@ const cmdProjectCreate = async (title: string, root: string, flags: Flags): Prom
   console.log(`created project ${bold(title)} on ${host.name}\n  id   ${projectId}\n  root ${workspaceRoot}\n  seq  ${sequence}`);
 };
 
+// The setup script runs before the RPC answers unless it is marked async, and
+// a cold checkout of a big repo plus `npm ci` takes minutes.
+const BOOTSTRAP_WAIT_MS = 15 * 60_000;
+
+// The shape the server recognises as temporary (isTemporaryWorktreeBranch in
+// packages/shared/src/git.ts) and renames after the first turn. A branch is
+// always sent: without one the server adds a detached worktree at the commit.
+const temporaryBranch = (): string => `t3code/${crypto.randomUUID().slice(0, 8)}`;
+
+type VcsRef = { name: string; isRemote?: boolean; remoteName?: string; isDefault: boolean };
+
+// The default is origin/HEAD, which the server keeps on the first page of
+// vcs.listRefs. It can be listed as `origin/main` when there is no local main.
+const defaultBranch = async (rpc: RpcSession, project: Project): Promise<string> => {
+  const list = (await rpc.call('vcs.listRefs', { cwd: project.workspaceRoot, limit: 20 }, 30_000)) as { isRepo: boolean; refs: VcsRef[] };
+  if (!list.isRepo) throw new Error(`${project.title} (${project.workspaceRoot}) is not a git repository, so it cannot have a worktree`);
+  const ref = list.refs.find((r) => r.isDefault);
+  if (!ref) throw new Error(`cannot tell the default branch of ${project.title}: origin/HEAD is not set — pass --base <branch>`);
+  return ref.isRemote && ref.remoteName ? ref.name.slice(ref.remoteName.length + 1) : ref.name;
+};
+
+const worktreeFlagProblem = (flags: Flags): string | null => {
+  if (!flags['new-worktree']) return flags.message || flags.base ? '--message and --base only apply with --new-worktree' : null;
+  if (flags.worktree) return '--new-worktree makes its own worktree, so it cannot take --worktree <path> as well';
+  if (!flags.message?.trim()) return '--new-worktree needs --message <text>: the server only prepares a worktree when the first message is sent';
+  return null;
+};
+
+// One thread.turn.start that carries the thread, the worktree and the first
+// message, as the app sends it from a new-thread draft. The server creates the
+// thread, fetches origin/<base>, adds the worktree, runs the setup script, then
+// starts the turn — and deletes the thread again if any step before the turn fails.
+const cmdThreadCreateInWorktree = async (host: Host, project: Project, title: string, modelSelection: ModelSelection, flags: Flags): Promise<void> => {
+  const runtimeMode = parseRuntimeMode(flags['runtime-mode'] ?? 'full-access');
+  const interactionMode = flags['interaction-mode'] ?? 'default';
+  const rpc = await openRpc(host);
+  try {
+    const baseBranch = flags.base ?? await defaultBranch(rpc, project);
+    const branch = flags.branch ?? temporaryBranch();
+    const threadId = crypto.randomUUID();
+    const createdAt = new Date().toISOString();
+    console.error(dim(`preparing ${branch} from ${baseBranch} in a new worktree on ${host.name} — this can take a few minutes`));
+    const { sequence } = (await rpc.call('orchestration.dispatchCommand', {
+      type: 'thread.turn.start', commandId: crypto.randomUUID(), threadId,
+      message: { messageId: crypto.randomUUID(), role: 'user', text: flags.message, attachments: [] },
+      modelSelection, runtimeMode, interactionMode,
+      bootstrap: {
+        createThread: {
+          projectId: project.id, title, modelSelection, runtimeMode, interactionMode,
+          branch: baseBranch, worktreePath: null, createdAt,
+        },
+        // requireWorktree: fail rather than quietly run in the project checkout
+        // when the project is not a repo or the base has no commit.
+        prepareWorktree: { projectCwd: project.workspaceRoot, baseBranch, branch, startFromOrigin: true, requireWorktree: true },
+        runSetupScript: true,
+      },
+      createdAt,
+    }, BOOTSTRAP_WAIT_MS).catch((error: unknown) => {
+      if (!(error instanceof RpcError)) {
+        // The bootstrap outlives the connection that asked for it.
+        throw new Error(`${errorMessage(error)}\n  any setup already under way carries on on the server — check with: t3ctl ls -t`);
+      }
+      const outcome = error.disposition === 'deleted' ? 'the server deleted the thread it had created'
+        : error.disposition === 'not-created' ? 'no thread was created' : '';
+      throw new Error(outcome ? `${error.message}\n  ${outcome}` : error.message);
+    })) as { sequence: number };
+    // The server picks the worktree path, so read it back rather than guess it.
+    const made = await threadDetail(host, threadId).catch(() => null);
+    console.log(`started ${bold(title)} in ${project.title} on ${host.name}\n  id       ${threadId}\n` +
+      `  branch   ${made?.branch ?? branch} ${dim(`(from ${baseBranch})`)}\n  worktree ${made?.worktreePath ?? '-'}\n` +
+      `  model    ${describeModel(modelSelection)}\n  mode     ${runtimeMode} / ${interactionMode}\n  seq      ${sequence}`);
+  } finally {
+    rpc.close();
+  }
+};
+
 const cmdThreadCreate = async (projectRef: string, title: string, flags: Flags): Promise<void> => {
+  const problem = worktreeFlagProblem(flags);
+  if (problem) throw new Error(problem);
   const host = pickHost(flags);
   const project = resolveProject(await snapshot(host), projectRef);
   if (!project) throw new Error(`no project matching "${projectRef}" on ${host.name}`);
   const modelSelection = withOptions(parseModel(flags.model ?? 'claudeAgent/claude-opus-5'), flags.option);
+  if (flags['new-worktree']) return cmdThreadCreateInWorktree(host, project, title, modelSelection, flags);
   const threadId = crypto.randomUUID();
   const { sequence } = await dispatch(host, {
     type: 'thread.create', commandId: crypto.randomUUID(),
@@ -1441,7 +1618,7 @@ const FLAG_NAMES = {
   host: 'host', model: 'model', branch: 'branch', worktree: 'worktree',
   name: 'name', timeout: 'timeout',
   runtimeMode: 'runtime-mode', interactionMode: 'interaction-mode',
-  option: 'option',
+  option: 'option', newWorktree: 'new-worktree', base: 'base', message: 'message',
 };
 // Only carry options that were actually supplied. Emitting every key
 // unconditionally made `'name' in flags` always true, which made host add bail
@@ -1559,11 +1736,14 @@ const thread = program.command('thread').description('create and drive threads')
 hostOption(thread.command('create')
   .argument('<project>', 'project id, title, or workspace root')
   .argument('<title...>', 'thread title; everything after the project is used')
-  .description('create a thread (idle — use `thread send` to run it)')
+  .description('create a thread (idle — use `thread send` to run it, or --new-worktree to start it in a fresh worktree)')
   .option('--model <instance/model>', 'e.g. claudeAgent/claude-opus-5', 'claudeAgent/claude-opus-5')
   .option('--option <id=value>', 'model option, e.g. effort=high; repeatable', addOption)
-  .option('--branch <branch>', 'git branch to associate with the thread')
-  .option('--worktree <path>', 'git worktree the thread should run in')
+  .option('--branch <branch>', 'git branch to associate with the thread; with --new-worktree, the branch to create')
+  .option('--worktree <path>', 'existing git worktree the thread should run in')
+  .option('--new-worktree', 'have the server create a worktree and start the thread in it; needs --message')
+  .option('--base <branch>', "with --new-worktree: branch to start from (default: the repo's default branch)")
+  .option('--message <text>', 'with --new-worktree: the first message, which starts the agent')
   .option('--runtime-mode <mode>', RUNTIME_MODE_HELP, 'full-access')
   .option('--interaction-mode <mode>', 'default | plan', 'default'))
   .action((ref: string, title: string[], o: OptionValues) => cmdThreadCreate(ref, title.join(' '), toFlags(o)));
