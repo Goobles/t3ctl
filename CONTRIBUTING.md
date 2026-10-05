@@ -64,8 +64,17 @@ instead, so it never touches the pairing flow.
 | List everything | `GET /api/orchestration/snapshot` | bearer |
 | Per-thread | `GET /api/orchestration/threads/:threadId` | bearer |
 | Writes (commands) | `POST /api/orchestration/dispatch` | bearer |
+| Socket ticket | `POST /api/auth/websocket-ticket` | bearer |
+| App RPC | `GET /ws?wsTicket=<ticket>` (WebSocket) | ticket |
 
-t3ctl uses `descriptor`, `snapshot` and `dispatch` only.
+t3ctl uses `descriptor`, `snapshot` and `dispatch` for nearly everything. The
+socket is only for `thread create --new-worktree`: the worktree `bootstrap` on
+`thread.turn.start` runs only in the WebSocket handler (`dispatchBootstrapTurnStart`
+in `apps/server/src/ws.ts`). Sent over HTTP, the field is dropped without an
+error. The socket speaks Effect RPC as one JSON message per text frame:
+`{"_tag":"Request","id":"1","tag":"orchestration.dispatchCommand","payload":…,"headers":[]}`
+out, `{"_tag":"Exit","requestId":"1","exit":{"_tag":"Success","value":…}}` (or
+`"Failure"` with a `cause` array) back.
 
 ### The environment descriptor
 

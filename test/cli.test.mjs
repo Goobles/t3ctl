@@ -13,6 +13,7 @@ import { chmodSync, copyFileSync, existsSync, mkdtempSync, mkdirSync, rmSync, wr
 import { fileURLToPath } from 'node:url';
 import { createServer } from 'node:net';
 import { createServer as createHttpServer } from 'node:http';
+import { createHash } from 'node:crypto';
 import { networkInterfaces, tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 
@@ -293,8 +294,62 @@ test('a host off loopback goes over HTTP, and its markers carry the host name', 
 
 const ENV_ID = 'e3b97f3f-0000-4000-8000-000000000000';
 
-const fakeT3 = async (serverVersion, threads = []) => {
+/**
+ * The app's WebSocket RPC, as little of it as t3ctl touches: text frames only,
+ * one JSON Effect RPC message each. `answer(request)` returns the `exit` to
+ * send back; Pings are swallowed. No `ws` dependency, so the RFC 6455 framing
+ * is done by hand — client frames are always masked, server frames never.
+ */
+const acceptWebSocket = (server, rpc, answer) => server.on('upgrade', (req, socket) => {
+  const accept = createHash('sha1').update(`${req.headers['sec-websocket-key']}258EAFA5-E914-47DA-95CA-C5AB0DC85B11`).digest('base64');
+  socket.write(`HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ${accept}\r\n\r\n`);
+  const send = (message) => {
+    const body = Buffer.from(JSON.stringify(message));
+    const head = body.length < 126 ? Buffer.from([0x81, body.length])
+      : Buffer.from([0x81, 126, body.length >> 8, body.length & 0xff]);
+    socket.write(Buffer.concat([head, body]));
+  };
+  let buf = Buffer.alloc(0);
+  socket.on('data', (chunk) => {
+    buf = Buffer.concat([buf, chunk]);
+    for (;;) {
+      if (buf.length < 2) return;
+      const opcode = buf[0] & 0x0f;
+      let len = buf[1] & 0x7f;
+      let at = 2;
+      if (len === 126) { len = buf.readUInt16BE(2); at = 4; }
+      if (buf.length < at + 4 + len) return;
+      const mask = buf.subarray(at, at + 4);
+      const body = Buffer.from(buf.subarray(at + 4, at + 4 + len).map((b, i) => b ^ mask[i % 4]));
+      buf = buf.subarray(at + 4 + len);
+      if (opcode === 0x8) return socket.end();
+      if (opcode !== 0x1) continue;
+      const message = JSON.parse(body.toString());
+      if (message._tag !== 'Request') continue;
+      rpc.push({ url: req.url, tag: message.tag, payload: message.payload });
+      const exit = answer(message);
+      if (exit === DROP) return socket.destroy();
+      send({ _tag: 'Exit', requestId: message.id, exit });
+    }
+  });
+  socket.on('error', () => {});
+});
+
+const ok = (value) => ({ _tag: 'Success', value });
+/** An answer that cuts the connection instead of replying. */
+const DROP = Symbol('drop');
+
+/** What a git project answers by default: a feature branch checked out, `main` the default only on origin. */
+const defaultRpc = (request) => request.tag === 'vcs.listRefs'
+  ? ok({ isRepo: true, hasPrimaryRemote: true, nextCursor: null, totalCount: 2, refs: [
+    { name: 'feature', current: true, isDefault: false, worktreePath: '/tmp' },
+    { name: 'origin/main', isRemote: true, remoteName: 'origin', current: false, isDefault: true, worktreePath: null },
+  ] })
+  : ok({ sequence: 7 });
+
+const fakeT3 = async (serverVersion, threads = [], answer = defaultRpc) => {
   const dispatched = [];
+  const rpc = [];
   const server = createHttpServer((req, res) => {
     const json = (body) => { res.setHeader('content-type', 'application/json'); res.end(JSON.stringify(body)); };
     if (req.url === '/.well-known/t3/environment') return json({ environmentId: ENV_ID, label: 'box', serverVersion });
@@ -307,10 +362,24 @@ const fakeT3 = async (serverVersion, threads = []) => {
       req.on('end', () => { dispatched.push(JSON.parse(body)); json({ sequence: 1 }); });
       return;
     }
+    if (req.url === '/api/auth/websocket-ticket' && req.method === 'POST') {
+      return json({ ticket: `ticket-for-${req.headers.authorization}`, expiresAt: '2026-01-01T00:05:00.000Z' });
+    }
+    // A thread read back after a bootstrap carries the worktree the server made.
+    const detail = /^\/api\/orchestration\/threads\/([^/?]+)/.exec(req.url ?? '');
+    const started = detail && rpc.find((r) => r.payload?.threadId === detail[1]);
+    if (started) {
+      const { branch } = started.payload.bootstrap.prepareWorktree;
+      return json({ thread: { id: detail[1], branch, worktreePath: `/wt/alpha/${branch.replace(/\//g, '-')}` } });
+    }
     res.statusCode = 404; res.end();
   });
+  acceptWebSocket(server, rpc, answer);
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
-  return { origin: `http://127.0.0.1:${server.address().port}`, dispatched, close: () => server.close() };
+  return {
+    origin: `http://127.0.0.1:${server.address().port}`, dispatched, rpc, server,
+    close: () => server.close(),
+  };
 };
 
 const splitHome = (host, runtimeOrigin) => {
@@ -510,6 +579,167 @@ test('the app names work wherever --runtime-mode is accepted', async () => {
     assert.notEqual(bad.code, 0);
     assert.match(bad.stderr, /unknown runtime mode/);
     assert.equal(w.dispatched.length, 2);
+  } finally { w.close(); }
+});
+
+// ---- thread create --new-worktree --------------------------------------------
+// The worktree bootstrap exists only on the WebSocket RPC; over HTTP the server
+// drops it without a word. So the one thing every case asserts first is that
+// nothing went to the HTTP dispatch endpoint.
+
+/** A fake host whose RPC answers come from `answer`, with the HOME pointing at it. */
+const worktreeWorld = async (answer, hostFields = {}) => {
+  const server = await fakeT3('0.0.45', [], answer);
+  const home = splitHome({ name: 'box', origin: server.origin, token: 'tok', environmentId: ENV_ID, ...hostFields }, server.origin);
+  return { ...server, home, close: () => { server.close(); rmSync(home, { recursive: true, force: true }); } };
+};
+
+test('--new-worktree sends one bootstrapped turn start over the websocket, with the app\'s defaults', async () => {
+  const w = await worktreeWorld();
+  try {
+    const { code, stdout, stderr } = await cliIn(w.home, 'thread', 'create', 'alpha', 'fix', 'the', 'flake',
+      '--new-worktree', '--message', 'find out why ci flakes');
+    assert.equal(code, 0, stderr);
+    assert.deepEqual(w.dispatched, [], 'a bootstrap over HTTP is silently ignored, so nothing may go there');
+    assert.match(w.rpc[0].url, /^\/ws\?wsTicket=ticket-for-Bearer%20tok$/);
+
+    // No --base: the default comes from the repo, and origin/main means `main`.
+    assert.deepEqual(w.rpc[0].payload, { cwd: '/tmp', limit: 20 });
+    assert.equal(w.rpc[0].tag, 'vcs.listRefs');
+
+    const { tag, payload } = w.rpc[1];
+    assert.equal(tag, 'orchestration.dispatchCommand');
+    const { commandId, threadId, message, createdAt, bootstrap, ...rest } = payload;
+    assert.match(commandId, /^[0-9a-f-]{36}$/);
+    assert.match(threadId, /^[0-9a-f-]{36}$/);
+    assert.equal(message.text, 'find out why ci flakes');
+    assert.deepEqual(rest, {
+      type: 'thread.turn.start', runtimeMode: 'full-access', interactionMode: 'default',
+      modelSelection: { instanceId: 'claudeAgent', model: 'claude-opus-5' },
+    });
+    assert.match(bootstrap.prepareWorktree.branch, /^t3code\/[0-9a-f]{8}$/, 'a temporary branch the server renames later');
+    assert.deepEqual(bootstrap, {
+      createThread: {
+        projectId: 'p1', title: 'fix the flake', modelSelection: rest.modelSelection,
+        runtimeMode: 'full-access', interactionMode: 'default',
+        branch: 'main', worktreePath: null, createdAt,
+      },
+      prepareWorktree: {
+        projectCwd: '/tmp', baseBranch: 'main', branch: bootstrap.prepareWorktree.branch,
+        startFromOrigin: true, requireWorktree: true,
+      },
+      runSetupScript: true,
+    });
+
+    // The path is the one the server reports, not one t3ctl made up.
+    assert.ok(stdout.includes(`worktree /wt/alpha/${bootstrap.prepareWorktree.branch.replace('/', '-')}`), stdout);
+    assert.ok(stdout.includes(threadId), stdout);
+  } finally { w.close(); }
+});
+
+test('--base and --branch are sent as given, and skip the default-branch lookup', async () => {
+  const w = await worktreeWorld();
+  try {
+    const { code, stderr } = await cliIn(w.home, 'thread', 'create', 'alpha', 'pin', 'deps',
+      '--new-worktree', '--message', 'pin them', '--base', 'develop', '--branch', 'chore/pin-deps', '--runtime-mode', 'supervised');
+    assert.equal(code, 0, stderr);
+    assert.deepEqual(w.rpc.map((r) => r.tag), ['orchestration.dispatchCommand']);
+    const { bootstrap, runtimeMode } = w.rpc[0].payload;
+    assert.equal(bootstrap.prepareWorktree.baseBranch, 'develop');
+    assert.equal(bootstrap.prepareWorktree.branch, 'chore/pin-deps');
+    assert.equal(bootstrap.createThread.branch, 'develop');
+    assert.equal(runtimeMode, 'approval-required');
+    assert.equal(bootstrap.createThread.runtimeMode, 'approval-required');
+  } finally { w.close(); }
+});
+
+const failWith = (error) => (request) => request.tag === 'vcs.listRefs' ? defaultRpc(request) : {
+  _tag: 'Failure', cause: [{ _tag: 'Fail', error: { _tag: 'OrchestrationDispatchCommandError', ...error } }],
+};
+
+test('a failed worktree setup reports the server\'s reason and what became of the thread', async () => {
+  // The two dispositions the server reports, each with a reason it really pairs
+  // it with: requireWorktree is checked before the thread exists (ws.ts), while
+  // a failed checkout comes after createThread and rolls it back.
+  const cases = [
+    [{ message: 'A separate worktree requires a Git repository and a base branch with a commit.', bootstrapThreadDisposition: 'not-created' }, /no thread was created/],
+    [{ message: 'Git command failed in GitVcsDriver.createWorktree: disk full', bootstrapThreadDisposition: 'deleted' }, /the server deleted the thread it had created/],
+  ];
+  for (const [error, outcome] of cases) {
+    const w = await worktreeWorld(failWith(error));
+    try {
+      const { code, stderr } = await cliIn(w.home, 'thread', 'create', 'alpha', 'doomed', '--new-worktree', '--message', 'go');
+      assert.notEqual(code, 0);
+      assert.ok(stderr.includes(error.message), stderr);
+      assert.match(stderr, outcome);
+      assert.doesNotMatch(stderr, /carries on on the server/, 'the server answered, so nothing is left running');
+    } finally { w.close(); }
+  }
+});
+
+test('a connection lost mid-dispatch says the setup may still be running', async () => {
+  const w = await worktreeWorld((request) => request.tag === 'vcs.listRefs' ? defaultRpc(request) : DROP);
+  try {
+    const { code, stderr } = await cliIn(w.home, 'thread', 'create', 'alpha', 'x', '--new-worktree', '--message', 'go');
+    assert.notEqual(code, 0);
+    assert.match(stderr, /closed before the server answered/);
+    assert.match(stderr, /carries on on the server — check with: t3ctl ls -t/);
+  } finally { w.close(); }
+});
+
+test('a websocket handshake that never completes times out instead of hanging', async () => {
+  const w = await worktreeWorld(undefined, { timeoutMs: 500 });
+  w.server.removeAllListeners('upgrade');
+  w.server.on('upgrade', () => {}); // accept the request, never answer it
+  try {
+    const { code, stderr } = await cliIn(w.home, 'thread', 'create', 'alpha', 'x', '--new-worktree', '--message', 'go');
+    assert.notEqual(code, 0);
+    assert.match(stderr, /websocket handshake got no answer in 500ms/);
+  } finally { w.close(); }
+});
+
+test('a git error, which carries detail rather than message, still says what went wrong', async () => {
+  const w = await worktreeWorld(() => ({
+    _tag: 'Failure',
+    cause: [{ _tag: 'Fail', error: { _tag: 'GitCommandError', operation: 'GitVcsDriver.listRefs', command: 'git', cwd: '/tmp', detail: 'fatal: bad object HEAD' } }],
+  }));
+  try {
+    const { code, stderr } = await cliIn(w.home, 'thread', 'create', 'alpha', 'x', '--new-worktree', '--message', 'go');
+    assert.notEqual(code, 0);
+    assert.match(stderr, /vcs\.listRefs failed: fatal: bad object HEAD/);
+  } finally { w.close(); }
+});
+
+test('without --base, a repo with no known default branch asks for one', async () => {
+  const w = await worktreeWorld((request) => request.tag === 'vcs.listRefs'
+    ? ok({ isRepo: true, hasPrimaryRemote: false, nextCursor: null, totalCount: 1, refs: [{ name: 'trunk', current: true, isDefault: false, worktreePath: '/tmp' }] })
+    : ok({ sequence: 7 }));
+  try {
+    const { code, stderr } = await cliIn(w.home, 'thread', 'create', 'alpha', 'x', '--new-worktree', '--message', 'go');
+    assert.notEqual(code, 0);
+    assert.match(stderr, /origin\/HEAD is not set — pass --base <branch>/);
+    assert.doesNotMatch(stderr, /carries on on the server/, 'nothing was dispatched, so nothing is under way');
+    assert.deepEqual(w.rpc.map((r) => r.tag), ['vcs.listRefs'], 'nothing may be dispatched without a base');
+  } finally { w.close(); }
+});
+
+test('--new-worktree flag mistakes are caught before anything is sent', async () => {
+  const w = await worktreeWorld();
+  try {
+    const cases = [
+      [['--new-worktree'], /needs --message/],
+      [['--new-worktree', '--message', '  '], /needs --message/],
+      [['--message', 'hi'], /only apply with --new-worktree/],
+      [['--base', 'main'], /only apply with --new-worktree/],
+      [['--new-worktree', '--message', 'hi', '--worktree', '/x'], /cannot take --worktree/],
+    ];
+    for (const [flags, expected] of cases) {
+      const { code, stderr } = await cliIn(w.home, 'thread', 'create', 'alpha', 'x', ...flags);
+      assert.notEqual(code, 0, `expected failure: ${flags.join(' ')}`);
+      assert.match(stderr, expected);
+    }
+    assert.deepEqual(w.dispatched, []);
+    assert.deepEqual(w.rpc, []);
   } finally { w.close(); }
 });
 
