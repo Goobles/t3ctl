@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.9.0](https://github.com/Goobles/t3ctl/compare/v0.8.0...v0.9.0) (2026-10-05)
+
+
+### Features
+
+* start a thread in a new server-made worktree with thread create --new-worktree ([16ede96](https://github.com/Goobles/t3ctl/commit/16ede965c0dc970d4873e529b9c8f3449a4c6b90))
+* start a thread in a new server-made worktree with thread create --new-worktree ([ff26422](https://github.com/Goobles/t3ctl/commit/ff26422e66e7c8d0c659e62d1c7c926869055711))
+
+
+### Bug Fixes
+
+* harden the websocket client behind thread create --new-worktree ([34b84c8](https://github.com/Goobles/t3ctl/commit/34b84c8e80513ef705c23a640374d69b960dd9e8))
+
 ## [0.8.0](https://github.com/Goobles/t3ctl/compare/v0.7.0...v0.8.0) (2026-10-02)
 
 
