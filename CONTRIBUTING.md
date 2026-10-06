@@ -21,7 +21,9 @@ node dist/t3ctl.js ls -t
 - `docs/user/remote-access.md` — pairing, `t3 serve`, transports
 - `docs/internals/environment-auth.md` — session methods, bearer tokens
 - `docs/internals/t3-connect.md` — the relay
-- `packages/contracts/src/orchestration.ts` — the authoritative command/event schemas
+- `packages/contracts/src/orchestrationV2.ts` — the authoritative command/event schemas
+  for protocol 2 (`orchestration.ts` has protocol 1's, in history before the switch)
+- `packages/contracts/src/environmentHttp.ts` — every HTTP route, with its headers
 
 Note that `@t3tools/contracts` and `@t3tools/client-runtime` are `private: true`
 — readable in the repo, but not installable from npm. Hence the hand-rolled HTTP
@@ -58,20 +60,41 @@ instead, so it never touches the pairing flow.
 
 ## Endpoints
 
-| Purpose | Endpoint | Auth |
-|---|---|---|
-| Identify the server | `GET /.well-known/t3/environment` | **none** |
-| List everything | `GET /api/orchestration/snapshot` | bearer |
-| Per-thread | `GET /api/orchestration/threads/:threadId` | bearer |
-| Writes (commands) | `POST /api/orchestration/dispatch` | bearer |
-| Socket ticket | `POST /api/auth/websocket-ticket` | bearer |
-| App RPC | `GET /ws?wsTicket=<ticket>` (WebSocket) | ticket |
+T3 Code has spoken two **orchestration protocols**, and t3ctl drives both. They
+share almost no routes:
 
-t3ctl uses `descriptor`, `snapshot` and `dispatch` for nearly everything. The
-socket is only for `thread create --new-worktree`: the worktree `bootstrap` on
-`thread.turn.start` runs only in the WebSocket handler (`dispatchBootstrapTurnStart`
-in `apps/server/src/ws.ts`). Sent over HTTP, the field is dropped without an
-error. The socket speaks Effect RPC as one JSON message per text frame:
+| Purpose | Protocol 1 | Protocol 2 ("Orchestrator V2") | Auth |
+|---|---|---|---|
+| Identify the server | `GET /.well-known/t3/environment` | same | **none** |
+| List everything | `GET /api/orchestration/snapshot` | `GET /api/orchestration/shell` | bearer (+ header in 2) |
+| Per-thread | `GET /api/orchestration/threads/:threadId` | same path, other shape | bearer (+ header in 2) |
+| Writes (commands) | `POST /api/orchestration/dispatch` | the socket only | bearer / ticket |
+| Create a project | a `project.create` command | `POST /api/projects/mutate` | bearer |
+| Socket ticket | `POST /api/auth/websocket-ticket` | same | bearer |
+| App RPC | `GET /ws?wsTicket=<ticket>` | `GET /ws?wsTicket=<ticket>&orchestrationProtocol=2` | ticket |
+
+Protocol 2 rejects orchestration reads without the header
+`x-t3-orchestration-protocol: 2` (HTTP 400) and closes a socket opened without
+`orchestrationProtocol=2`. Neither protocol answers the other's routes with an
+error: an unknown GET gets the web app's `index.html`, which is how a client on
+the wrong protocol ends up with `Unexpected token '<'`.
+
+### Detecting the protocol
+
+The environment descriptor carries `orchestrationProtocolVersion`; servers from
+before protocol negotiation leave it out, and all of those speak protocol 1.
+`protocolOf()` reads it once per host per run (cached in memory, not in
+`hosts.json`, since a server can update between runs) and every API call
+branches on the answer. A version t3ctl does not know is an error before
+anything is sent, never a guess.
+
+Protocol 1 takes commands over HTTP and uses the socket only for `thread create
+--new-worktree`: the worktree `bootstrap` on `thread.turn.start` runs only in the
+WebSocket handler (`dispatchBootstrapTurnStart` in `apps/server/src/ws.ts`), and
+over HTTP the field is dropped without an error. Protocol 2 takes every command
+over the socket, as the `orchestration.dispatchCommand` RPC, and uses
+`orchestration.launchThread` for `--new-worktree`. The socket speaks Effect RPC
+as one JSON message per text frame:
 `{"_tag":"Request","id":"1","tag":"orchestration.dispatchCommand","payload":…,"headers":[]}`
 out, `{"_tag":"Exit","requestId":"1","exit":{"_tag":"Success","value":…}}` (or
 `"Failure"` with a `cause` array) back.
@@ -85,7 +108,8 @@ out, `{"_tag":"Exit","requestId":"1","exit":{"_tag":"Success","value":…}}` (or
 ```json
 { "environmentId": "9d9d9921-…", "label": "SPR-Gobius-D",
   "platform": { "os": "darwin", "arch": "arm64" },
-  "serverVersion": "0.0.38-nightly.20260901.1250",
+  "serverVersion": "0.0.46-nightly.20261005.2689",
+  "orchestrationProtocolVersion": 2,
   "capabilities": { "…": true } }
 ```
 
@@ -96,21 +120,25 @@ apart: "this origin isn't T3 Code" and "your token is wrong". t3ctl stores
 `environmentId` on a known origin as a loud warning — the origin now resolves to
 a different machine, so the stored token belongs to something else.
 
-Probing happens on `host add` and `hosts` only. `ls` must stay one request per
-host; adding a descriptor round-trip there would double its cost for information
-it never displays. t3ctl reads only the three string fields — `platform` and
-`capabilities` are deliberately ignored rather than stored, so there is nothing
-to keep in sync when the server grows a capability flag.
+Every command now probes it once per host, for the protocol, so `ls` costs two
+requests per host rather than one. The descriptor is small and needs no auth;
+guessing the protocol from what the server answers instead would mean telling an
+error apart from the web app's index page. t3ctl reads only the three string
+fields and the protocol — `platform` and `capabilities` are deliberately ignored
+rather than stored, so there is nothing to keep in sync when the server grows a
+capability flag.
 
 ## Command vocabulary
 
 Commands are imperative, events past-tense (`thread.create` → `thread.created`).
-Commands are dispatched directly to `/dispatch` with no envelope — the command
-object *is* the request body, and the response carries a `sequence`.
+The command object *is* the RPC payload, with no envelope, and the answer
+carries a `sequence`.
 
 **The client generates `commandId`, `threadId`, and `projectId`**; `commandId`
-is the idempotency key, so retries are safe. Exact schemas live in
-`packages/contracts/src/orchestration.ts`.
+is the idempotency key, so retries are safe. Every command is built in the
+host's own protocol.
+
+Protocol 1 (`packages/contracts/src/orchestration.ts`):
 
 ```
 project.create      { commandId, projectId, title, workspaceRoot, createdAt,
@@ -120,14 +148,51 @@ thread.create       { commandId, threadId, projectId, title, modelSelection,
 thread.turn.start   { commandId, threadId, message: {messageId, role, text, attachments},
                       runtimeMode, interactionMode, modelSelection?, titleSeed?, createdAt }
 thread.turn.interrupt { commandId, threadId }
+thread.meta.update  { commandId, threadId, title?, regenerateTitle? }
 thread.snooze       { commandId, threadId, snoozedUntil }
 thread.unsnooze     { commandId, threadId, reason: "user" }
 thread.runtime-mode.set { commandId, threadId, runtimeMode, createdAt }
 ```
 
-Note the shape of the last one: the *event* is `thread.runtime-mode-set`, but the
-command that produces it is `thread.runtime-mode.set` — a dot, not a hyphen, in
-the same position. Its sibling `thread.interaction-mode.set` is not wired up.
+The client-side `thread.turn.start` schema requires `runtimeMode` and
+`interactionMode` explicitly, while the server-side one defaults them; t3ctl
+always sends both.
+
+Protocol 2 (`packages/contracts/src/orchestrationV2.ts`):
+
+```
+thread.create       { commandId, createdBy, creationSource, threadId, projectId, title,
+                      modelSelection, runtimeMode, interactionMode, branch, worktreePath }
+message.dispatch    { commandId, createdBy, creationSource, threadId, messageId, text,
+                      attachments, modelSelection?, dispatchMode }
+run.interrupt       { commandId, threadId, runId }
+thread.metadata.update { commandId, threadId, title?, regenerateTitle? }
+thread.snooze       { commandId, threadId, snoozedUntil }
+thread.unsnooze     { commandId, threadId, reason: "user" }
+thread.runtime-mode.set     { commandId, threadId, runtimeMode }
+thread.interaction-mode.set { commandId, threadId, interactionMode }
+```
+
+`createdBy` is `user`, `agent` or `system`; `creationSource` is `web`,
+`mobile`, `mcp`, `provider` or `server`. t3ctl sends `user` / `web`: it acts for
+the person at the keyboard, and the server only treats `server` and `provider`
+specially.
+
+In protocol 2, `message.dispatch` carries no access or interaction mode, unlike protocol 1's
+`thread.turn.start`, so `thread send --runtime-mode` sends
+`thread.runtime-mode.set` first, on the same socket. Its `dispatchMode` is
+`start_immediately` for an idle thread and `queue_after_active` for one with an
+`activeRunId`; the app can also steer or restart an active run, which t3ctl
+does not. `run.interrupt` needs the run to stop, so `thread interrupt` takes it
+from the shell's `activeRunId` and refuses a thread with none.
+
+Protocol 2 projects are not orchestration commands. `project create` posts
+`{type: "project.create", commandId, projectId, title, workspaceRoot}` to
+`/api/projects/mutate` (`ProjectMutation` in `packages/contracts/src/project.ts`),
+which answers with the project rather than a sequence.
+
+Note the command name `thread.runtime-mode.set`: a dot, not a hyphen, before
+`set`.
 
 `thread.snooze` takes only a wake time today. Upstream's comment on the field
 says event-based wake conditions (PR merged, review posted) are expected to
@@ -153,24 +218,25 @@ the *first* slash, and `model` keeps the rest — opencode models are themselves
 slashed, e.g. `opencode/github-copilot/gpt-5.4` parses to
 `{instanceId: "opencode", model: "github-copilot/gpt-5.4"}`.
 
-### thread.create vs thread.turn.start
+### thread.create vs orchestration.launchThread
 
 `thread create` in t3ctl creates an *idle* thread with no messages — it does not
-start the agent. The UI never produces this state: it always fires
-`thread.create` immediately followed by `thread.turn.start`, a single command
-that carries the first message inline (`message: {messageId, role, text,
-attachments}` plus a `titleSeed`).
+start the agent. The UI never produces this state: it always starts a thread
+with its first message.
 
-`thread.message-sent` and `thread.turn-start-requested` are the resulting
-*events*, not commands — don't try to dispatch them.
-
-One asymmetry to know about: the client-side `thread.turn.start` schema requires
-`runtimeMode`/`interactionMode` explicitly, while the server-side schema
-defaults them. t3ctl always sends both.
+`thread create --new-worktree` does what the UI does. In protocol 1 that is one
+`thread.turn.start` over the socket, carrying a `bootstrap` that creates the
+thread, prepares the worktree and runs the setup script before the server
+answers; a failed fetch or checkout deletes the thread again, and the error says
+so (`bootstrapThreadDisposition`). In protocol 2 it is one
+`orchestration.launchThread` call (with `workspaceStrategy: {type: "worktree",
+baseRef, branch, startFromOrigin: true}`), which answers once the thread
+exists; the worktree and setup script carry on in the background as the run's
+preparation, so a failure there shows in the thread, not in t3ctl's output.
 
 ### Simple thread commands
 
-`SIMPLE_THREAD_COMMANDS` in `t3ctl.mjs` is exactly the set of commands whose
+`SIMPLE_THREAD_COMMANDS` in `src/t3ctl.ts` is exactly the set of commands whose
 entire payload is `{commandId, threadId}`, verified against the contracts:
 
 ```
@@ -195,20 +261,21 @@ the list.
 
 ## Derived thread status
 
-The server does not send a single status field; t3ctl derives one. Order
-matters — most urgent wins, and `archived`/`deleted` short-circuit before
-anything else is considered:
+Neither protocol sends a status that covers snoozing, settling and plans, so
+t3ctl derives its own. Order matters — most urgent wins, and
+`archived`/`deleted` short-circuit before anything else is considered. Each row
+reads both protocols' fields; a thread only ever carries one set:
 
-| Status | Condition |
-|---|---|
-| `deleted` | `deletedAt` |
-| `archived` | `archivedAt` |
-| `running` | `session.activeTurnId` or `session.status === "running"` |
-| `error` | `session.status === "error"` or `latestTurn.state === "error"` |
-| `snoozed` | `snoozedUntil` is in the future |
-| `needs-review` | `proposedPlans` is non-empty |
-| `settled` | `settledAt && !unsettledAt` |
-| `idle` | fallback |
+| Status | Protocol 1 | Protocol 2 |
+|---|---|---|
+| `deleted` | `deletedAt` | same |
+| `archived` | `archivedAt` | same |
+| `running` | `session.activeTurnId` or `session.status === "running"` | `activeRunId`, or `status` is `preparing`, `queued`, `starting`, `running` or `waiting` |
+| `error` | `session.status === "error"` or `latestTurn.state === "error"` | `status === "failed"` or `lastError` |
+| `snoozed` | `snoozedUntil` is in the future | same |
+| `needs-review` | `proposedPlans` is non-empty | `hasActionableProposedPlan` |
+| `settled` | `settledAt && !unsettledAt` | same |
+| `idle` | fallback | same |
 
 If you add a status, add it to `ICON` too — `ls` prints `?` for anything
 unmapped rather than crashing.
@@ -219,19 +286,30 @@ unmapped rather than crashing.
 API, so it is worth explaining why.
 
 The API can answer "which prompts did a human type today" only in N+1 requests:
-the snapshot lists threads but carries **no messages**, so every candidate
+the shell snapshot lists threads but carries **no messages**, so every candidate
 thread needs its own `GET /api/orchestration/threads/:id`. The host's own
 SQLite answers it in one join. On a machine with 200-odd threads that is the
 difference between a few hundred requests and 30ms.
 
-The store is `~/.t3/userdata/state.sqlite`. Three projection tables matter, and
-they are projections — rebuilt from `orchestration_events`, never authoritative:
+Each protocol has its own store in `~/.t3/userdata/`: `state.sqlite` for 1 and
+`statev2.sqlite` for 2. A server that moves to protocol 2 leaves `state.sqlite`
+behind, frozen at the switch, and reading it then returns nothing newer without
+an error. So `statev2.sqlite` wins whenever it exists, and `state.sqlite` is
+read only where it does not. The choice is made from the files, not by asking
+the server: reading the store needs no server running. `LOCAL_STORES` holds
+both statements. Three projection tables matter in each, and they are
+projections — rebuilt from the event log, never authoritative:
 
-| Table | Columns used |
-|---|---|
-| `projection_thread_messages` | `message_id`, `thread_id`, `role`, `text`, `created_at` |
-| `projection_threads` | `thread_id`, `project_id`, `deleted_at` |
-| `projection_projects` | `project_id`, `workspace_root`, `deleted_at` |
+| Protocol 1 table | Protocol 2 table | Columns used |
+|---|---|---|
+| `projection_thread_messages` | `orchestration_v2_projection_messages` | `message_id`, `thread_id`, `role`, `created_at`, and `text` (protocol 2: `text` and `createdBy` from `payload_json`) |
+| `projection_threads` | `orchestration_v2_projection_threads` | `thread_id`, `project_id`, `deleted_at` |
+| `projection_projects` | `projection_projects` | `project_id`, `workspace_root`, `deleted_at` |
+
+A prompt is a `user`-role message, and in protocol 2 one whose `createdBy` is
+`user`: an agent can write a user-role message into a thread too (a delegated
+task's brief), and that is not something a person typed. Protocol 1 messages
+carry no author, and only people wrote user-role ones.
 
 Reading them is a stability bet of the same kind as the HTTP endpoints, but a
 separate one: a T3 Code release could rename a column without touching the API.
@@ -240,9 +318,10 @@ strategies survive.
 
 **The invariant: every strategy returns the same rows.** A prompt must not
 appear or vanish depending on how a host happens to be reachable. `PROMPT_SQL`
-is one constant, and the HTTP path deliberately filters only `deletedAt` — it
-does *not* also skip archived threads, because the SQL does not. If you change
-what one strategy excludes, change both.
+is one constant, and the HTTP path deliberately filters only `deletedAt` and
+`createdBy` — it does *not* also skip archived threads, because the SQL does
+not (which is why `snapshot()` merges the shell's `archivedThreads` back in).
+If you change what one strategy excludes, change both.
 
 The HTTP path does prefilter which threads it fetches (`mayHavePrompts`), but
 only on facts that cannot hide a row: a thread whose `updatedAt` predates the

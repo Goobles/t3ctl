@@ -132,7 +132,7 @@ test('export prompts needs a host registry like every other read', async () => {
 });
 
 // The export tests build a world instead of mocking one: a throwaway
-// state.sqlite plus a host registry, which between them decide which strategy
+// statev2.sqlite plus a host registry, which between them decide which strategy
 // the CLI picks. No server and no network — a host on loopback is read from the
 // database directly.
 //
@@ -169,11 +169,17 @@ const refusedRemoteOrigin = async () => {
   return `http://${ip}:${port}`;
 };
 
+// The columns PROMPT_SQL reads, from Orchestrator V2's statev2.sqlite. A
+// message's text and author sit in its JSON payload.
 const SCHEMA = `
   CREATE TABLE projection_projects (project_id TEXT, workspace_root TEXT, deleted_at TEXT);
-  CREATE TABLE projection_threads (thread_id TEXT, project_id TEXT, deleted_at TEXT);
-  CREATE TABLE projection_thread_messages (message_id TEXT, thread_id TEXT, role TEXT, text TEXT, created_at TEXT);
+  CREATE TABLE orchestration_v2_projection_threads (thread_id TEXT, project_id TEXT, deleted_at TEXT);
+  CREATE TABLE orchestration_v2_projection_messages (message_id TEXT, thread_id TEXT, role TEXT, created_at TEXT, payload_json TEXT);
 `;
+
+/** One message row's VALUES tuple; `text` may span lines. */
+const msg = (id, thread, role, text, at, createdBy = role === 'user' ? 'user' : 'agent') =>
+  `('${id}','${thread}','${role}','${at}',json_object('text','${text}','createdBy','${createdBy}'))`;
 
 /** A HOME with a host registry and a seeded state database. Returns its path. */
 const fixtureHome = (hosts, seed) => {
@@ -181,7 +187,7 @@ const fixtureHome = (hosts, seed) => {
   mkdirSync(join(home, '.t3', 'userdata'), { recursive: true });
   mkdirSync(join(home, '.config', 't3ctl'), { recursive: true });
   writeFileSync(join(home, '.config', 't3ctl', 'hosts.json'), JSON.stringify({ hosts }));
-  const db = new DatabaseSync(join(home, '.t3', 'userdata', 'state.sqlite'));
+  const db = new DatabaseSync(join(home, '.t3', 'userdata', 'statev2.sqlite'));
   db.exec(SCHEMA + seed(home));
   db.close();
   return home;
@@ -210,25 +216,25 @@ test('export prompts reads the local state database', needsSqlite, async () => {
       ('p1', '${h}/Code/alpha', NULL),
       ('p2', '${h}/elsewhere/beta', NULL),
       ('p3', '${h}/Code/gone', '2026-01-01T00:00:00.000Z');
-    INSERT INTO projection_threads VALUES
+    INSERT INTO orchestration_v2_projection_threads VALUES
       ('t1','p1',NULL), ('t2','p2',NULL), ('t3','p3',NULL), ('t4','p1','2026-01-01T00:00:00.000Z');
-    INSERT INTO projection_thread_messages VALUES
-      ('m1','t1','user','  hello   there  ','2026-09-14T10:00:00.000Z'),
-      ('m2','t1','assistant','not a prompt','2026-09-14T11:00:00.000Z'),
-      ('m3','t1','user','<user_query>
-unwrap me
-</user_query>','2026-09-14T12:00:00.000Z'),
-      ('m4','t2','user','outside the watched root','2026-09-14T13:00:00.000Z'),
-      ('m5','t3','user','project is deleted','2026-09-14T13:00:00.000Z'),
-      ('m6','t4','user','thread is deleted','2026-09-14T13:00:00.000Z'),
-      ('m7','t1','user','the day before','2026-09-13T23:59:59.999Z'),
-      ('m8','t1','user','the day after','2026-09-15T00:00:00.000Z');
+    INSERT INTO orchestration_v2_projection_messages VALUES
+      ${msg('m1', 't1', 'user', '  hello   there  ', '2026-09-14T10:00:00.000Z')},
+      ${msg('m2', 't1', 'assistant', 'not a prompt', '2026-09-14T11:00:00.000Z')},
+      ${msg('m3', 't1', 'user', '<user_query>\nunwrap me\n</user_query>', '2026-09-14T12:00:00.000Z')},
+      ${msg('m4', 't2', 'user', 'outside the watched root', '2026-09-14T13:00:00.000Z')},
+      ${msg('m5', 't3', 'user', 'project is deleted', '2026-09-14T13:00:00.000Z')},
+      ${msg('m6', 't4', 'user', 'thread is deleted', '2026-09-14T13:00:00.000Z')},
+      ${msg('m7', 't1', 'user', 'the day before', '2026-09-13T23:59:59.999Z')},
+      ${msg('m8', 't1', 'user', 'the day after', '2026-09-15T00:00:00.000Z')},
+      ${msg('m9', 't1', 'user', 'a delegated task brief', '2026-09-14T14:00:00.000Z', 'agent')};
   `);
   try {
     const { messages, unreachable } = await exportPrompts(home);
     assert.deepEqual(unreachable, []);
     // m2 is not a prompt, m4 is outside ~/Code, m5 and m6 hang off deleted rows,
-    // m7 and m8 fall outside the half-open window. That leaves m1 and m3.
+    // m7 and m8 fall outside the half-open window, and m9 was written by an
+    // agent, not typed by a person. That leaves m1 and m3.
     assert.deepEqual(messages.map((m) => m.messageId), ['m1', 'm3']);
     assert.equal(messages[0].text, 'hello there');   // whitespace collapsed
     assert.equal(messages[1].text, 'unwrap me');     // <user_query> unwrapped
@@ -241,11 +247,36 @@ unwrap me
   }
 });
 
+test('export prompts falls back to protocol 1\'s state.sqlite where there is no statev2.sqlite', needsSqlite, async () => {
+  const home = mkdtempSync(join(tmpdir(), 't3ctl-export-v1-'));
+  mkdirSync(join(home, '.t3', 'userdata'), { recursive: true });
+  mkdirSync(join(home, '.config', 't3ctl'), { recursive: true });
+  writeFileSync(join(home, '.config', 't3ctl', 'hosts.json'), JSON.stringify({ hosts: [LOCAL_HOST] }));
+  const db = new DatabaseSync(join(home, '.t3', 'userdata', 'state.sqlite'));
+  db.exec(`
+    CREATE TABLE projection_projects (project_id TEXT, workspace_root TEXT, deleted_at TEXT);
+    CREATE TABLE projection_threads (thread_id TEXT, project_id TEXT, deleted_at TEXT);
+    CREATE TABLE projection_thread_messages (message_id TEXT, thread_id TEXT, role TEXT, text TEXT, created_at TEXT);
+    INSERT INTO projection_projects VALUES ('p1', '${home}/Code/alpha', NULL);
+    INSERT INTO projection_threads VALUES ('t1','p1',NULL);
+    INSERT INTO projection_thread_messages VALUES
+      ('m1','t1','user','from protocol 1','2026-09-14T10:00:00.000Z'),
+      ('m2','t1','assistant','not a prompt','2026-09-14T11:00:00.000Z');
+  `);
+  db.close();
+  try {
+    const { messages } = await exportPrompts(home);
+    assert.deepEqual(messages.map((m) => [m.messageId, m.text]), [['m1', 'from protocol 1']]);
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
 test('the longest matching --watch root wins', needsSqlite, async () => {
   const home = fixtureHome([LOCAL_HOST], (h) => `
     INSERT INTO projection_projects VALUES ('p1', '${h}/Code/clients/acme', NULL);
-    INSERT INTO projection_threads VALUES ('t1','p1',NULL);
-    INSERT INTO projection_thread_messages VALUES ('m1','t1','user','hi','2026-09-14T10:00:00.000Z');
+    INSERT INTO orchestration_v2_projection_threads VALUES ('t1','p1',NULL);
+    INSERT INTO orchestration_v2_projection_messages VALUES ${msg('m1', 't1', 'user', 'hi', '2026-09-14T10:00:00.000Z')};
   `);
   try {
     const wide = await exportPrompts(home, ['--watch', `${home}/Code`]);
@@ -271,8 +302,8 @@ test('a host off loopback goes over HTTP, and its markers carry the host name', 
     [{ name: 'remotebox', origin: await refusedRemoteOrigin(), token: 'x' }],
     (h) => `
       INSERT INTO projection_projects VALUES ('p1', '${h}/Code/alpha', NULL);
-      INSERT INTO projection_threads VALUES ('t1','p1',NULL);
-      INSERT INTO projection_thread_messages VALUES ('m1','t1','user','over http','2026-09-14T10:00:00.000Z');
+      INSERT INTO orchestration_v2_projection_threads VALUES ('t1','p1',NULL);
+      INSERT INTO orchestration_v2_projection_messages VALUES ${msg('m1', 't1', 'user', 'over http', '2026-09-14T10:00:00.000Z')};
     `,
   );
   try {
@@ -339,45 +370,80 @@ const ok = (value) => ({ _tag: 'Success', value });
 /** An answer that cuts the connection instead of replying. */
 const DROP = Symbol('drop');
 
-/** What a git project answers by default: a feature branch checked out, `main` the default only on origin. */
-const defaultRpc = (request) => request.tag === 'vcs.listRefs'
-  ? ok({ isRepo: true, hasPrimaryRemote: true, nextCursor: null, totalCount: 2, refs: [
-    { name: 'feature', current: true, isDefault: false, worktreePath: '/tmp' },
-    { name: 'origin/main', isRemote: true, remoteName: 'origin', current: false, isDefault: true, worktreePath: null },
-  ] })
-  : ok({ sequence: 7 });
+/**
+ * What a git project answers by default: a feature branch checked out, `main`
+ * the default only on origin. A launched thread comes back already on its
+ * branch, with the worktree path the server picked.
+ */
+const defaultRpc = (request) => {
+  if (request.tag === 'vcs.listRefs') {
+    return ok({ isRepo: true, hasPrimaryRemote: true, nextCursor: null, totalCount: 2, refs: [
+      { name: 'feature', current: true, isDefault: false, worktreePath: '/tmp' },
+      { name: 'origin/main', isRemote: true, remoteName: 'origin', current: false, isDefault: true, worktreePath: null },
+    ] });
+  }
+  if (request.tag === 'orchestration.launchThread') {
+    const { threadId, workspaceStrategy: { branch } } = request.payload;
+    return ok({ threadId, resumed: false, projection: { thread: { id: threadId, branch, worktreePath: `/wt/alpha/${branch.replace(/\//g, '-')}` } } });
+  }
+  return ok({ sequence: 7 });
+};
 
-const fakeT3 = async (serverVersion, threads = [], answer = defaultRpc) => {
-  const dispatched = [];
+/**
+ * A T3 Code server, as far as t3ctl touches it, speaking orchestration
+ * `protocol` 1 or 2. Like the real ones, each serves only its own routes and
+ * answers anything else with the web app's index page; protocol 2 also refuses
+ * orchestration reads without its header, and is the only one whose descriptor
+ * names a protocol. `dispatched` is the commands received, in order: at
+ * POST /dispatch for protocol 1, over the socket for protocol 2.
+ */
+const fakeT3 = async (serverVersion, threads = [], answer = defaultRpc, protocol = 2) => {
   const rpc = [];
+  const projectMutations = [];
+  const httpDispatched = [];
+  const PROJECT = { id: 'p1', title: 'alpha', workspaceRoot: '/tmp', updatedAt: '2026-01-01' };
   const server = createHttpServer((req, res) => {
     const json = (body) => { res.setHeader('content-type', 'application/json'); res.end(JSON.stringify(body)); };
-    if (req.url === '/.well-known/t3/environment') return json({ environmentId: ENV_ID, label: 'box', serverVersion });
-    if (req.url === '/api/orchestration/snapshot') {
-      return json({ projects: [{ id: 'p1', title: 'alpha', workspaceRoot: '/tmp', updatedAt: '2026-01-01' }], threads });
-    }
-    if (req.url === '/api/orchestration/dispatch') {
-      let body = '';
-      req.on('data', (c) => { body += c; });
-      req.on('end', () => { dispatched.push(JSON.parse(body)); json({ sequence: 1 }); });
-      return;
+    if (req.url === '/.well-known/t3/environment') {
+      return json({ environmentId: ENV_ID, label: 'box', serverVersion, ...(protocol === 2 ? { orchestrationProtocolVersion: 2 } : {}) });
     }
     if (req.url === '/api/auth/websocket-ticket' && req.method === 'POST') {
       return json({ ticket: `ticket-for-${req.headers.authorization}`, expiresAt: '2026-01-01T00:05:00.000Z' });
     }
-    // A thread read back after a bootstrap carries the worktree the server made.
-    const detail = /^\/api\/orchestration\/threads\/([^/?]+)/.exec(req.url ?? '');
-    const started = detail && rpc.find((r) => r.payload?.threadId === detail[1]);
-    if (started) {
-      const { branch } = started.payload.bootstrap.prepareWorktree;
-      return json({ thread: { id: detail[1], branch, worktreePath: `/wt/alpha/${branch.replace(/\//g, '-')}` } });
+    if (protocol === 1) {
+      if (req.url === '/api/orchestration/snapshot') return json({ projects: [PROJECT], threads });
+      if (req.url === '/api/orchestration/dispatch' && req.method === 'POST') {
+        let body = '';
+        req.on('data', (c) => { body += c; });
+        req.on('end', () => { httpDispatched.push(JSON.parse(body)); json({ sequence: 1 }); });
+        return;
+      }
+      // A thread read back after a bootstrap carries the worktree the server made.
+      const detail = /^\/api\/orchestration\/threads\/([^/?]+)/.exec(req.url ?? '');
+      const started = detail && rpc.find((r) => r.payload?.threadId === detail[1]);
+      if (started) {
+        const { branch } = started.payload.bootstrap.prepareWorktree;
+        return json({ thread: { id: detail[1], branch, worktreePath: `/wt/alpha/${branch.replace(/\//g, '-')}` } });
+      }
+    } else if (req.url === '/api/orchestration/shell') {
+      if (req.headers['x-t3-orchestration-protocol'] !== '2') { res.statusCode = 400; return res.end(); }
+      return json({ schemaVersion: 1, snapshotSequence: 1, archivedThreads: [], threads, projects: [PROJECT] });
+    } else if (req.url === '/api/projects/mutate' && req.method === 'POST') {
+      let body = '';
+      req.on('data', (c) => { body += c; });
+      req.on('end', () => { const m = JSON.parse(body); projectMutations.push(m); json({ id: m.projectId, title: m.title }); });
+      return;
     }
-    res.statusCode = 404; res.end();
+    res.setHeader('content-type', 'text/html'); res.end('<!doctype html><html></html>');
   });
   acceptWebSocket(server, rpc, answer);
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
   return {
-    origin: `http://127.0.0.1:${server.address().port}`, dispatched, rpc, server,
+    origin: `http://127.0.0.1:${server.address().port}`, rpc, server, projectMutations,
+    get dispatched() {
+      return protocol === 1 ? httpDispatched
+        : rpc.filter((r) => r.tag === 'orchestration.dispatchCommand').map((r) => r.payload);
+    },
     close: () => server.close(),
   };
 };
@@ -461,15 +527,17 @@ const THREAD = {
   title: 'scratch', updatedAt: '2026-01-01', runtimeMode: 'full-access',
 };
 
-/** A fake host serving THREAD, with the HOME whose registry points at it. */
-const threadWorld = async () => {
-  const server = await fakeT3('0.0.45', [THREAD]);
-  const home = splitHome({ name: 'box', origin: server.origin, token: 'tok', environmentId: ENV_ID }, server.origin);
-  return {
-    ...server, home,
-    close: () => { server.close(); rmSync(home, { recursive: true, force: true }); },
-  };
+/** A fake server plus a HOME whose registry points at it; `dispatched` stays live. */
+const world = (server, hostFields = {}) => {
+  const home = splitHome({ name: 'box', origin: server.origin, token: 'tok', environmentId: ENV_ID, ...hostFields }, server.origin);
+  return Object.defineProperty(
+    { ...server, home, close: () => { server.close(); rmSync(home, { recursive: true, force: true }); } },
+    'dispatched', { get: () => server.dispatched },
+  );
 };
+
+/** A fake host serving `threads` (THREAD by default). */
+const threadWorld = async (threads = [THREAD]) => world(await fakeT3('0.0.45', threads));
 
 /** Split a recorded command into its generated id and the rest, which is fixed. */
 const withoutCommandId = (command) => {
@@ -547,11 +615,11 @@ test('runtime-mode sets the mode of an existing thread, app names included', asy
   try {
     const { code, stdout, stderr } = await cliIn(w.home, 'thread', 'runtime-mode', 'scratch', 'supervised');
     assert.equal(code, 0, stderr);
-    const { createdAt, ...rest } = withoutCommandId(w.dispatched[0]);
-    assert.deepEqual(rest, {
+    assert.deepEqual(withoutCommandId(w.dispatched[0]), {
       type: 'thread.runtime-mode.set', threadId: THREAD.id, runtimeMode: 'approval-required',
     });
-    assert.equal(createdAt, new Date(createdAt).toISOString(), 'createdAt must be an ISO instant');
+    // Protocol 2 only takes commands over the socket, and only with the protocol flag.
+    assert.match(w.rpc[0].url, /^\/ws\?wsTicket=ticket-for-Bearer%20tok&orchestrationProtocol=2$/);
     // The thread's old mode comes from the snapshot, so the line says what changed.
     assert.match(stdout, /full-access ->.*approval-required.*\(Supervised\)/);
 
@@ -572,67 +640,142 @@ test('the app names work wherever --runtime-mode is accepted', async () => {
     assert.equal((await cliIn(w.home, 'thread', 'create', 'alpha', 'hello', '--runtime-mode', 'supervised')).code, 0);
     assert.equal(w.dispatched[0].runtimeMode, 'approval-required');
 
-    assert.equal((await cliIn(w.home, 'thread', 'send', 'scratch', 'hi', '--runtime-mode', 'full')).code, 0);
-    assert.equal(w.dispatched[1].runtimeMode, 'full-access');
+    // message.dispatch has no mode, so send sets it first, then sends.
+    assert.equal((await cliIn(w.home, 'thread', 'send', 'scratch', 'hi', '--runtime-mode', 'supervised')).code, 0);
+    assert.deepEqual(w.dispatched.slice(1).map((c) => c.type), ['thread.runtime-mode.set', 'message.dispatch']);
+    assert.equal(w.dispatched[1].runtimeMode, 'approval-required');
 
     const bad = await cliIn(w.home, 'thread', 'create', 'alpha', 'hello', '--runtime-mode', 'yolo');
     assert.notEqual(bad.code, 0);
     assert.match(bad.stderr, /unknown runtime mode/);
-    assert.equal(w.dispatched.length, 2);
+    assert.equal(w.dispatched.length, 3);
+  } finally { w.close(); }
+});
+
+// ---- protocol 2 commands ------------------------------------------------------
+// The commands whose shape changed when the server moved to Orchestrator V2.
+
+const BUSY = { ...THREAD, id: '22222222-2222-4222-8222-222222222222', title: 'busy', status: 'running', activeRunId: 'run:busy:1' };
+
+test('send dispatches a message that starts at once, or queues behind a running thread', async () => {
+  const w = await threadWorld([THREAD, BUSY]);
+  try {
+    const idle = await cliIn(w.home, 'thread', 'send', 'scratch', 'hello', 'there');
+    assert.equal(idle.code, 0, idle.stderr);
+    const { messageId, ...rest } = withoutCommandId(w.dispatched[0]);
+    assert.match(messageId, /^[0-9a-f-]{36}$/);
+    assert.deepEqual(rest, {
+      type: 'message.dispatch', createdBy: 'user', creationSource: 'web', threadId: THREAD.id,
+      text: 'hello there', attachments: [], dispatchMode: { type: 'start_immediately' },
+    });
+    assert.match(idle.stdout, /started .*scratch/);
+
+    const busy = await cliIn(w.home, 'thread', 'send', 'busy', 'and then');
+    assert.equal(busy.code, 0, busy.stderr);
+    assert.deepEqual(w.dispatched[1].dispatchMode, { type: 'queue_after_active' });
+    assert.match(busy.stdout, /queued for .*busy/);
+  } finally { w.close(); }
+});
+
+test('interrupt stops the active run, and refuses a thread with nothing running', async () => {
+  const w = await threadWorld([THREAD, BUSY]);
+  try {
+    assert.equal((await cliIn(w.home, 'thread', 'interrupt', 'busy')).code, 0);
+    assert.deepEqual(withoutCommandId(w.dispatched[0]), { type: 'run.interrupt', threadId: BUSY.id, runId: BUSY.activeRunId });
+
+    const idle = await cliIn(w.home, 'thread', 'interrupt', 'scratch');
+    assert.notEqual(idle.code, 0);
+    assert.match(idle.stderr, /nothing is running in scratch/);
+    assert.equal(w.dispatched.length, 1);
+  } finally { w.close(); }
+});
+
+test('rename sends thread.metadata.update', async () => {
+  const w = await threadWorld();
+  try {
+    assert.equal((await cliIn(w.home, 'thread', 'rename', 'scratch', 'new', 'name')).code, 0);
+    assert.deepEqual(withoutCommandId(w.dispatched[0]), { type: 'thread.metadata.update', threadId: THREAD.id, title: 'new name' });
+  } finally { w.close(); }
+});
+
+test('thread create says who it is from, as protocol 2 requires', async () => {
+  const w = await threadWorld();
+  try {
+    assert.equal((await cliIn(w.home, 'thread', 'create', 'alpha', 'hello')).code, 0);
+    const { threadId, ...rest } = withoutCommandId(w.dispatched[0]);
+    assert.deepEqual(rest, {
+      type: 'thread.create', createdBy: 'user', creationSource: 'web', projectId: 'p1', title: 'hello',
+      modelSelection: { instanceId: 'claudeAgent', model: 'claude-opus-5' },
+      runtimeMode: 'full-access', interactionMode: 'default', branch: null, worktreePath: null,
+    });
+  } finally { w.close(); }
+});
+
+test('project create goes to the projects endpoint, not the orchestrator', async () => {
+  const w = await threadWorld();
+  try {
+    const { code, stderr } = await cliIn(w.home, 'project', 'create', 'beta', tmpdir());
+    assert.equal(code, 0, stderr);
+    const [{ commandId, projectId, ...rest }] = w.projectMutations;
+    assert.match(commandId, /^[0-9a-f-]{36}$/);
+    assert.match(projectId, /^[0-9a-f-]{36}$/);
+    assert.deepEqual(rest, { type: 'project.create', title: 'beta', workspaceRoot: tmpdir() });
+    assert.deepEqual(w.dispatched, []);
+  } finally { w.close(); }
+});
+
+test('ls reads thread status and provider from the shell snapshot', async () => {
+  const failed = { ...THREAD, id: '33333333-3333-4333-8333-333333333333', title: 'broken', status: 'failed', providerInstanceId: 'codex' };
+  const w = await threadWorld([THREAD, BUSY, failed]);
+  try {
+    const { code, stdout, stderr } = await cliIn(w.home, 'ls', '--json');
+    assert.equal(code, 0, stderr);
+    const threads = Object.fromEntries(JSON.parse(stdout).projects[0].threads.map((t) => [t.title, t]));
+    assert.equal(threads.busy.status, 'running');
+    assert.equal(threads.broken.status, 'error');
+    assert.equal(threads.broken.provider, 'codex');
+    assert.equal(threads.scratch.status, 'idle');
   } finally { w.close(); }
 });
 
 // ---- thread create --new-worktree --------------------------------------------
-// The worktree bootstrap exists only on the WebSocket RPC; over HTTP the server
-// drops it without a word. So the one thing every case asserts first is that
-// nothing went to the HTTP dispatch endpoint.
+// orchestration.launchThread creates the thread, the worktree and the first
+// message in one call, so the one thing every case asserts first is that no
+// separate thread.create or message.dispatch went out alongside it.
 
 /** A fake host whose RPC answers come from `answer`, with the HOME pointing at it. */
-const worktreeWorld = async (answer, hostFields = {}) => {
-  const server = await fakeT3('0.0.45', [], answer);
-  const home = splitHome({ name: 'box', origin: server.origin, token: 'tok', environmentId: ENV_ID, ...hostFields }, server.origin);
-  return { ...server, home, close: () => { server.close(); rmSync(home, { recursive: true, force: true }); } };
-};
+const worktreeWorld = async (answer, hostFields = {}) => world(await fakeT3('0.0.45', [], answer), hostFields);
 
-test('--new-worktree sends one bootstrapped turn start over the websocket, with the app\'s defaults', async () => {
+test('--new-worktree launches the thread in one call, with the app\'s defaults', async () => {
   const w = await worktreeWorld();
   try {
     const { code, stdout, stderr } = await cliIn(w.home, 'thread', 'create', 'alpha', 'fix', 'the', 'flake',
       '--new-worktree', '--message', 'find out why ci flakes');
     assert.equal(code, 0, stderr);
-    assert.deepEqual(w.dispatched, [], 'a bootstrap over HTTP is silently ignored, so nothing may go there');
-    assert.match(w.rpc[0].url, /^\/ws\?wsTicket=ticket-for-Bearer%20tok$/);
+    assert.deepEqual(w.dispatched, [], 'the launch makes the thread; nothing else may be dispatched');
+    assert.match(w.rpc[0].url, /^\/ws\?wsTicket=ticket-for-Bearer%20tok&orchestrationProtocol=2$/);
 
     // No --base: the default comes from the repo, and origin/main means `main`.
     assert.deepEqual(w.rpc[0].payload, { cwd: '/tmp', limit: 20 });
     assert.equal(w.rpc[0].tag, 'vcs.listRefs');
 
     const { tag, payload } = w.rpc[1];
-    assert.equal(tag, 'orchestration.dispatchCommand');
-    const { commandId, threadId, message, createdAt, bootstrap, ...rest } = payload;
+    assert.equal(tag, 'orchestration.launchThread');
+    const { commandId, threadId, initialMessage, workspaceStrategy, ...rest } = payload;
     assert.match(commandId, /^[0-9a-f-]{36}$/);
     assert.match(threadId, /^[0-9a-f-]{36}$/);
-    assert.equal(message.text, 'find out why ci flakes');
+    assert.equal(initialMessage.text, 'find out why ci flakes');
+    assert.deepEqual(initialMessage.attachments, []);
     assert.deepEqual(rest, {
-      type: 'thread.turn.start', runtimeMode: 'full-access', interactionMode: 'default',
+      creationSource: 'web', projectId: 'p1', title: 'fix the flake',
       modelSelection: { instanceId: 'claudeAgent', model: 'claude-opus-5' },
+      runtimeMode: 'full-access', interactionMode: 'default',
     });
-    assert.match(bootstrap.prepareWorktree.branch, /^t3code\/[0-9a-f]{8}$/, 'a temporary branch the server renames later');
-    assert.deepEqual(bootstrap, {
-      createThread: {
-        projectId: 'p1', title: 'fix the flake', modelSelection: rest.modelSelection,
-        runtimeMode: 'full-access', interactionMode: 'default',
-        branch: 'main', worktreePath: null, createdAt,
-      },
-      prepareWorktree: {
-        projectCwd: '/tmp', baseBranch: 'main', branch: bootstrap.prepareWorktree.branch,
-        startFromOrigin: true, requireWorktree: true,
-      },
-      runSetupScript: true,
-    });
+    assert.match(workspaceStrategy.branch, /^t3code\/[0-9a-f]{8}$/, 'a temporary branch the server renames later');
+    assert.deepEqual(workspaceStrategy, { type: 'worktree', baseRef: 'main', branch: workspaceStrategy.branch, startFromOrigin: true });
 
     // The path is the one the server reports, not one t3ctl made up.
-    assert.ok(stdout.includes(`worktree /wt/alpha/${bootstrap.prepareWorktree.branch.replace('/', '-')}`), stdout);
+    assert.ok(stdout.includes(`worktree /wt/alpha/${workspaceStrategy.branch.replace('/', '-')}`), stdout);
     assert.ok(stdout.includes(threadId), stdout);
   } finally { w.close(); }
 });
@@ -643,38 +786,27 @@ test('--base and --branch are sent as given, and skip the default-branch lookup'
     const { code, stderr } = await cliIn(w.home, 'thread', 'create', 'alpha', 'pin', 'deps',
       '--new-worktree', '--message', 'pin them', '--base', 'develop', '--branch', 'chore/pin-deps', '--runtime-mode', 'supervised');
     assert.equal(code, 0, stderr);
-    assert.deepEqual(w.rpc.map((r) => r.tag), ['orchestration.dispatchCommand']);
-    const { bootstrap, runtimeMode } = w.rpc[0].payload;
-    assert.equal(bootstrap.prepareWorktree.baseBranch, 'develop');
-    assert.equal(bootstrap.prepareWorktree.branch, 'chore/pin-deps');
-    assert.equal(bootstrap.createThread.branch, 'develop');
+    assert.deepEqual(w.rpc.map((r) => r.tag), ['orchestration.launchThread']);
+    const { workspaceStrategy, runtimeMode } = w.rpc[0].payload;
+    assert.equal(workspaceStrategy.baseRef, 'develop');
+    assert.equal(workspaceStrategy.branch, 'chore/pin-deps');
     assert.equal(runtimeMode, 'approval-required');
-    assert.equal(bootstrap.createThread.runtimeMode, 'approval-required');
   } finally { w.close(); }
 });
 
 const failWith = (error) => (request) => request.tag === 'vcs.listRefs' ? defaultRpc(request) : {
-  _tag: 'Failure', cause: [{ _tag: 'Fail', error: { _tag: 'OrchestrationDispatchCommandError', ...error } }],
+  _tag: 'Failure', cause: [{ _tag: 'Fail', error: { _tag: 'OrchestrationV2ThreadLaunchError', ...error } }],
 };
 
-test('a failed worktree setup reports the server\'s reason and what became of the thread', async () => {
-  // The two dispositions the server reports, each with a reason it really pairs
-  // it with: requireWorktree is checked before the thread exists (ws.ts), while
-  // a failed checkout comes after createThread and rolls it back.
-  const cases = [
-    [{ message: 'A separate worktree requires a Git repository and a base branch with a commit.', bootstrapThreadDisposition: 'not-created' }, /no thread was created/],
-    [{ message: 'Git command failed in GitVcsDriver.createWorktree: disk full', bootstrapThreadDisposition: 'deleted' }, /the server deleted the thread it had created/],
-  ];
-  for (const [error, outcome] of cases) {
-    const w = await worktreeWorld(failWith(error));
-    try {
-      const { code, stderr } = await cliIn(w.home, 'thread', 'create', 'alpha', 'doomed', '--new-worktree', '--message', 'go');
-      assert.notEqual(code, 0);
-      assert.ok(stderr.includes(error.message), stderr);
-      assert.match(stderr, outcome);
-      assert.doesNotMatch(stderr, /carries on on the server/, 'the server answered, so nothing is left running');
-    } finally { w.close(); }
-  }
+test('a refused launch reports the server\'s reason', async () => {
+  const error = { message: 'Project p1 has no Git repository to make a worktree in.' };
+  const w = await worktreeWorld(failWith(error));
+  try {
+    const { code, stderr } = await cliIn(w.home, 'thread', 'create', 'alpha', 'doomed', '--new-worktree', '--message', 'go');
+    assert.notEqual(code, 0);
+    assert.ok(stderr.includes(`orchestration.launchThread failed: ${error.message}`), stderr);
+    assert.doesNotMatch(stderr, /carries on on the server/, 'the server answered, so nothing is left running');
+  } finally { w.close(); }
 });
 
 test('a connection lost mid-dispatch says the setup may still be running', async () => {
@@ -719,7 +851,7 @@ test('without --base, a repo with no known default branch asks for one', async (
     assert.notEqual(code, 0);
     assert.match(stderr, /origin\/HEAD is not set — pass --base <branch>/);
     assert.doesNotMatch(stderr, /carries on on the server/, 'nothing was dispatched, so nothing is under way');
-    assert.deepEqual(w.rpc.map((r) => r.tag), ['vcs.listRefs'], 'nothing may be dispatched without a base');
+    assert.deepEqual(w.rpc.map((r) => r.tag), ['vcs.listRefs'], 'nothing may be launched without a base');
   } finally { w.close(); }
 });
 
@@ -739,6 +871,144 @@ test('--new-worktree flag mistakes are caught before anything is sent', async ()
       assert.match(stderr, expected);
     }
     assert.deepEqual(w.dispatched, []);
+    assert.deepEqual(w.rpc, []);
+  } finally { w.close(); }
+});
+
+// ---- protocol 1 servers -------------------------------------------------------
+// A server whose descriptor names no protocol is from before Orchestrator V2.
+// t3ctl must still drive it exactly as before: reads from /snapshot, commands
+// to POST /dispatch in protocol 1's shapes, and the socket only for a worktree
+// bootstrap. These pin those shapes, so a protocol 2 change cannot leak in.
+
+const v1World = async (threads = [THREAD], answer = defaultRpc) => world(await fakeT3('0.0.43', threads, answer, 1));
+
+/** Split off the fields every protocol 1 command stamps: a uuid commandId and an ISO createdAt. */
+const v1Command = (command) => {
+  const { createdAt, ...rest } = withoutCommandId(command);
+  assert.equal(createdAt, new Date(createdAt).toISOString(), 'createdAt must be an ISO instant');
+  return rest;
+};
+
+test('protocol 1: an undeclared protocol means /snapshot and /dispatch, never the socket', async () => {
+  const w = await v1World();
+  try {
+    const ls = await cliIn(w.home, 'ls', '--json');
+    assert.equal(ls.code, 0, ls.stderr);
+    assert.equal(JSON.parse(ls.stdout).projects[0].threads[0].title, 'scratch');
+
+    const { code, stderr } = await cliIn(w.home, 'thread', 'runtime-mode', 'scratch', 'auto');
+    assert.equal(code, 0, stderr);
+    assert.deepEqual(v1Command(w.dispatched[0]), { type: 'thread.runtime-mode.set', threadId: THREAD.id, runtimeMode: 'auto' });
+    assert.deepEqual(w.rpc, [], 'protocol 1 takes plain commands over HTTP');
+  } finally { w.close(); }
+});
+
+test('protocol 1: send, interrupt and rename keep their protocol 1 commands', async () => {
+  const w = await v1World();
+  try {
+    assert.equal((await cliIn(w.home, 'thread', 'send', 'scratch', 'hi', '--runtime-mode', 'supervised')).code, 0);
+    const { message, ...turn } = v1Command(w.dispatched[0]);
+    assert.deepEqual(turn, { type: 'thread.turn.start', threadId: THREAD.id, runtimeMode: 'approval-required', interactionMode: 'default' });
+    assert.equal(message.role, 'user');
+    assert.equal(message.text, 'hi');
+
+    // No active run needed: protocol 1 interrupts the thread, not a run.
+    assert.equal((await cliIn(w.home, 'thread', 'interrupt', 'scratch')).code, 0);
+    assert.deepEqual(withoutCommandId(w.dispatched[1]), { type: 'thread.turn.interrupt', threadId: THREAD.id });
+
+    assert.equal((await cliIn(w.home, 'thread', 'rename', 'scratch', 'renamed')).code, 0);
+    assert.deepEqual(withoutCommandId(w.dispatched[2]), { type: 'thread.meta.update', threadId: THREAD.id, title: 'renamed' });
+  } finally { w.close(); }
+});
+
+test('protocol 1: thread and project create carry createdAt, and go to /dispatch', async () => {
+  const w = await v1World();
+  try {
+    assert.equal((await cliIn(w.home, 'thread', 'create', 'alpha', 'hello')).code, 0);
+    const { threadId, ...thread } = v1Command(w.dispatched[0]);
+    assert.deepEqual(thread, {
+      type: 'thread.create', projectId: 'p1', title: 'hello',
+      modelSelection: { instanceId: 'claudeAgent', model: 'claude-opus-5' },
+      runtimeMode: 'full-access', interactionMode: 'default', branch: null, worktreePath: null,
+    });
+
+    assert.equal((await cliIn(w.home, 'project', 'create', 'beta', tmpdir())).code, 0);
+    const { projectId, ...project } = v1Command(w.dispatched[1]);
+    assert.deepEqual(project, { type: 'project.create', title: 'beta', workspaceRoot: tmpdir() });
+  } finally { w.close(); }
+});
+
+test('protocol 1: ls reads status and provider from the session', async () => {
+  const running = { ...THREAD, id: '44444444-4444-4444-8444-444444444444', title: 'busy', session: { status: 'running', providerName: 'codex', activeTurnId: 't1' } };
+  const w = await v1World([THREAD, running]);
+  try {
+    const threads = Object.fromEntries(JSON.parse((await cliIn(w.home, 'ls', '--json')).stdout).projects[0].threads.map((t) => [t.title, t]));
+    assert.equal(threads.busy.status, 'running');
+    assert.equal(threads.busy.provider, 'codex');
+    assert.equal(threads.scratch.status, 'idle');
+  } finally { w.close(); }
+});
+
+test('protocol 1: --new-worktree sends one bootstrapped turn start over the websocket', async () => {
+  const w = await v1World([]);
+  try {
+    const { code, stdout, stderr } = await cliIn(w.home, 'thread', 'create', 'alpha', 'fix', 'the', 'flake',
+      '--new-worktree', '--message', 'find out why ci flakes');
+    assert.equal(code, 0, stderr);
+    assert.deepEqual(w.dispatched, [], 'a bootstrap over HTTP is silently ignored, so nothing may go there');
+    assert.match(w.rpc[0].url, /^\/ws\?wsTicket=ticket-for-Bearer%20tok$/, 'no protocol 2 flag on a protocol 1 socket');
+    assert.deepEqual(w.rpc.map((r) => r.tag), ['vcs.listRefs', 'orchestration.dispatchCommand']);
+
+    const { type, message, bootstrap, createdAt, modelSelection, runtimeMode, interactionMode } = w.rpc[1].payload;
+    assert.equal(type, 'thread.turn.start');
+    assert.equal(message.text, 'find out why ci flakes');
+    assert.match(bootstrap.prepareWorktree.branch, /^t3code\/[0-9a-f]{8}$/);
+    assert.deepEqual(bootstrap, {
+      createThread: {
+        projectId: 'p1', title: 'fix the flake', modelSelection, runtimeMode, interactionMode,
+        branch: 'main', worktreePath: null, createdAt,
+      },
+      prepareWorktree: {
+        projectCwd: '/tmp', baseBranch: 'main', branch: bootstrap.prepareWorktree.branch,
+        startFromOrigin: true, requireWorktree: true,
+      },
+      runSetupScript: true,
+    });
+    // The path is the one the server reports, read back from the thread.
+    assert.ok(stdout.includes(`worktree /wt/alpha/${bootstrap.prepareWorktree.branch.replace('/', '-')}`), stdout);
+  } finally { w.close(); }
+});
+
+test('protocol 1: a failed bootstrap reports what became of the thread', async () => {
+  const cases = [
+    [{ message: 'A separate worktree requires a Git repository and a base branch with a commit.', bootstrapThreadDisposition: 'not-created' }, /no thread was created/],
+    [{ message: 'Git command failed in GitVcsDriver.createWorktree: disk full', bootstrapThreadDisposition: 'deleted' }, /the server deleted the thread it had created/],
+  ];
+  for (const [error, outcome] of cases) {
+    const w = await v1World([], (request) => request.tag === 'vcs.listRefs' ? defaultRpc(request) : {
+      _tag: 'Failure', cause: [{ _tag: 'Fail', error: { _tag: 'OrchestrationDispatchCommandError', ...error } }],
+    });
+    try {
+      const { code, stderr } = await cliIn(w.home, 'thread', 'create', 'alpha', 'doomed', '--new-worktree', '--message', 'go');
+      assert.notEqual(code, 0);
+      assert.ok(stderr.includes(error.message), stderr);
+      assert.match(stderr, outcome);
+    } finally { w.close(); }
+  }
+});
+
+test('a protocol newer than t3ctl knows is refused before anything is sent', async () => {
+  const w = await threadWorld();
+  w.server.removeAllListeners('request');
+  w.server.on('request', (req, res) => {
+    res.setHeader('content-type', 'application/json');
+    res.end(JSON.stringify({ environmentId: ENV_ID, label: 'box', serverVersion: '0.1.0', orchestrationProtocolVersion: 3 }));
+  });
+  try {
+    const { code, stderr } = await cliIn(w.home, 'thread', 'runtime-mode', 'scratch', 'auto');
+    assert.notEqual(code, 0);
+    assert.match(stderr, /speaks orchestration protocol 3, which this t3ctl does not know/);
     assert.deepEqual(w.rpc, []);
   } finally { w.close(); }
 });

@@ -464,7 +464,7 @@ t3ctl export prompts --since 2026-09-14 --until 2026-09-15
 ```
 29 prompts  2026-09-14T00:00:00.000Z -> 2026-09-15T00:00:00.000Z
 
-agentbox  29  local state.sqlite
+agentbox  29  local state database
   @clients/dsl  28
   t3ctl          1
 ```
@@ -519,7 +519,7 @@ Same rows either way; only the cost differs.
 
 | Host | How | Cost |
 |---|---|---|
-| Origin on loopback | Reads `~/.t3/userdata/state.sqlite` directly | One query |
+| Origin on loopback | Reads `~/.t3/userdata/statev2.sqlite` directly (`state.sqlite` on a server from before Orchestrator V2) | One query |
 | Anything else | Snapshot, then one fetch per thread that could match | N+1 requests |
 
 The snapshot is filtered by each thread's `updatedAt` before anything is
@@ -625,7 +625,8 @@ Worth knowing before you build a workflow on this:
 - **Unofficial.** Not affiliated with or supported by T3 Tools. Written against
   T3 Code Nightly's HTTP API, which is not a documented public API — **endpoints
   and payloads can change without warning** and a T3 Code update may break t3ctl
-  until it catches up.
+  until it catches up. t3ctl speaks both orchestration protocols T3 Code has
+  used (Orchestrator V2 and the one before it), and asks each server which it runs.
 - **A host is only reachable while its T3 Code server is running.** t3ctl can't
   wake a machine or queue work for later. If the desktop app is closed and no
   `t3 serve` is running, that host is `unreachable` — except an ssh-registered

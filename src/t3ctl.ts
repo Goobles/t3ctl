@@ -13,8 +13,10 @@ import os from 'node:os';
 import path from 'node:path';
 
 // ---- domain types -------------------------------------------------------
-// Shapes are the subset of T3 Code's API that t3ctl actually reads. The full
-// schemas live in packages/contracts/src/orchestration.ts upstream.
+// Shapes are the subset of T3 Code's API that t3ctl actually reads. T3 Code
+// speaks one of two orchestration protocols (see "protocol detection" below):
+// 1 is packages/contracts/src/orchestration.ts upstream, 2 ("Orchestrator V2")
+// is orchestrationV2.ts, with project mutations in project.ts.
 
 type Host = {
   name: string;
@@ -35,6 +37,8 @@ type Descriptor = {
   environmentId: string;
   label: string;
   serverVersion: string;
+  /** Absent on servers from before protocol negotiation, which all speak protocol 1. */
+  orchestrationProtocolVersion?: number;
   platform?: { os: string; arch: string };
 };
 
@@ -42,12 +46,6 @@ type Descriptor = {
 type ModelOption = { id: string; value: string | boolean };
 
 type ModelSelection = { instanceId: string; model: string; options?: ModelOption[] };
-
-type Session = {
-  status: string;
-  providerName?: string | null;
-  activeTurnId?: string | null;
-};
 
 type Thread = {
   id: string;
@@ -64,18 +62,29 @@ type Thread = {
   snoozedUntil?: string | null;
   runtimeMode?: string;
   modelSelection?: ModelSelection | null;
-  session?: Session | null;
+  // Protocol 2 fields.
+  providerInstanceId?: string | null;
+  /** `idle`, or the status of the latest run (`running`, `failed`, `completed`, ...). */
+  status?: string;
+  activeRunId?: string | null;
+  lastError?: string | null;
+  hasActionableProposedPlan?: boolean;
+  // Protocol 1 fields.
+  session?: { status: string; providerName?: string | null; activeTurnId?: string | null } | null;
   latestTurn?: { state?: string } | null;
   proposedPlans?: unknown[];
   titleRegeneration?: unknown | null;
-  /** Only ever populated by the per-thread endpoint; the snapshot leaves it empty. */
+  /** Only ever populated by the per-thread endpoint; the shell snapshot has no messages. */
   messages?: ThreadMessage[];
 };
 
-/** A message as `thread.message-sent` carries it, which is what the detail endpoint serialises. */
+/** A conversation message from a thread projection. */
 type ThreadMessage = {
-  messageId?: string;
   id?: string;
+  /** Protocol 1's name for `id`. */
+  messageId?: string;
+  /** Protocol 2: `user` for a person's message; `agent` when an agent wrote it into the thread. */
+  createdBy?: string;
   role?: string;
   text?: string;
   createdAt?: string;
@@ -119,24 +128,85 @@ const writeHosts = (hosts: Host[]): void => {
   fs.writeFileSync(HOSTS_FILE, JSON.stringify({ hosts }, null, 2), { mode: 0o600 });
 };
 
-const snapshot = async (host: Host): Promise<Snapshot> => {
-  await ensureTunnel(host);
-  const res = await fetch(`${host.origin}/api/orchestration/snapshot`, {
-    headers: host.token ? { authorization: `Bearer ${host.token}` } : {},
-    signal: AbortSignal.timeout(host.timeoutMs ?? 15000),
-  });
-  if (!res.ok) throw new Error(`${host.name}: HTTP ${res.status} ${await res.text().catch(() => '')}`.trim());
-  return (await res.json()) as Snapshot;
+// ---- protocol detection ---------------------------------------------------
+// T3 Code moved from orchestration protocol 1 to 2 ("Orchestrator V2"), and the
+// two share almost no routes: protocol 1 reads /api/orchestration/snapshot and
+// takes commands at POST /api/orchestration/dispatch; protocol 2 reads
+// /api/orchestration/shell and takes commands only over the websocket, under
+// other names. Neither answers the other's routes with an error — an unknown
+// GET gets the web app's index.html — so the protocol is asked for, not guessed:
+// the environment descriptor carries `orchestrationProtocolVersion`, and is
+// missing it on servers from before protocol negotiation, which speak 1.
+type Protocol = 1 | 2;
+
+// Asked once per host per run. Not stored in hosts.json: a server can update
+// between two runs, and the descriptor is one small unauthenticated request.
+const protocols = new Map<string, Promise<Protocol>>();
+
+const protocolOf = (host: Host): Promise<Protocol> => {
+  let known = protocols.get(host.origin);
+  if (!known) {
+    known = (async () => {
+      await ensureTunnel(host);
+      const { orchestrationProtocolVersion: v } = await probe(host.origin, host.timeoutMs ?? 5000);
+      if (v === undefined || v === 1) return 1;
+      if (v === 2) return 2;
+      throw new Error(`${host.name} speaks orchestration protocol ${v}, which this t3ctl does not know — update t3ctl`);
+    })();
+    // A failed probe is not remembered, so a later call in the same run can retry.
+    known.catch(() => protocols.delete(host.origin));
+    protocols.set(host.origin, known);
+  }
+  return known;
 };
 
-// Derived status. Order matters: most urgent wins.
+// Protocol 2 rejects orchestration reads without this header (HTTP 400) and
+// closes a socket opened without the query parameter
+// (packages/contracts/src/environment.ts).
+const PROTOCOL_2_HEADER = { 'x-t3-orchestration-protocol': '2' };
+const PROTOCOL_2_QUERY = 'orchestrationProtocol=2';
+
+const authHeaders = (host: Host): Record<string, string> => (host.token ? { authorization: `Bearer ${host.token}` } : {});
+
+/** GET a JSON orchestration endpoint, failing loudly on anything that is not JSON. */
+/** GET a JSON orchestration endpoint in the host's protocol, failing loudly on anything that is not JSON. */
+const getJson = async <T>(host: Host, route: string): Promise<T> => {
+  const protocol = await protocolOf(host);
+  const res = await fetch(`${host.origin}${route}`, {
+    headers: { ...authHeaders(host), ...(protocol === 2 ? PROTOCOL_2_HEADER : {}) },
+    signal: AbortSignal.timeout(host.timeoutMs ?? 15000),
+  });
+  const body = await res.text();
+  if (!res.ok) throw new Error(`${host.name}: HTTP ${res.status} ${body.slice(0, 300)}`.trim());
+  try {
+    return JSON.parse(body) as T;
+  } catch {
+    throw new Error(`${host.name}: ${route} did not answer with JSON (orchestration protocol ${protocol})`);
+  }
+};
+
+// Protocol 2's shell snapshot only carries live projects and threads; archived
+// threads come in their own list, merged in so `ls --all` still shows them.
+const snapshot = async (host: Host): Promise<Snapshot> => {
+  if (await protocolOf(host) === 1) return getJson<Snapshot>(host, '/api/orchestration/snapshot');
+  const shell = await getJson<Snapshot & { archivedThreads?: Thread[] }>(host, '/api/orchestration/shell');
+  return { snapshotSequence: shell.snapshotSequence, projects: shell.projects, threads: [...shell.threads, ...(shell.archivedThreads ?? [])] };
+};
+
+// Run statuses that mean the thread is busy (OrchestrationV2RunStatus).
+const ACTIVE_RUN_STATUSES = new Set(['preparing', 'queued', 'starting', 'running', 'waiting']);
+
+// Derived status. Order matters: most urgent wins. Each line reads the fields
+// of both protocols; a thread only ever carries one protocol's set.
 const threadStatus = (t: Thread): ThreadStatus => {
   if (t.deletedAt) return 'deleted';
   if (t.archivedAt) return 'archived';
+  if (t.activeRunId || ACTIVE_RUN_STATUSES.has(t.status ?? '')) return 'running';
   if (t.session?.activeTurnId || t.session?.status === 'running') return 'running';
+  if (t.status === 'failed' || t.lastError) return 'error';
   if (t.session?.status === 'error' || t.latestTurn?.state === 'error') return 'error';
   if (t.snoozedUntil && new Date(t.snoozedUntil) > new Date()) return 'snoozed';
-  if (t.proposedPlans?.length) return 'needs-review';
+  if (t.hasActionableProposedPlan || t.proposedPlans?.length) return 'needs-review';
   if (t.settledAt && !t.unsettledAt) return 'settled';
   return 'idle';
 };
@@ -189,7 +259,7 @@ const cmdLs = async ({ threads: showThreads, all: showAll, json: asJson }: LsOpt
         host: host.name, id: p.id, title: p.title, workspaceRoot: p.workspaceRoot,
         threads: snap.threads.filter((t) => t.projectId === p.id)
           .filter((t) => showAll || (!t.deletedAt && !t.archivedAt))
-          .map((t) => ({ id: t.id, title: t.title, branch: t.branch, status: threadStatus(t), provider: t.session?.providerName ?? null, updatedAt: t.updatedAt })),
+          .map((t) => ({ id: t.id, title: t.title, branch: t.branch, status: threadStatus(t), provider: t.providerInstanceId ?? t.session?.providerName ?? null, updatedAt: t.updatedAt })),
       })));
     console.log(JSON.stringify({ projects: out, unreachable: failed.map((f) => ({ host: f.host.name, error: f.error })) }, null, 2));
     return;
@@ -214,7 +284,7 @@ const cmdLs = async ({ threads: showThreads, all: showAll, json: asJson }: LsOpt
       if (!showThreads) continue;
       for (const t of threads) {
         const s = threadStatus(t);
-        const meta = [t.branch, t.session?.providerName].filter(Boolean).join(' ');
+        const meta = [t.branch, t.providerInstanceId ?? t.session?.providerName].filter(Boolean).join(' ');
         console.log(`    ${ICON[s] ?? '?'} ${(t.title || '(untitled)').slice(0, 62).padEnd(62)} ${dim(meta)}`);
       }
     }
@@ -252,6 +322,7 @@ const probe = async (origin: string, timeoutMs = 5000): Promise<Descriptor> => {
     environmentId: d['environmentId'] as string,
     label: d['label'] as string,
     serverVersion: d['serverVersion'] as string,
+    ...(typeof d['orchestrationProtocolVersion'] === 'number' ? { orchestrationProtocolVersion: d['orchestrationProtocolVersion'] } : {}),
   };
 };
 
@@ -768,7 +839,7 @@ const pickHost = (flags: Flags): Host => {
 
 // ---- split-brain guard --------------------------------------------------
 // Two T3 Code servers can end up running against one ~/.t3 — say the boot
-// service on 3773 and a desktop-launched one on 3774. They share state.sqlite
+// service on 3773 and a desktop-launched one on 3774. They share one ~/.t3 (and its state database)
 // but each keeps its own in-memory read model, built at startup and advanced
 // only by its own commands. A thread created through one is unknown to the
 // other, which then rejects every command on it with "Thread '…' does not
@@ -848,30 +919,49 @@ const warnRivals = async (hosts: Host[]): Promise<void> => {
   hosts.forEach((h, i) => { const r = rivals[i]; if (r) warn(rivalMessage(h, r)); });
 };
 
-const dispatch = async (host: Host, command: OrchestrationCommand): Promise<{ sequence: number }> => {
-  await ensureTunnel(host);
-  await assertNoRival(host);
-  const res = await fetch(`${host.origin}/api/orchestration/dispatch`, {
-    method: 'POST',
-    headers: { ...(host.token ? { authorization: `Bearer ${host.token}` } : {}), 'content-type': 'application/json' },
-    body: JSON.stringify(command),
-    signal: AbortSignal.timeout(host.timeoutMs ?? 15000),
-  });
-  const body = await res.text();
-  if (!res.ok) throw new Error(`${command.type} failed: HTTP ${res.status} ${body}`);
-  return body ? (JSON.parse(body) as { sequence: number }) : { sequence: 0 };
+/**
+ * Send one or more orchestration commands, in order, and return the sequence of
+ * the last one. Protocol 1 takes them at POST /dispatch; protocol 2 only over
+ * the websocket, so they share one socket there. Callers build each command in
+ * the host's own protocol.
+ */
+const dispatch = async (host: Host, ...commands: OrchestrationCommand[]): Promise<{ sequence: number }> => {
+  if (await protocolOf(host) === 1) {
+    await assertNoRival(host);
+    let sequence = 0;
+    for (const command of commands) {
+      const res = await fetch(`${host.origin}/api/orchestration/dispatch`, {
+        method: 'POST',
+        headers: { ...authHeaders(host), 'content-type': 'application/json' },
+        body: JSON.stringify(command),
+        signal: AbortSignal.timeout(host.timeoutMs ?? 15000),
+      });
+      const body = await res.text();
+      if (!res.ok) throw new Error(`${command.type} failed: HTTP ${res.status} ${body}`);
+      sequence = body ? (JSON.parse(body) as { sequence: number }).sequence : 0;
+    }
+    return { sequence };
+  }
+  const rpc = await openRpc(host);
+  try {
+    let sequence = 0;
+    for (const command of commands) {
+      ({ sequence } = (await rpc.call('orchestration.dispatchCommand', command, host.timeoutMs ?? 15000)) as { sequence: number });
+    }
+    return { sequence };
+  } finally {
+    rpc.close();
+  }
 };
 
 // ---- websocket rpc ------------------------------------------------------
-// A few things exist only on the app's WebSocket, not over HTTP. The one t3ctl
-// needs is `bootstrap` on thread.turn.start: the HTTP dispatch hands commands
-// straight to the engine, which ignores the field, so a worktree requested
-// over HTTP is silently never made (apps/server/src/ws.ts,
-// dispatchBootstrapTurnStart). The socket speaks Effect RPC as plain JSON
-// frames: {_tag: 'Request', id, tag, payload, headers} out, {_tag: 'Exit',
-// requestId, exit} back. A browser cannot put a bearer header on a socket, so
-// the server takes a short-lived ticket in the query string instead, minted
-// over authenticated HTTP.
+// Protocol 2 takes every write over the app's WebSocket; protocol 1 only the
+// worktree `bootstrap` on thread.turn.start, which its HTTP dispatch drops
+// without a word (apps/server/src/ws.ts, dispatchBootstrapTurnStart). The
+// socket speaks Effect RPC as plain JSON frames: {_tag: 'Request', id, tag,
+// payload, headers} out, {_tag: 'Exit', requestId, exit} back. A browser cannot
+// put a bearer header on a socket, so the server takes a short-lived ticket in
+// the query string instead, minted over authenticated HTTP.
 
 type RpcExit = {
   _tag: 'Success' | 'Failure';
@@ -883,7 +973,7 @@ type RpcSession = { call: (tag: string, payload: unknown, timeoutMs: number) => 
 
 /** A failure the server answered with, as opposed to a dropped or timed-out socket. */
 class RpcError extends Error {
-  /** Set on a failed bootstrap: `deleted` (the thread was rolled back) or `not-created`. */
+  /** Protocol 1, on a failed bootstrap: `deleted` (the thread was rolled back) or `not-created`. */
   disposition?: string;
 }
 
@@ -898,10 +988,9 @@ const rpcFailure = (tag: string, exit: RpcExit): RpcError => {
   return error;
 };
 
-// Only write commands open a socket today, so the split-brain guard runs here
-// the same way it does in dispatch.
+// Only write commands open a socket, so the split-brain guard runs here.
 const openRpc = async (host: Host): Promise<RpcSession> => {
-  await ensureTunnel(host);
+  const protocol = await protocolOf(host);
   await assertNoRival(host);
   const res = await fetch(`${host.origin}/api/auth/websocket-ticket`, {
     method: 'POST',
@@ -911,7 +1000,7 @@ const openRpc = async (host: Host): Promise<RpcSession> => {
   if (!res.ok) throw new Error(`${host.name}: websocket ticket: HTTP ${res.status} ${await res.text().catch(() => '')}`.trim());
   const { ticket } = (await res.json()) as { ticket: string };
 
-  const ws = new WebSocket(`${host.origin.replace(/^http/, 'ws')}/ws?wsTicket=${encodeURIComponent(ticket)}`);
+  const ws = new WebSocket(`${host.origin.replace(/^http/, 'ws')}/ws?wsTicket=${encodeURIComponent(ticket)}${protocol === 2 ? `&${PROTOCOL_2_QUERY}` : ''}`);
   // Node's own handshake timeout is minutes; a tunnel to a wedged server would sit there.
   const openMs = host.timeoutMs ?? 15000;
   await new Promise<void>((resolve, reject) => {
@@ -941,7 +1030,7 @@ const openRpc = async (host: Host): Promise<RpcSession> => {
   });
   ws.addEventListener('close', () => failAll(new Error(`${host.name}: the connection closed before the server answered`)));
   // The server answers a Ping with a Pong; it only keeps an idle socket alive
-  // through the ssh tunnel or a proxy while a long bootstrap runs.
+  // through the ssh tunnel or a proxy while a long call runs.
   const keepalive = setInterval(() => ws.send(JSON.stringify({ _tag: 'Ping' })), 15_000);
 
   let nextId = 0;
@@ -974,7 +1063,7 @@ const resolveProject = (snap: Snapshot, ref: string): Project | undefined =>
 
 
 // Commands whose entire payload is {commandId, threadId}. Verified against
-// packages/contracts/src/orchestration.ts — note `unsettle` is NOT one of
+// packages/contracts/src/orchestrationV2.ts — note `unsettle` is NOT one of
 // these (it carries extra fields), so it is deliberately absent.
 const SIMPLE_THREAD_COMMANDS = ['settle', 'archive', 'unarchive', 'unpin', 'delete'];
 
@@ -1087,11 +1176,15 @@ const withOptions = (selection: ModelSelection, raw: string[] = []): ModelSelect
 const describeModel = (m: ModelSelection): string => `${m.instanceId}/${m.model}` +
   (m.options?.length ? ` (${m.options.map((o) => `${o.id}=${o.value}`).join(', ')})` : '');
 
-// thread.turn.start is ONE command carrying the first message inline — this is
-// what the UI fires immediately after thread.create, which is why a thread with
-// no messages is a state the UI never produces. The client-side schema requires
+// Who a command is from, as the server records it. t3ctl acts for the person at
+// the keyboard, like the app's own clients, so it reports itself as one: the
+// server only treats `server` and `provider` as special.
+const FROM_USER = { createdBy: 'user', creationSource: 'web' } as const;
+
+// Protocol 1: thread.turn.start is ONE command carrying the message inline,
+// with the access and interaction modes on it. The client-side schema requires
 // runtimeMode/interactionMode explicitly (the server-side one defaults them).
-const cmdThreadStart = async (thread: Thread, host: Host, text: string, flags: Flags): Promise<void> => {
+const cmdThreadStartV1 = async (thread: Thread, host: Host, text: string, flags: Flags): Promise<void> => {
   const command: OrchestrationCommand = {
     type: 'thread.turn.start',
     commandId: crypto.randomUUID(),
@@ -1111,10 +1204,48 @@ const cmdThreadStart = async (thread: Thread, host: Host, text: string, flags: F
     `\n  mode  ${command.runtimeMode} / ${command.interactionMode}\n  seq   ${sequence}`);
 };
 
-const cmdThreadInterrupt = async (thread: Thread, host: Host): Promise<void> => {
-  const { sequence } = await dispatch(host, {
-    type: 'thread.turn.interrupt', commandId: crypto.randomUUID(), threadId: thread.id,
+// Protocol 2: message.dispatch carries no access or interaction mode, unlike protocol 1's
+// thread.turn.start, so --runtime-mode and --interaction-mode are set first, on
+// the same socket, in order. A thread that is already busy gets the message
+// queued behind its active run rather than started over it.
+const cmdThreadStart = async (thread: Thread, host: Host, text: string, flags: Flags): Promise<void> => {
+  if (await protocolOf(host) === 1) return cmdThreadStartV1(thread, host, text, flags);
+  const runtimeMode = flags['runtime-mode'] ? parseRuntimeMode(flags['runtime-mode']) : null;
+  const interactionMode = flags['interaction-mode'] ?? null;
+  const base = flags.model ? parseModel(flags.model) : thread.modelSelection;
+  if (!base && flags.option?.length) throw new Error('--option needs a model; the thread has none, so pass --model too');
+  const modelSelection = base && (flags.model || flags.option?.length) ? withOptions(base, flags.option) : undefined;
+  const commands: OrchestrationCommand[] = [];
+  if (runtimeMode && runtimeMode !== thread.runtimeMode) {
+    commands.push({ type: 'thread.runtime-mode.set', commandId: crypto.randomUUID(), threadId: thread.id, runtimeMode });
+  }
+  if (interactionMode) {
+    commands.push({ type: 'thread.interaction-mode.set', commandId: crypto.randomUUID(), threadId: thread.id, interactionMode });
+  }
+  commands.push({
+    type: 'message.dispatch', commandId: crypto.randomUUID(), ...FROM_USER,
+    threadId: thread.id, messageId: crypto.randomUUID(), text, attachments: [],
+    ...(modelSelection ? { modelSelection } : {}),
+    dispatchMode: { type: thread.activeRunId ? 'queue_after_active' : 'start_immediately' },
   });
+  const { sequence } = await dispatch(host, ...commands);
+  const m = modelSelection ?? thread.modelSelection;
+  console.log(`${thread.activeRunId ? 'queued for' : 'started'} ${bold(thread.title || thread.id)}\n  id    ${thread.id}` +
+    (m ? `\n  model ${describeModel(m)}` : '') +
+    `\n  mode  ${runtimeMode ?? thread.runtimeMode ?? '?'} / ${interactionMode ?? 'unchanged'}\n  seq   ${sequence}`);
+};
+
+// Protocol 2's run.interrupt names the run to stop, so there a thread with
+// nothing running is an error here rather than a command the server would reject.
+const cmdThreadInterrupt = async (thread: Thread, host: Host): Promise<void> => {
+  let command: OrchestrationCommand;
+  if (await protocolOf(host) === 1) {
+    command = { type: 'thread.turn.interrupt', commandId: crypto.randomUUID(), threadId: thread.id };
+  } else {
+    if (!thread.activeRunId) throw new Error(`nothing is running in ${thread.title || thread.id}`);
+    command = { type: 'run.interrupt', commandId: crypto.randomUUID(), threadId: thread.id, runId: thread.activeRunId };
+  }
+  const { sequence } = await dispatch(host, command);
   console.log(`interrupted ${bold(thread.title || thread.id)}\n  seq ${sequence}`);
 };
 
@@ -1144,8 +1275,9 @@ const cmdThreadUnsnooze = async (thread: Thread, host: Host): Promise<void> => {
 const cmdThreadRuntimeMode = async (thread: Thread, host: Host, raw: string): Promise<void> => {
   const runtimeMode = parseRuntimeMode(raw);
   const { sequence } = await dispatch(host, {
-    type: 'thread.runtime-mode.set', commandId: crypto.randomUUID(), threadId: thread.id,
-    runtimeMode, createdAt: new Date().toISOString(),
+    type: 'thread.runtime-mode.set', commandId: crypto.randomUUID(), threadId: thread.id, runtimeMode,
+    // Protocol 1 requires a createdAt; protocol 2 has none.
+    ...(await protocolOf(host) === 1 ? { createdAt: new Date().toISOString() } : {}),
   });
   // The snapshot carries the old mode, so say what changed rather than just what it is now.
   console.log(`${bold(thread.title || thread.id)}\n  mode ${dim(`${thread.runtimeMode ?? '?'} ->`)} ` +
@@ -1153,28 +1285,29 @@ const cmdThreadRuntimeMode = async (thread: Thread, host: Host, raw: string): Pr
 };
 
 
-// thread.meta.update also accepts regenerateTitle:true, which asks the server to
-// derive a title from the thread's own content instead of taking one from us.
+// The thread metadata command: thread.meta.update in protocol 1,
+// thread.metadata.update in 2. Both also take regenerateTitle:true, which asks
+// the server to derive a title from the thread's own content.
+const metadataCommand = async (host: Host): Promise<string> =>
+  await protocolOf(host) === 1 ? 'thread.meta.update' : 'thread.metadata.update';
+
 const cmdThreadRename = async (thread: Thread, host: Host, title: string): Promise<void> => {
   const { sequence } = await dispatch(host, {
-    type: 'thread.meta.update', commandId: crypto.randomUUID(), threadId: thread.id, title,
+    type: await metadataCommand(host), commandId: crypto.randomUUID(), threadId: thread.id, title,
   });
   console.log(`renamed ${dim(thread.title || thread.id)} -> ${bold(title)}\n  seq ${sequence}`);
 };
 
-// Lighter than the full snapshot; retitle polls this so it does not refetch every
-// thread's history once a second.
-// `turnLimit` is null for callers that want the whole history (export), 1 for
-// callers that only want to poll a field (retitle).
-const threadDetail = async (host: Host, threadId: string, turnLimit: number | null = 1): Promise<Thread> => {
-  await ensureTunnel(host);
-  const query = turnLimit === null ? '' : `?turnLimit=${turnLimit}`;
-  const res = await fetch(`${host.origin}/api/orchestration/threads/${threadId}${query}`, {
-    headers: { authorization: `Bearer ${host.token}` },
-    signal: AbortSignal.timeout(host.timeoutMs ?? 15000),
-  });
-  if (!res.ok) throw new Error(`${host.name}: HTTP ${res.status}`);
-  return ((await res.json()) as { thread: Thread }).thread;
+// One thread with its messages. `turnLimit` is null for the whole history
+// (export); protocol 1 can also cut it to the last few turns, which retitle uses
+// to poll cheaply. Protocol 2 always answers with the whole projection.
+const threadDetail = async (host: Host, threadId: string, turnLimit: number | null = null): Promise<Thread> => {
+  const route = `/api/orchestration/threads/${encodeURIComponent(threadId)}`;
+  if (await protocolOf(host) === 1) {
+    return (await getJson<{ thread: Thread }>(host, `${route}${turnLimit === null ? '' : `?turnLimit=${turnLimit}`}`)).thread;
+  }
+  const { projection } = await getJson<{ projection: { thread: Thread; messages?: ThreadMessage[] } }>(host, route);
+  return { ...projection.thread, messages: projection.messages ?? [] };
 };
 
 // `regenerateTitle` does NOT rename anything by itself. The server records an
@@ -1186,7 +1319,7 @@ const threadDetail = async (host: Host, threadId: string, turnLimit: number | nu
 const cmdThreadRetitle = async (thread: Thread, host: Host, timeoutSeconds: number): Promise<void> => {
   const before = thread.title;
   const { sequence } = await dispatch(host, {
-    type: 'thread.meta.update', commandId: crypto.randomUUID(), threadId: thread.id,
+    type: await metadataCommand(host), commandId: crypto.randomUUID(), threadId: thread.id,
     regenerateTitle: true,
   });
   console.log(`asked the server to retitle ${bold(before || thread.id)}${dim(`  (seq ${sequence})`)}`);
@@ -1195,7 +1328,12 @@ const cmdThreadRetitle = async (thread: Thread, host: Host, timeoutSeconds: numb
   let sawMarker = false;
   while (Date.now() < deadline) {
     await new Promise((r) => setTimeout(r, 1500));
-    const current = await threadDetail(host, thread.id);
+    // Protocol 1 has `titleRegeneration` on the thread detail, cut to one turn.
+    // In protocol 2 only the shell snapshot carries it, not the projection.
+    const current = await protocolOf(host) === 1
+      ? await threadDetail(host, thread.id, 1)
+      : (await snapshot(host)).threads.find((t) => t.id === thread.id);
+    if (!current) break;
     if (current.title && current.title !== before) {
       console.log(`retitled -> ${bold(current.title)}`);
       return;
@@ -1218,16 +1356,26 @@ const cmdProjectCreate = async (title: string, root: string, flags: Flags): Prom
   const workspaceRoot = path.resolve(root.replace(/^~/, os.homedir()));
   if (!fs.existsSync(workspaceRoot)) throw new Error(`workspace root does not exist: ${workspaceRoot}`);
   const projectId = crypto.randomUUID();
-  const { sequence } = await dispatch(host, {
-    type: 'project.create', commandId: crypto.randomUUID(),
-    projectId, title, workspaceRoot, createdAt: new Date().toISOString(),
+  if (await protocolOf(host) === 1) {
+    const { sequence } = await dispatch(host, {
+      type: 'project.create', commandId: crypto.randomUUID(),
+      projectId, title, workspaceRoot, createdAt: new Date().toISOString(),
+    });
+    console.log(`created project ${bold(title)} on ${host.name}\n  id   ${projectId}\n  root ${workspaceRoot}\n  seq  ${sequence}`);
+    return;
+  }
+  // In protocol 2 projects are not orchestration commands; they have their own
+  // HTTP mutation (packages/contracts/src/project.ts), which answers with the project.
+  await assertNoRival(host);
+  const res = await fetch(`${host.origin}/api/projects/mutate`, {
+    method: 'POST',
+    headers: { ...authHeaders(host), 'content-type': 'application/json' },
+    body: JSON.stringify({ type: 'project.create', commandId: crypto.randomUUID(), projectId, title, workspaceRoot }),
+    signal: AbortSignal.timeout(host.timeoutMs ?? 15000),
   });
-  console.log(`created project ${bold(title)} on ${host.name}\n  id   ${projectId}\n  root ${workspaceRoot}\n  seq  ${sequence}`);
+  if (!res.ok) throw new Error(`project.create failed: HTTP ${res.status} ${(await res.text()).slice(0, 300)}`);
+  console.log(`created project ${bold(title)} on ${host.name}\n  id   ${projectId}\n  root ${workspaceRoot}`);
 };
-
-// The setup script runs before the RPC answers unless it is marked async, and
-// a cold checkout of a big repo plus `npm ci` takes minutes.
-const BOOTSTRAP_WAIT_MS = 15 * 60_000;
 
 // The shape the server recognises as temporary (isTemporaryWorktreeBranch in
 // packages/shared/src/git.ts) and renames after the first turn. A branch is
@@ -1253,12 +1401,14 @@ const worktreeFlagProblem = (flags: Flags): string | null => {
   return null;
 };
 
-// One thread.turn.start that carries the thread, the worktree and the first
-// message, as the app sends it from a new-thread draft. The server creates the
-// thread, fetches origin/<base>, adds the worktree, runs the setup script, then
-// starts the turn. A failed fetch or checkout deletes the thread again; a failed
-// setup script does not — the server keeps the worktree and starts the agent anyway.
-const cmdThreadCreateInWorktree = async (host: Host, project: Project, title: string, modelSelection: ModelSelection, flags: Flags): Promise<void> => {
+// Protocol 1: one thread.turn.start that carries the thread, the worktree and
+// the first message, as the app sends it from a new-thread draft. The server
+// creates the thread, fetches origin/<base>, adds the worktree, runs the setup
+// script, then starts the turn — all before it answers. A failed fetch or
+// checkout deletes the thread again; a failed setup script does not.
+const BOOTSTRAP_WAIT_MS = 15 * 60_000;
+
+const cmdThreadCreateInWorktreeV1 = async (host: Host, project: Project, title: string, modelSelection: ModelSelection, flags: Flags): Promise<void> => {
   const runtimeMode = parseRuntimeMode(flags['runtime-mode'] ?? 'full-access');
   const interactionMode = flags['interaction-mode'] ?? 'default';
   const rpc = await openRpc(host);
@@ -1293,10 +1443,46 @@ const cmdThreadCreateInWorktree = async (host: Host, project: Project, title: st
       throw new Error(outcome ? `${error.message}\n  ${outcome}` : error.message);
     })) as { sequence: number };
     // The server picks the worktree path, so read it back rather than guess it.
-    const made = await threadDetail(host, threadId).catch(() => null);
+    const made = await threadDetail(host, threadId, 1).catch(() => null);
     console.log(`started ${bold(title)} in ${project.title} on ${host.name}\n  id       ${threadId}\n` +
       `  branch   ${made?.branch ?? branch} ${dim(`(from ${baseBranch})`)}\n  worktree ${made?.worktreePath ?? '-'}\n` +
       `  model    ${describeModel(modelSelection)}\n  mode     ${runtimeMode} / ${interactionMode}\n  seq      ${sequence}`);
+  } finally {
+    rpc.close();
+  }
+};
+
+// Protocol 2: orchestration.launchThread creates the thread, prepares the worktree and sends
+// the first message, as the app does from a new-thread draft. It answers once
+// the thread exists; fetching origin/<base>, adding the worktree and running
+// the setup script carry on in the background as the run's preparation, and a
+// failure there shows in the thread rather than here.
+const LAUNCH_WAIT_MS = 2 * 60_000;
+
+type LaunchResult = { threadId: string; projection: { thread: Thread } };
+
+const cmdThreadCreateInWorktree = async (host: Host, project: Project, title: string, modelSelection: ModelSelection, flags: Flags): Promise<void> => {
+  const runtimeMode = parseRuntimeMode(flags['runtime-mode'] ?? 'full-access');
+  const interactionMode = flags['interaction-mode'] ?? 'default';
+  const rpc = await openRpc(host);
+  try {
+    const baseBranch = flags.base ?? await defaultBranch(rpc, project);
+    const branch = flags.branch ?? temporaryBranch();
+    const threadId = crypto.randomUUID();
+    const { projection } = (await rpc.call('orchestration.launchThread', {
+      commandId: crypto.randomUUID(), creationSource: FROM_USER.creationSource, threadId,
+      projectId: project.id, title, modelSelection, runtimeMode, interactionMode,
+      workspaceStrategy: { type: 'worktree', baseRef: baseBranch, branch, startFromOrigin: true },
+      initialMessage: { messageId: crypto.randomUUID(), text: flags.message, attachments: [] },
+    }, LAUNCH_WAIT_MS).catch((error: unknown) => {
+      if (error instanceof RpcError) throw error;
+      // The launch outlives the connection that asked for it.
+      throw new Error(`${errorMessage(error)}\n  any setup already under way carries on on the server — check with: t3ctl ls -t`);
+    })) as LaunchResult;
+    const made = projection.thread;
+    console.log(`started ${bold(title)} in ${project.title} on ${host.name}\n  id       ${threadId}\n` +
+      `  branch   ${made.branch ?? branch} ${dim(`(from ${baseBranch})`)}\n  worktree ${made.worktreePath ?? dim('being prepared — check with: t3ctl ls -t')}\n` +
+      `  model    ${describeModel(modelSelection)}\n  mode     ${runtimeMode} / ${interactionMode}`);
   } finally {
     rpc.close();
   }
@@ -1309,16 +1495,22 @@ const cmdThreadCreate = async (projectRef: string, title: string, flags: Flags):
   const project = resolveProject(await snapshot(host), projectRef);
   if (!project) throw new Error(`no project matching "${projectRef}" on ${host.name}`);
   const modelSelection = withOptions(parseModel(flags.model ?? 'claudeAgent/claude-opus-5'), flags.option);
-  if (flags['new-worktree']) return cmdThreadCreateInWorktree(host, project, title, modelSelection, flags);
+  const protocol = await protocolOf(host);
+  if (flags['new-worktree']) {
+    return protocol === 1
+      ? cmdThreadCreateInWorktreeV1(host, project, title, modelSelection, flags)
+      : cmdThreadCreateInWorktree(host, project, title, modelSelection, flags);
+  }
   const threadId = crypto.randomUUID();
   const { sequence } = await dispatch(host, {
     type: 'thread.create', commandId: crypto.randomUUID(),
+    // Protocol 2 records who created the thread; protocol 1 when.
+    ...(protocol === 1 ? { createdAt: new Date().toISOString() } : FROM_USER),
     threadId, projectId: project.id, title, modelSelection,
     runtimeMode: parseRuntimeMode(flags['runtime-mode'] ?? 'full-access'),
     interactionMode: flags['interaction-mode'] ?? 'default',
     branch: flags.branch ?? null,
     worktreePath: flags.worktree ?? null,
-    createdAt: new Date().toISOString(),
   });
   console.log(`created thread ${bold(title)} in ${project.title} on ${host.name}\n  id    ${threadId}\n  model ${describeModel(modelSelection)}\n  seq   ${sequence}`);
 };
@@ -1366,12 +1558,10 @@ type Prompt = {
 type Strategy = 'sqlite' | 'http';
 
 const STRATEGY_LABEL: Record<Strategy, string> = {
-  sqlite: 'local state.sqlite',
+  sqlite: 'local state database',
   http: 'snapshot + per-thread fetch',
 };
 
-/** Fixed by T3 Code. Read relative to whichever machine's home directory applies. */
-const STATE_DB = '.t3/userdata/state.sqlite';
 
 const expandHome = (p: string): string => path.resolve(p.replace(/^~(?=$|\/)/, os.homedir()));
 
@@ -1406,9 +1596,30 @@ const cleanPrompt = (text: string): string => {
   return (tagged?.[1] ?? text).replace(/\s+/g, ' ').trim();
 };
 
-// One statement, shared by every strategy that reads the local store directly,
-// so it cannot drift from what the HTTP path reconstructs.
-const PROMPT_SQL = `SELECT m.message_id, m.thread_id, m.text, m.created_at, p.workspace_root
+// The local store, one statement per protocol, each matching what the HTTP path
+// reconstructs for that protocol. Paths are fixed by T3 Code, relative to the
+// home directory. Orchestrator V2 keeps its state in statev2.sqlite and leaves
+// the protocol 1 state.sqlite behind, frozen at the switch — so statev2.sqlite
+// wins whenever it exists. No server is needed to tell which applies.
+const LOCAL_STORES = [
+  {
+    file: '.t3/userdata/statev2.sqlite',
+    // A message's text and author live in its JSON payload. `createdBy` tells a
+    // person's prompt from one an agent wrote into a thread (a delegated task's brief).
+    sql: `SELECT m.message_id, m.thread_id, json_extract(m.payload_json, '$.text') AS text, m.created_at, p.workspace_root
+FROM orchestration_v2_projection_messages m
+JOIN orchestration_v2_projection_threads t ON t.thread_id = m.thread_id
+JOIN projection_projects p ON p.project_id = t.project_id
+WHERE m.role = 'user'
+  AND json_extract(m.payload_json, '$.createdBy') = 'user'
+  AND t.deleted_at IS NULL
+  AND p.deleted_at IS NULL
+  AND m.created_at >= ? AND m.created_at < ?
+ORDER BY m.created_at`,
+  },
+  {
+    file: '.t3/userdata/state.sqlite',
+    sql: `SELECT m.message_id, m.thread_id, m.text, m.created_at, p.workspace_root
 FROM projection_thread_messages m
 JOIN projection_threads t ON t.thread_id = m.thread_id
 JOIN projection_projects p ON p.project_id = t.project_id
@@ -1416,7 +1627,9 @@ WHERE m.role = 'user'
   AND t.deleted_at IS NULL
   AND p.deleted_at IS NULL
   AND m.created_at >= ? AND m.created_at < ?
-ORDER BY m.created_at`;
+ORDER BY m.created_at`,
+  },
+];
 
 /**
  * A bare `--since 2026-09-14` is the UTC day boundary, not local midnight: the
@@ -1440,19 +1653,20 @@ const loadSqlite = async (): Promise<typeof import('node:sqlite').DatabaseSync> 
   try {
     return (await import('node:sqlite')).DatabaseSync;
   } catch {
-    throw new Error('reading state.sqlite needs node:sqlite — upgrade to Node >= 22.13, or pass --experimental-sqlite on 22.5-22.12');
+    throw new Error('reading the T3 Code database needs node:sqlite — upgrade to Node >= 22.13, or pass --experimental-sqlite on 22.5-22.12');
   }
 };
 
 const queryLocal = async (since: string, until: string): Promise<PromptRow[]> => {
-  const file = path.join(os.homedir(), STATE_DB);
-  if (!fs.existsSync(file)) throw new Error(`no T3 Code database at ${file}`);
+  const store = LOCAL_STORES.find((s) => fs.existsSync(path.join(os.homedir(), s.file)));
+  if (!store) throw new Error(`no T3 Code database in ${path.join(os.homedir(), '.t3/userdata')}`);
+  const file = path.join(os.homedir(), store.file);
   const DatabaseSync = await loadSqlite();
   // The database is in WAL mode, so this reader neither blocks the running app
   // nor is blocked by it, and no copy is needed — it is ~500 MB.
   const db = new DatabaseSync(file, { readOnly: true });
   try {
-    return db.prepare(PROMPT_SQL).all(since, until) as unknown as PromptRow[];
+    return db.prepare(store.sql).all(since, until) as unknown as PromptRow[];
   } finally {
     db.close();
   }
@@ -1500,10 +1714,11 @@ const queryOverHttp = async (host: Host, since: string, until: string): Promise<
   const perThread = await mapPool(threads, 8, async (t) => {
     const workspaceRoot = roots.get(t.projectId);
     if (workspaceRoot === undefined) return [];
-    const detail = await threadDetail(host, t.id, null);
+    const detail = await threadDetail(host, t.id);
     const rows: PromptRow[] = [];
     for (const m of detail.messages ?? []) {
-      if (m.role !== 'user') continue;
+      // Protocol 1 messages carry no author, and only people wrote user-role ones.
+      if (m.role !== 'user' || (m.createdBy !== undefined && m.createdBy !== 'user')) continue;
       const at = instant(m.createdAt);
       if (at === null || at < from || at >= to) continue;
       const messageId = m.messageId ?? m.id;
