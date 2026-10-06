@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.9.1](https://github.com/Goobles/t3ctl/compare/v0.9.0...v0.9.1) (2026-10-06)
+
+
+### Bug Fixes
+
+* read ssh-tunnelled hosts over http in export prompts ([8608ff9](https://github.com/Goobles/t3ctl/commit/8608ff95f5acb6568664a0c0216daa06115cd691))
+* support T3 Code orchestration protocol 2 alongside protocol 1 ([220d30c](https://github.com/Goobles/t3ctl/commit/220d30cadc2a2804b01d5fec39668d3ce7637481))
+
 ## [0.9.0](https://github.com/Goobles/t3ctl/compare/v0.8.0...v0.9.0) (2026-10-05)
 
 
