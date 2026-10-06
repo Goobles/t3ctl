@@ -519,7 +519,7 @@ Same rows either way; only the cost differs.
 
 | Host | How | Cost |
 |---|---|---|
-| Origin on loopback | Reads `~/.t3/userdata/statev2.sqlite` directly (`state.sqlite` on a server from before Orchestrator V2) | One query |
+| Origin on loopback, not over ssh | Reads `~/.t3/userdata/statev2.sqlite` directly (`state.sqlite` on a server from before Orchestrator V2) | One query |
 | Anything else | Snapshot, then one fetch per thread that could match | N+1 requests |
 
 The snapshot is filtered by each thread's `updatedAt` before anything is

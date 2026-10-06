@@ -323,6 +323,10 @@ is one constant, and the HTTP path deliberately filters only `deletedAt` and
 not (which is why `snapshot()` merges the shell's `archivedThreads` back in).
 If you change what one strategy excludes, change both.
 
+A host is read from the local database only when its origin is loopback *and*
+it has no `ssh` login: an ssh host's origin is the local end of a tunnel, so
+its database is on the other machine.
+
 The HTTP path does prefilter which threads it fetches (`mayHavePrompts`), but
 only on facts that cannot hide a row: a thread whose `updatedAt` predates the
 window has had no message in it, and one created after the window closed has

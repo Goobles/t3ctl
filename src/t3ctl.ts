@@ -1744,6 +1744,9 @@ const queryOverHttp = async (host: Host, since: string, until: string): Promise<
 const LOOPBACK = new Set(['localhost', '127.0.0.1', '::1', '[::1]']);
 
 const strategyFor = (host: Host): Strategy => {
+  // A host reached over ssh has a loopback origin too, but it is the local end
+  // of a tunnel: its database is on the other machine.
+  if (host.ssh) return 'http';
   let hostname = '';
   try {
     hostname = new URL(host.origin).hostname;

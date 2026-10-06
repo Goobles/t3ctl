@@ -318,6 +318,25 @@ test('a host off loopback goes over HTTP, and its markers carry the host name', 
   }
 });
 
+test('a host behind an ssh tunnel is not read from the local database, despite its loopback origin', needsSqlite, async () => {
+  // The tunnel's local end: loopback, closed, so the HTTP path fails fast.
+  const tunnel = (await refusedRemoteOrigin()).replace(/\/\/[^:]+:/, '//127.0.0.1:');
+  const home = fixtureHome(
+    [{ name: 'mac', origin: tunnel, token: 'x', ssh: 'me@mac', sshLocalPort: Number(new URL(tunnel).port), sshRemotePort: 3773 }],
+    (h) => `
+      INSERT INTO projection_projects VALUES ('p1', '${h}/Code/alpha', NULL);
+      INSERT INTO orchestration_v2_projection_threads VALUES ('t1','p1',NULL);
+      INSERT INTO orchestration_v2_projection_messages VALUES ${msg('m1', 't1', 'user', 'typed on this machine', '2026-09-14T10:00:00.000Z')};
+    `,
+  );
+  try {
+    const { messages } = await exportPrompts(home);
+    assert.deepEqual(messages, [], 'this machine\'s prompts must not be filed under the remote host');
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
 // ---- split-brain guard ------------------------------------------------------
 // Two fake servers on loopback that report the same environmentId, i.e. two T3
 // Code processes sharing one ~/.t3. server-runtime.json names B, the one that
