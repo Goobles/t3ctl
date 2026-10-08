@@ -814,6 +814,35 @@ test('ls reads thread status and provider from the shell snapshot', async () => 
   } finally { w.close(); }
 });
 
+// mainframe links tasks to PRs through this field, so its shape is a contract.
+test('ls --json lists each thread\'s linked pull requests', async () => {
+  const link = (number, extra) => ({
+    host: 'github.com', repository: 'sparklink/mainframe', number, url: `https://github.com/Sparklink/mainframe/pull/${number}`,
+    source: 'agent', linkedAt: '2026-10-01T00:00:00.000Z', snapshot: null, stack: null, ...extra,
+  });
+  const linked = {
+    ...THREAD, id: '44444444-4444-4444-8444-444444444444', title: 'linked',
+    pullRequests: [
+      link(5, { snapshot: { state: 'merged', title: 'x', headBranch: 'a', baseBranch: 'main', isDraft: false, updatedAt: null, syncedAt: '2026-10-01T00:00:00.000Z' } }),
+      // Not synced with the host yet: no state to report.
+      link(6),
+      // A tombstone for a stack member the user unlinked; T3 hides it too.
+      link(7, { source: 'stack-dismissed' }),
+    ],
+  };
+  const w = await threadWorld([THREAD, linked]);
+  try {
+    const { code, stdout, stderr } = await cliIn(w.home, 'ls', '--json', '--threads');
+    assert.equal(code, 0, stderr);
+    const threads = Object.fromEntries(JSON.parse(stdout).projects[0].threads.map((t) => [t.title, t]));
+    assert.deepEqual(threads.linked.pullRequests, [
+      { url: 'https://github.com/Sparklink/mainframe/pull/5', repository: 'sparklink/mainframe', number: 5, state: 'merged' },
+      { url: 'https://github.com/Sparklink/mainframe/pull/6', repository: 'sparklink/mainframe', number: 6 },
+    ]);
+    assert.deepEqual(threads.scratch.pullRequests, []);
+  } finally { w.close(); }
+});
+
 // ---- thread create --new-worktree --------------------------------------------
 // orchestration.launchThread creates the thread, the worktree and the first
 // message in one call, so the one thing every case asserts first is that no
@@ -1051,6 +1080,8 @@ test('protocol 1: ls reads status and provider from the session', async () => {
     assert.equal(threads.busy.status, 'running');
     assert.equal(threads.busy.provider, 'codex');
     assert.equal(threads.scratch.status, 'idle');
+    // Protocol 1 has no pull request links; the field is still there, empty.
+    assert.deepEqual(threads.scratch.pullRequests, []);
   } finally { w.close(); }
 });
 
