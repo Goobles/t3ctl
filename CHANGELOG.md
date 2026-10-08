@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.0](https://github.com/Goobles/t3ctl/compare/v0.9.1...v0.10.0) (2026-10-08)
+
+
+### Features
+
+* add --json to thread create and thread send ([7b17091](https://github.com/Goobles/t3ctl/commit/7b170918cf5912a0f100a4ae2a0746bf58c9091d))
+
 ## [0.9.1](https://github.com/Goobles/t3ctl/compare/v0.9.0...v0.9.1) (2026-10-06)
 
 
