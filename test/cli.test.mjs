@@ -118,6 +118,39 @@ test('commands needing a host fail cleanly when none is registered', async () =>
   assert.match(stdout + stderr, /no hosts registered/);
 });
 
+// Tools that drive t3ctl (mainframe starts threads with create + send) read
+// errors with JSON.parse, so with --json even commander's own errors are JSON,
+// and nothing else reaches stderr.
+test('with --json, an error is one JSON object on stderr and still exits non-zero', async () => {
+  const cases = [
+    [['thread', 'create', 'alpha', 'hello', '--json'], /^no hosts registered/],
+    [['thread', 'send', 'scratch', 'hi', '--json'], /^no hosts registered/],
+    [['thread', 'send', '--json'], /^missing required argument 'thread'$/],
+    [['thread', 'create', 'alpha', 'hello', '--json', '--bogus'], /^unknown option '--bogus'$/],
+  ];
+  for (const [args, message] of cases) {
+    const { code, stdout, stderr } = await cli(...args);
+    assert.notEqual(code, 0, `expected failure: t3ctl ${args.join(' ')}`);
+    assert.equal(stdout, '');
+    const lines = stderr.trim().split('\n');
+    assert.equal(lines.length, 1, stderr);
+    assert.deepEqual(Object.keys(JSON.parse(lines[0])), ['error']);
+    assert.match(JSON.parse(lines[0]).error, message);
+  }
+
+  // After `--`, --json is part of the message, so the error stays prose.
+  const prose = await cli('thread', 'send', 'scratch', '--', '--json');
+  assert.notEqual(prose.code, 0);
+  assert.match(prose.stderr, /^error no hosts registered/);
+});
+
+test('nothing is coloured when the output is not a terminal', async () => {
+  // execFile pipes both streams, as a script or a tool driving t3ctl would.
+  const { stderr } = await cli('thread', 'create', 'alpha', 'hello');
+  assert.match(stderr, /^error no hosts registered/);
+  assert.doesNotMatch(stderr, /\x1b/);
+});
+
 test('the published bin target exists and is executable', () => {
   assert.equal(pkg.bin.t3ctl, './dist/t3ctl.js');
   const stat = statSync(CLI);
@@ -730,6 +763,30 @@ test('thread create says who it is from, as protocol 2 requires', async () => {
   } finally { w.close(); }
 });
 
+test('thread create --json prints the new thread as one JSON object', async () => {
+  const w = await threadWorld();
+  try {
+    const { code, stdout, stderr } = await cliIn(w.home, 'thread', 'create', 'alpha', 'hello', 'there',
+      '--model', 'codex/gpt-5.5', '--option', 'effort=high', '--json');
+    assert.equal(code, 0, stderr);
+    assert.deepEqual(JSON.parse(stdout), {
+      id: w.dispatched[0].threadId, title: 'hello there', projectId: 'p1', project: 'alpha',
+      host: 'box', model: 'codex/gpt-5.5', sequence: 7,
+    });
+  } finally { w.close(); }
+});
+
+test('thread send --json prints the thread, host and sequence', async () => {
+  const w = await threadWorld([THREAD, BUSY]);
+  try {
+    for (const t of [THREAD, BUSY]) {
+      const { code, stdout, stderr } = await cliIn(w.home, 'thread', 'send', t.title, 'hi', '--json');
+      assert.equal(code, 0, stderr);
+      assert.deepEqual(JSON.parse(stdout), { threadId: t.id, host: 'box', sequence: 7 });
+    }
+  } finally { w.close(); }
+});
+
 test('project create goes to the projects endpoint, not the orchestrator', async () => {
   const w = await threadWorld();
   try {
@@ -810,6 +867,18 @@ test('--base and --branch are sent as given, and skip the default-branch lookup'
     assert.equal(workspaceStrategy.baseRef, 'develop');
     assert.equal(workspaceStrategy.branch, 'chore/pin-deps');
     assert.equal(runtimeMode, 'approval-required');
+  } finally { w.close(); }
+});
+
+test('--new-worktree --json has no sequence to report: the launch answers with the thread', async () => {
+  const w = await worktreeWorld();
+  try {
+    const { code, stdout, stderr } = await cliIn(w.home, 'thread', 'create', 'alpha', 'fix', '--new-worktree', '--message', 'go', '--json');
+    assert.equal(code, 0, stderr);
+    assert.deepEqual(JSON.parse(stdout), {
+      id: w.rpc[1].payload.threadId, title: 'fix', projectId: 'p1', project: 'alpha',
+      host: 'box', model: 'claudeAgent/claude-opus-5', sequence: null,
+    });
   } finally { w.close(); }
 });
 
@@ -955,6 +1024,22 @@ test('protocol 1: thread and project create carry createdAt, and go to /dispatch
     assert.equal((await cliIn(w.home, 'project', 'create', 'beta', tmpdir())).code, 0);
     const { projectId, ...project } = v1Command(w.dispatched[1]);
     assert.deepEqual(project, { type: 'project.create', title: 'beta', workspaceRoot: tmpdir() });
+  } finally { w.close(); }
+});
+
+test('protocol 1: create and send --json report the sequence /dispatch answered with', async () => {
+  const w = await v1World();
+  try {
+    const created = await cliIn(w.home, 'thread', 'create', 'alpha', 'hello', '--json');
+    assert.equal(created.code, 0, created.stderr);
+    assert.deepEqual(JSON.parse(created.stdout), {
+      id: w.dispatched[0].threadId, title: 'hello', projectId: 'p1', project: 'alpha',
+      host: 'box', model: 'claudeAgent/claude-opus-5', sequence: 1,
+    });
+
+    const sent = await cliIn(w.home, 'thread', 'send', 'scratch', 'hi', '--json');
+    assert.equal(sent.code, 0, sent.stderr);
+    assert.deepEqual(JSON.parse(sent.stdout), { threadId: THREAD.id, host: 'box', sequence: 1 });
   } finally { w.close(); }
 });
 
