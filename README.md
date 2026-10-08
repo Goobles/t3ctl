@@ -241,6 +241,7 @@ Flags:
 | `--message <text>` | none | With `--new-worktree`: the first message, which starts the agent. Quote it — see below |
 | `--runtime-mode <mode>` | `full-access` | `approval-required`, `auto-accept-edits`, `auto`, `full-access` — see [Runtime modes](#runtime-modes) for the app's names |
 | `--interaction-mode <mode>` | `default` | `default` or `plan` |
+| `--json` | off | Print the new thread as JSON — see [Scripting t3ctl](#scripting-t3ctl) |
 | `--host <name>` | the only host | Which host to act on |
 
 `--model` splits on the **first** slash, so slashed model names work as-is:
@@ -253,6 +254,28 @@ shows. The ids come from the provider, e.g. `effort`, `fastMode` and
 ```sh
 t3ctl thread create t3ctl "tidy the tests" --model claudeAgent/claude-opus-5-5 --option effort=medium --option fastMode=false
 ```
+
+With `--json`, the summary is one JSON object instead. `id` is the new thread's
+id, which is what `thread send` takes next:
+
+```sh
+t3ctl thread create t3ctl "tidy the tests" --json
+```
+```json
+{
+  "id": "0f5c1e2a-…",
+  "title": "tidy the tests",
+  "projectId": "8b1d0c44-…",
+  "project": "t3ctl",
+  "host": "laptop",
+  "model": "claudeAgent/claude-opus-5",
+  "sequence": 4471
+}
+```
+
+`model` is the `--model` spelling, without `--option`s. `sequence` is `null`
+for `--new-worktree` on a server speaking orchestration protocol 2, which
+answers the launch with the thread rather than a sequence.
 
 #### Starting a thread in a new worktree
 
@@ -320,7 +343,8 @@ started rewrite the readme for users
 ```
 
 Accepts `--model`, `--option`, `--runtime-mode` (see [Runtime
-modes](#runtime-modes)), `--interaction-mode`, and `--host`. Unlike
+modes](#runtime-modes)), `--interaction-mode`, `--host`, and `--json`, which
+prints `{"threadId", "host", "sequence"}` instead of the summary. Unlike
 `thread create`, `--model` has no default here: the thread's existing model is
 reused unless you override it. `--option` changes options on top of the thread's
 model, or on top of `--model` when you pass one.
@@ -617,6 +641,31 @@ tailnet) is **not planned**: the relay's `dpop-token` exchange only accepts a
 Clerk *session* JWT carrying the relay audience, and its allowed scopes are keyed
 by `client_id`, which is pinned to `t3-mobile` and `t3-web`. A third-party CLI has
 no way to present either. The transports above are the options.
+
+## Scripting t3ctl
+
+`ls`, `export prompts`, `thread create` and `thread send` take `--json`. With
+it, stdout carries only the JSON, and an error is one line on stderr, with the
+exit code still non-zero:
+
+```json
+{"error":"no hosts registered — run: t3ctl host add <origin> <token>"}
+```
+
+That holds for argument errors too (`missing required argument 'thread'`,
+`unknown option '--bogus'`). Warnings, such as two servers sharing a data dir,
+can still precede it on stderr, so read the last line.
+
+Colour is only used on a terminal: output piped to a file or another program is
+plain text, with or without `--json`. Set `NO_COLOR` to anything to turn it off
+on a terminal too.
+
+A tool that starts a thread and runs it:
+
+```sh
+id=$(t3ctl thread create t3ctl "tidy the tests" --json | jq -r .id)
+t3ctl thread send "$id" make the snooze tests independent of the clock --json
+```
 
 ## Limitations
 

@@ -105,7 +105,7 @@ type Flags = Partial<Record<
   'host' | 'model' | 'branch' | 'worktree' | 'name' | 'timeout' | 'runtime-mode' | 'interaction-mode' | 'ttl' | 't3-version' |
   'base' | 'message',
   string
->> & { option?: string[]; 'new-worktree'?: boolean };
+>> & { option?: string[]; 'new-worktree'?: boolean; json?: boolean };
 
 /** An orchestration command; `type` selects the shape the server validates. */
 type OrchestrationCommand = { type: string; commandId: string } & Record<string, unknown>;
@@ -211,22 +211,29 @@ const threadStatus = (t: Thread): ThreadStatus => {
   return 'idle';
 };
 
+// Colour only on a terminal, and never when NO_COLOR is set to anything
+// (https://no-color.org), so piped output and scripts get plain text. Decided
+// per stream: `t3ctl ls 2>log` still colours the table on screen.
+const colours = (stream: NodeJS.WriteStream): boolean => Boolean(stream.isTTY) && !process.env['NO_COLOR'];
+const sgr = (code: string, s: string, stream: NodeJS.WriteStream = process.stdout): string =>
+  (colours(stream) ? `\x1b[${code}m${s}\x1b[0m` : s);
+
 const ICON = {
-  running: '\x1b[32m●\x1b[0m', error: '\x1b[31m✕\x1b[0m', 'needs-review': '\x1b[33m◆\x1b[0m',
-  snoozed: '\x1b[90m☾\x1b[0m', settled: '\x1b[90m✓\x1b[0m', idle: '\x1b[90m·\x1b[0m',
-  archived: '\x1b[90m▪\x1b[0m', deleted: '\x1b[90m✗\x1b[0m',
+  running: sgr('32', '●'), error: sgr('31', '✕'), 'needs-review': sgr('33', '◆'),
+  snoozed: sgr('90', '☾'), settled: sgr('90', '✓'), idle: sgr('90', '·'),
+  archived: sgr('90', '▪'), deleted: sgr('90', '✗'),
 };
 /** `catch` binds `unknown`; every call site wants the same string out of it. */
 const errorMessage = (e: unknown): string => (e instanceof Error ? e.message : String(e));
 
-const dim = (s: string) => `\x1b[90m${s}\x1b[0m`;
+const dim = (s: string, stream?: NodeJS.WriteStream) => sgr('90', s, stream);
 // Usage errors are user errors: print to stderr and exit non-zero so scripts
 // can tell them apart from success.
 const usage = (message: string): void => {
   console.error(message);
   process.exitCode = 1;
 };
-const bold = (s: string) => `\x1b[1m${s}\x1b[0m`;
+const bold = (s: string) => sgr('1', s);
 
 type Reached = { host: Host; snap: Snapshot };
 type Unreached = { host: Host; error: string };
@@ -289,7 +296,7 @@ const cmdLs = async ({ threads: showThreads, all: showAll, json: asJson }: LsOpt
       }
     }
   }
-  for (const f of failed) console.error(`\n\x1b[31munreachable\x1b[0m ${f.host.name}: ${f.error}`);
+  for (const f of failed) console.error(`\n${sgr('31', 'unreachable', process.stderr)} ${f.host.name}: ${f.error}`);
 };
 
 // ---- host registry ------------------------------------------------------
@@ -327,7 +334,7 @@ const probe = async (origin: string, timeoutMs = 5000): Promise<Descriptor> => {
 };
 
 const shortId = (id?: string | null) => (id ? id.slice(0, 8) : '-');
-const warn = (message: string) => console.error(`\x1b[33mwarning\x1b[0m ${message}`);
+const warn = (message: string) => console.error(`${sgr('33', 'warning', process.stderr)} ${message}`);
 
 // The name is what you type in --host, so derive a typeable slug from the label
 // rather than using the label verbatim.
@@ -1173,7 +1180,10 @@ const withOptions = (selection: ModelSelection, raw: string[] = []): ModelSelect
   return { ...selection, options: [...options.values()] };
 };
 
-const describeModel = (m: ModelSelection): string => `${m.instanceId}/${m.model}` +
+/** The `--model` spelling of a selection, without its options. */
+const modelRef = (m: ModelSelection): string => `${m.instanceId}/${m.model}`;
+
+const describeModel = (m: ModelSelection): string => modelRef(m) +
   (m.options?.length ? ` (${m.options.map((o) => `${o.id}=${o.value}`).join(', ')})` : '');
 
 // Who a command is from, as the server records it. t3ctl acts for the person at
@@ -1198,6 +1208,7 @@ const cmdThreadStartV1 = async (thread: Thread, host: Host, text: string, flags:
   if (!base && flags.option?.length) throw new Error('--option needs a model; the thread has none, so pass --model too');
   if (base) command.modelSelection = withOptions(base, flags.option);
   const { sequence } = await dispatch(host, command);
+  if (flags.json) return printJson({ threadId: thread.id, host: host.name, sequence });
   const m = command['modelSelection'] as ModelSelection | undefined;
   console.log(`started ${bold(thread.title || thread.id)}\n  id    ${thread.id}` +
     (m ? `\n  model ${describeModel(m)}` : '') +
@@ -1229,6 +1240,7 @@ const cmdThreadStart = async (thread: Thread, host: Host, text: string, flags: F
     dispatchMode: { type: thread.activeRunId ? 'queue_after_active' : 'start_immediately' },
   });
   const { sequence } = await dispatch(host, ...commands);
+  if (flags.json) return printJson({ threadId: thread.id, host: host.name, sequence });
   const m = modelSelection ?? thread.modelSelection;
   console.log(`${thread.activeRunId ? 'queued for' : 'started'} ${bold(thread.title || thread.id)}\n  id    ${thread.id}` +
     (m ? `\n  model ${describeModel(m)}` : '') +
@@ -1343,7 +1355,7 @@ const cmdThreadRetitle = async (thread: Thread, host: Host, timeoutSeconds: numb
   }
 
   console.error(
-    `\x1b[33mno title was generated\x1b[0m — the server ${sawMarker ? 'cleared the request without producing one' : `did not act on it within ${timeoutSeconds}s`}.\n` +
+    `${sgr('33', 'no title was generated', process.stderr)} — the server ${sawMarker ? 'cleared the request without producing one' : `did not act on it within ${timeoutSeconds}s`}.\n` +
     `  The title is still "${before}". Set one directly:\n` +
     `    t3ctl thread rename ${thread.id} <title...>`,
   );
@@ -1376,6 +1388,13 @@ const cmdProjectCreate = async (title: string, root: string, flags: Flags): Prom
   if (!res.ok) throw new Error(`project.create failed: HTTP ${res.status} ${(await res.text()).slice(0, 300)}`);
   console.log(`created project ${bold(title)} on ${host.name}\n  id   ${projectId}\n  root ${workspaceRoot}`);
 };
+
+const printJson = (value: unknown): void => console.log(JSON.stringify(value, null, 2));
+
+/** What `thread create --json` prints, whichever way the thread was made. */
+const createdJson = (host: Host, project: Project, id: string, title: string, model: ModelSelection, sequence: number | null) => ({
+  id, title, projectId: project.id, project: project.title, host: host.name, model: modelRef(model), sequence,
+});
 
 // The shape the server recognises as temporary (isTemporaryWorktreeBranch in
 // packages/shared/src/git.ts) and renames after the first turn. A branch is
@@ -1417,7 +1436,7 @@ const cmdThreadCreateInWorktreeV1 = async (host: Host, project: Project, title: 
     const branch = flags.branch ?? temporaryBranch();
     const threadId = crypto.randomUUID();
     const createdAt = new Date().toISOString();
-    console.error(dim(`preparing ${branch} from ${baseBranch} in a new worktree on ${host.name} — this can take a few minutes`));
+    if (!flags.json) console.error(dim(`preparing ${branch} from ${baseBranch} in a new worktree on ${host.name} — this can take a few minutes`, process.stderr));
     const { sequence } = (await rpc.call('orchestration.dispatchCommand', {
       type: 'thread.turn.start', commandId: crypto.randomUUID(), threadId,
       message: { messageId: crypto.randomUUID(), role: 'user', text: flags.message, attachments: [] },
@@ -1442,6 +1461,7 @@ const cmdThreadCreateInWorktreeV1 = async (host: Host, project: Project, title: 
         : error.disposition === 'not-created' ? 'no thread was created' : '';
       throw new Error(outcome ? `${error.message}\n  ${outcome}` : error.message);
     })) as { sequence: number };
+    if (flags.json) return printJson(createdJson(host, project, threadId, title, modelSelection, sequence));
     // The server picks the worktree path, so read it back rather than guess it.
     const made = await threadDetail(host, threadId, 1).catch(() => null);
     console.log(`started ${bold(title)} in ${project.title} on ${host.name}\n  id       ${threadId}\n` +
@@ -1480,6 +1500,8 @@ const cmdThreadCreateInWorktree = async (host: Host, project: Project, title: st
       throw new Error(`${errorMessage(error)}\n  any setup already under way carries on on the server — check with: t3ctl ls -t`);
     })) as LaunchResult;
     const made = projection.thread;
+    // launchThread answers with the thread, not a sequence.
+    if (flags.json) return printJson(createdJson(host, project, threadId, title, modelSelection, null));
     console.log(`started ${bold(title)} in ${project.title} on ${host.name}\n  id       ${threadId}\n` +
       `  branch   ${made.branch ?? branch} ${dim(`(from ${baseBranch})`)}\n  worktree ${made.worktreePath ?? dim('being prepared — check with: t3ctl ls -t')}\n` +
       `  model    ${describeModel(modelSelection)}\n  mode     ${runtimeMode} / ${interactionMode}`);
@@ -1512,6 +1534,7 @@ const cmdThreadCreate = async (projectRef: string, title: string, flags: Flags):
     branch: flags.branch ?? null,
     worktreePath: flags.worktree ?? null,
   });
+  if (flags.json) return printJson(createdJson(host, project, threadId, title, modelSelection, sequence));
   console.log(`created thread ${bold(title)} in ${project.title} on ${host.name}\n  id    ${threadId}\n  model ${describeModel(modelSelection)}\n  seq   ${sequence}`);
 };
 
@@ -1831,7 +1854,7 @@ const cmdExportPrompts = async (o: ExportOptions): Promise<void> => {
     }
   }
 
-  for (const u of unreachable) console.error(`${ICON.error} ${u.host} ${dim(u.error)}`);
+  for (const u of unreachable) console.error(`${sgr('31', '✕', process.stderr)} ${u.host} ${dim(u.error, process.stderr)}`);
   // Partial results are still useful and `unreachable` reports what is missing,
   // so only a total failure is an error.
   if (unreachable.length === hosts.length) process.exitCode = 1;
@@ -1845,7 +1868,7 @@ const FLAG_NAMES = {
   host: 'host', model: 'model', branch: 'branch', worktree: 'worktree',
   name: 'name', timeout: 'timeout',
   runtimeMode: 'runtime-mode', interactionMode: 'interaction-mode',
-  option: 'option', newWorktree: 'new-worktree', base: 'base', message: 'message',
+  option: 'option', newWorktree: 'new-worktree', base: 'base', message: 'message', json: 'json',
 };
 // Only carry options that were actually supplied. Emitting every key
 // unconditionally made `'name' in flags` always true, which made host add bail
@@ -1867,7 +1890,23 @@ const pkg = JSON.parse(
   fs.readFileSync(new URL('../package.json', import.meta.url), 'utf8'),
 ) as { version: string };
 
+// With --json, an error is one JSON object on stderr — commander's own (a
+// missing argument, an unknown option) as well as ours — so a caller reads it
+// with JSON.parse instead of stripping colour and prose. Read from argv because
+// commander's errors arrive before any options are parsed; a `--json` after
+// `--` is message text, not the flag.
+const jsonErrors = ((args) => args.slice(0, args.includes('--') ? args.indexOf('--') : undefined).includes('--json'))(process.argv.slice(2));
+const printJsonError = (message: string): void => { process.stderr.write(`${JSON.stringify({ error: message })}\n`); };
+
 const program = new Command();
+// Before any .command(): subcommands copy the output settings when created.
+if (jsonErrors) {
+  program.configureOutput({
+    outputError: (text) => printJsonError(text.replace(/^error: /, '').trim()),
+    // Drops the "(run `t3ctl --help` ...)" hint commander adds after an error.
+    writeErr: () => {},
+  });
+}
 program
   .name('t3ctl')
   .description('Control T3 Code hosts — list and drive coding-agent threads across every machine you run T3 Code on.')
@@ -1972,7 +2011,8 @@ hostOption(thread.command('create')
   .option('--base <branch>', "with --new-worktree: branch to start from (default: the repo's default branch)")
   .option('--message <text>', 'with --new-worktree: the first message, which starts the agent (quote it)')
   .option('--runtime-mode <mode>', RUNTIME_MODE_HELP, 'full-access')
-  .option('--interaction-mode <mode>', 'default | plan', 'default'))
+  .option('--interaction-mode <mode>', 'default | plan', 'default')
+  .option('--json', 'print the new thread as JSON, and errors as {"error": ...} on stderr'))
   .action((ref: string, title: string[], o: OptionValues) => cmdThreadCreate(ref, title.join(' '), toFlags(o)));
 
 hostOption(thread.command('send')
@@ -1983,7 +2023,8 @@ hostOption(thread.command('send')
   .option('--model <instance/model>', "override the thread's model for this turn")
   .option('--option <id=value>', "model option for this turn, e.g. effort=high; repeatable", addOption)
   .option('--runtime-mode <mode>', RUNTIME_MODE_HELP)
-  .option('--interaction-mode <mode>', 'default | plan'))
+  .option('--interaction-mode <mode>', 'default | plan')
+  .option('--json', 'print the result as JSON, and errors as {"error": ...} on stderr'))
   .action(async (ref: string, message: string[], o: OptionValues) => {
     const { host: h, thread: t } = await resolve(ref, o);
     return cmdThreadStart(t, h, message.join(' '), toFlags(o));
@@ -2059,6 +2100,7 @@ for (const verb of SIMPLE_THREAD_COMMANDS) {
 try {
   await program.parseAsync(process.argv);
 } catch (error) {
-  console.error(`\x1b[31merror\x1b[0m ${error instanceof Error ? error.message : String(error)}`);
+  if (jsonErrors) printJsonError(errorMessage(error));
+  else console.error(`${sgr('31', 'error', process.stderr)} ${errorMessage(error)}`);
   process.exit(1);
 }
