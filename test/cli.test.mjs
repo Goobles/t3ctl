@@ -824,7 +824,6 @@ test('ls --json lists each thread\'s linked pull requests', async () => {
     ...THREAD, id: '44444444-4444-4444-8444-444444444444', title: 'linked',
     pullRequests: [
       link(5, { snapshot: { state: 'merged', title: 'x', headBranch: 'a', baseBranch: 'main', isDraft: false, updatedAt: null, syncedAt: '2026-10-01T00:00:00.000Z' } }),
-      // Not synced with the host yet: no state to report.
       link(6),
       // A tombstone for a stack member the user unlinked; T3 hides it too.
       link(7, { source: 'stack-dismissed' }),
@@ -836,7 +835,7 @@ test('ls --json lists each thread\'s linked pull requests', async () => {
     assert.equal(code, 0, stderr);
     const threads = Object.fromEntries(JSON.parse(stdout).projects[0].threads.map((t) => [t.title, t]));
     assert.deepEqual(threads.linked.pullRequests, [
-      { url: 'https://github.com/Sparklink/mainframe/pull/5', repository: 'sparklink/mainframe', number: 5, state: 'merged' },
+      { url: 'https://github.com/Sparklink/mainframe/pull/5', repository: 'sparklink/mainframe', number: 5 },
       { url: 'https://github.com/Sparklink/mainframe/pull/6', repository: 'sparklink/mainframe', number: 6 },
     ]);
     assert.deepEqual(threads.scratch.pullRequests, []);

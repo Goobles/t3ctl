@@ -79,9 +79,7 @@ t3ctl ls --json | jq -r '.projects[].threads[] | select(.status=="running") | .t
 ```
 
 Each thread in `--json` carries `pullRequests`: the PRs linked to it in T3 Code, as
-`{ url, repository, number, state }`, or `[]` when there are none. `state` is
-`open`, `merged` or `closed` as T3 last synced it, and is left out until the first
-sync.
+`{ url, repository, number }`, or `[]` when there are none.
 
 The JSON shape is `{projects: [{host, id, title, workspaceRoot, threads: [{id,
 title, branch, status, provider, updatedAt}]}], unreachable: [{host, error}]}`.

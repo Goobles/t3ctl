@@ -80,17 +80,13 @@ type Thread = {
   messages?: ThreadMessage[];
 };
 
-/**
- * The fields t3ctl reads from a thread's pull request link. `snapshot` is the
- * host state T3 last synced, null until the first sync.
- */
+/** The fields t3ctl reads from a thread's pull request link. */
 type PullRequestLink = {
   repository: string;
   number: number;
   url: string;
   /** `stack-dismissed` marks a stack member the user unlinked; T3 hides those. */
   source: string;
-  snapshot: { state: string } | null;
 };
 
 /** A conversation message from a thread projection. */
@@ -268,11 +264,11 @@ const collect = async (hosts: Host[]): Promise<{ ok: Reached[]; failed: Unreache
 
 type LsOptions = { threads?: boolean; all?: boolean; json?: boolean };
 
-// The same links T3's own list_thread_pull_requests tool reports. `state` is
-// left out until T3 has synced the PR with its host.
+// The same links T3's own list_thread_pull_requests tool reports. No state:
+// T3 only knows it as of its last sync with the host, which can be stale.
 const pullRequestsOf = (t: Thread) => (t.pullRequests ?? [])
   .filter((l) => l.source !== 'stack-dismissed')
-  .map((l) => ({ url: l.url, repository: l.repository, number: l.number, ...(l.snapshot ? { state: l.snapshot.state } : {}) }));
+  .map((l) => ({ url: l.url, repository: l.repository, number: l.number }));
 
 const cmdLs = async ({ threads: showThreads, all: showAll, json: asJson }: LsOptions): Promise<void> => {
   const hosts = readHosts();
