@@ -78,6 +78,9 @@ view. Pipe `--json` through `jq` if you want to slice it:
 t3ctl ls --json | jq -r '.projects[].threads[] | select(.status=="running") | .title'
 ```
 
+Each thread in `--json` carries `pullRequests`: the PRs linked to it in T3 Code, as
+`{ url, repository, number }`, or `[]` when there are none.
+
 The JSON shape is `{projects: [{host, id, title, workspaceRoot, threads: [{id,
 title, branch, status, provider, updatedAt}]}], unreachable: [{host, error}]}`.
 

@@ -69,6 +69,8 @@ type Thread = {
   activeRunId?: string | null;
   lastError?: string | null;
   hasActionableProposedPlan?: boolean;
+  /** Pull requests linked to the thread (ThreadPullRequestLink); absent on servers from before linking. */
+  pullRequests?: PullRequestLink[];
   // Protocol 1 fields.
   session?: { status: string; providerName?: string | null; activeTurnId?: string | null } | null;
   latestTurn?: { state?: string } | null;
@@ -76,6 +78,15 @@ type Thread = {
   titleRegeneration?: unknown | null;
   /** Only ever populated by the per-thread endpoint; the shell snapshot has no messages. */
   messages?: ThreadMessage[];
+};
+
+/** The fields t3ctl reads from a thread's pull request link. */
+type PullRequestLink = {
+  repository: string;
+  number: number;
+  url: string;
+  /** `stack-dismissed` marks a stack member the user unlinked; T3 hides those. */
+  source: string;
 };
 
 /** A conversation message from a thread projection. */
@@ -253,6 +264,12 @@ const collect = async (hosts: Host[]): Promise<{ ok: Reached[]; failed: Unreache
 
 type LsOptions = { threads?: boolean; all?: boolean; json?: boolean };
 
+// The same links T3's own list_thread_pull_requests tool reports. No state:
+// T3 only knows it as of its last sync with the host, which can be stale.
+const pullRequestsOf = (t: Thread) => (t.pullRequests ?? [])
+  .filter((l) => l.source !== 'stack-dismissed')
+  .map((l) => ({ url: l.url, repository: l.repository, number: l.number }));
+
 const cmdLs = async ({ threads: showThreads, all: showAll, json: asJson }: LsOptions): Promise<void> => {
   const hosts = readHosts();
   if (!hosts.length) return console.error('No hosts registered. Run: t3ctl host add <origin> <token>');
@@ -266,7 +283,7 @@ const cmdLs = async ({ threads: showThreads, all: showAll, json: asJson }: LsOpt
         host: host.name, id: p.id, title: p.title, workspaceRoot: p.workspaceRoot,
         threads: snap.threads.filter((t) => t.projectId === p.id)
           .filter((t) => showAll || (!t.deletedAt && !t.archivedAt))
-          .map((t) => ({ id: t.id, title: t.title, branch: t.branch, status: threadStatus(t), provider: t.providerInstanceId ?? t.session?.providerName ?? null, updatedAt: t.updatedAt })),
+          .map((t) => ({ id: t.id, title: t.title, branch: t.branch, status: threadStatus(t), provider: t.providerInstanceId ?? t.session?.providerName ?? null, updatedAt: t.updatedAt, pullRequests: pullRequestsOf(t) })),
       })));
     console.log(JSON.stringify({ projects: out, unreachable: failed.map((f) => ({ host: f.host.name, error: f.error })) }, null, 2));
     return;
