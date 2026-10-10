@@ -449,7 +449,7 @@ const defaultRpc = (request) => {
  * names a protocol. `dispatched` is the commands received, in order: at
  * POST /dispatch for protocol 1, over the socket for protocol 2.
  */
-const fakeT3 = async (serverVersion, threads = [], answer = defaultRpc, protocol = 2) => {
+const fakeT3 = async (serverVersion, threads = [], answer = defaultRpc, protocol = 2, address = '127.0.0.1') => {
   const rpc = [];
   const projectMutations = [];
   const httpDispatched = [];
@@ -489,9 +489,11 @@ const fakeT3 = async (serverVersion, threads = [], answer = defaultRpc, protocol
     res.setHeader('content-type', 'text/html'); res.end('<!doctype html><html></html>');
   });
   acceptWebSocket(server, rpc, answer);
-  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  // Anything but 127.0.0.1 is bound on every interface, so it is reachable at
+  // the address the CLI treats as another machine.
+  await new Promise((resolve) => server.listen(0, address === '127.0.0.1' ? address : '0.0.0.0', resolve));
   return {
-    origin: `http://127.0.0.1:${server.address().port}`, rpc, server, projectMutations,
+    origin: `http://${address}:${server.address().port}`, rpc, server, projectMutations,
     get dispatched() {
       return protocol === 1 ? httpDispatched
         : rpc.filter((r) => r.tag === 'orchestration.dispatchCommand').map((r) => r.payload);
@@ -798,6 +800,33 @@ test('project create goes to the projects endpoint, not the orchestrator', async
     assert.deepEqual(rest, { type: 'project.create', title: 'beta', workspaceRoot: tmpdir() });
     assert.deepEqual(w.dispatched, []);
   } finally { w.close(); }
+});
+
+test('project create checks the workspace root only on a local host', async () => {
+  const local = await threadWorld();
+  try {
+    const missing = join(tmpdir(), 't3ctl-no-such-root');
+    const { code, stderr } = await cliIn(local.home, 'project', 'create', 'beta', missing);
+    assert.notEqual(code, 0);
+    assert.match(stderr, /workspace root does not exist/);
+    assert.deepEqual(local.projectMutations, []);
+  } finally { local.close(); }
+
+  // Another machine's paths mean nothing here: its server checks them.
+  const remote = world(await fakeT3('0.0.45', [THREAD], defaultRpc, 2, new URL(await refusedRemoteOrigin()).hostname));
+  try {
+    const { code, stderr } = await cliIn(remote.home, 'project', 'create', 'beta', '/srv/only-on-that-box/beta');
+    assert.equal(code, 0, stderr);
+    assert.equal(remote.projectMutations[0]?.workspaceRoot, '/srv/only-on-that-box/beta');
+
+    // ~ and relative paths would be resolved against this machine, so they are refused.
+    for (const root of ['~/Code/beta', 'beta']) {
+      const bad = await cliIn(remote.home, 'project', 'create', 'beta', root);
+      assert.notEqual(bad.code, 0, root);
+      assert.match(bad.stderr, /absolute path on box/);
+    }
+    assert.equal(remote.projectMutations.length, 1);
+  } finally { remote.close(); }
 });
 
 test('ls reads thread status and provider from the shell snapshot', async () => {
