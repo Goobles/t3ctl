@@ -240,7 +240,7 @@ Flags:
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--model <instance>/<model>` | `claudeAgent/claude-opus-5` | Provider instance and model |
+| `--model <instance>/<model>` | the project's default model | Provider instance and model. Without it, the thread gets the model T3 Code would give it: the project's default, else the environment's, else `claudeAgent/claude-opus-5-5` |
 | `--option <id>=<value>` | none | Model option, e.g. `effort=high`; repeatable |
 | `--branch <name>` | none | Git branch for the thread. With `--new-worktree`, the branch to create (default: a temporary `t3code/<8 hex>`) |
 | `--worktree <path>` | none | Existing worktree path |
@@ -276,7 +276,7 @@ t3ctl thread create t3ctl "tidy the tests" --json
   "projectId": "8b1d0c44-…",
   "project": "t3ctl",
   "host": "laptop",
-  "model": "claudeAgent/claude-opus-5",
+  "model": "claudeAgent/claude-opus-5-5",
   "sequence": 4471
 }
 ```
@@ -299,7 +299,7 @@ started fix the flaky test in t3ctl on laptop
   id       0f5c1e2a-...
   branch   t3code/3f9a1c07 (from main)
   worktree /Users/you/.t3/worktrees/t3ctl/t3code-3f9a1c07
-  model    claudeAgent/claude-opus-5
+  model    claudeAgent/claude-opus-5-5
   mode     full-access / default
   seq      4471
 ```
@@ -345,7 +345,7 @@ t3ctl thread send "rewrite the readme" move the endpoint tables into CONTRIBUTIN
 ```
 started rewrite the readme for users
   id    0f5c1e2a-...
-  model claudeAgent/claude-opus-5
+  model claudeAgent/claude-opus-5-5
   mode  full-access / default
   seq   4471
 ```

@@ -107,6 +107,8 @@ type Project = {
   workspaceRoot: string;
   updatedAt: string;
   deletedAt?: string | null;
+  /** The project's own default model, which servers that have not folded their project settings still honour. */
+  defaultModelSelection?: ModelSelection | null;
 };
 
 type Snapshot = { snapshotSequence: number; projects: Project[]; threads: Thread[] };
@@ -1534,13 +1536,53 @@ const cmdThreadCreateInWorktree = async (host: Host, project: Project, title: st
   }
 };
 
+/** The parts of the server's settings (`server.getSettings`) that pick a new thread's model. */
+type ProviderInstanceSettings = Record<string, { enabled?: boolean }>;
+type ServerSettings = {
+  defaultModelSelection?: ModelSelection | null;
+  providerInstances?: ProviderInstanceSettings;
+  projectSettingsOverrides?: Record<string, { defaultModelSelection?: ModelSelection | null; providerInstances?: ProviderInstanceSettings }>;
+  projectSettingsFolded?: boolean;
+};
+
+// The model T3 Code starts a new thread on when neither the project nor the
+// environment sets one.
+const FALLBACK_MODEL: ModelSelection = { instanceId: 'claudeAgent', model: 'claude-opus-5-5' };
+
+// The model a new thread gets without --model, picked as T3 Code's own
+// resolveProjectSettings does: the project's default, unless it is on a
+// provider instance the project or environment turned off, then the
+// environment's default. The server requires a model on every thread, so it
+// cannot fill this in itself. Until the server has folded project settings
+// into its override record, the project's own field still counts.
+const defaultModel = async (host: Host, project: Project, flags: Flags): Promise<ModelSelection> => {
+  let settings: ServerSettings;
+  try {
+    const rpc = await openRpc(host);
+    try {
+      settings = (await rpc.call('server.getSettings', {}, host.timeoutMs ?? 15000)) as ServerSettings;
+    } finally {
+      rpc.close();
+    }
+  } catch (error) {
+    if (!flags.json) warn(`could not read the default model from ${host.name} (${errorMessage(error)}) — using ${modelRef(FALLBACK_MODEL)}`);
+    return FALLBACK_MODEL;
+  }
+  const overrides = settings.projectSettingsOverrides?.[project.id];
+  const fromProject = overrides?.defaultModelSelection ?? (settings.projectSettingsFolded ? null : project.defaultModelSelection);
+  const enabled = (instanceId: string): boolean =>
+    overrides?.providerInstances?.[instanceId]?.enabled ?? settings.providerInstances?.[instanceId]?.enabled ?? true;
+  if (fromProject && enabled(fromProject.instanceId)) return fromProject;
+  return settings.defaultModelSelection ?? FALLBACK_MODEL;
+};
+
 const cmdThreadCreate = async (projectRef: string, title: string, flags: Flags): Promise<void> => {
   const problem = worktreeFlagProblem(flags);
   if (problem) throw new Error(problem);
   const host = pickHost(flags);
   const project = resolveProject(await snapshot(host), projectRef);
   if (!project) throw new Error(`no project matching "${projectRef}" on ${host.name}`);
-  const modelSelection = withOptions(parseModel(flags.model ?? 'claudeAgent/claude-opus-5'), flags.option);
+  const modelSelection = withOptions(flags.model ? parseModel(flags.model) : await defaultModel(host, project, flags), flags.option);
   const protocol = await protocolOf(host);
   if (flags['new-worktree']) {
     return protocol === 1
@@ -2030,7 +2072,7 @@ hostOption(thread.command('create')
   .argument('<project>', 'project id, title, or workspace root')
   .argument('<title...>', 'thread title; everything after the project is used')
   .description('create a thread (idle — use `thread send` to run it, or --new-worktree to start it in a fresh worktree)')
-  .option('--model <instance/model>', 'e.g. claudeAgent/claude-opus-5', 'claudeAgent/claude-opus-5')
+  .option('--model <instance/model>', `e.g. claudeAgent/claude-opus-5-5 (default: the project's default model, as T3 Code picks it)`)
   .option('--option <id=value>', 'model option, e.g. effort=high; repeatable', addOption)
   .option('--branch <branch>', 'git branch to associate with the thread; with --new-worktree, the branch to create')
   .option('--worktree <path>', 'existing git worktree the thread should run in')
