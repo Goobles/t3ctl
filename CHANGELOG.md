@@ -5,7 +5,6 @@
 
 ### Bug Fixes
 
-* check project workspace root only on local hosts ([a200e43](https://github.com/Goobles/t3ctl/commit/a200e43abfe2e17eb3f71c710a350627ab2dc9f7))
 * check project workspace root only on local hosts ([fdd9965](https://github.com/Goobles/t3ctl/commit/fdd9965337acc299e20da6862de4f8d50a90bf54))
 
 ## [0.10.0](https://github.com/Goobles/t3ctl/compare/v0.9.1...v0.10.0) (2026-10-08)
