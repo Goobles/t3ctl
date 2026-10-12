@@ -107,6 +107,8 @@ type Project = {
   workspaceRoot: string;
   updatedAt: string;
   deletedAt?: string | null;
+  /** The project's own default model, which servers that have not folded their project settings still honour. */
+  defaultModelSelection?: ModelSelection | null;
 };
 
 type Snapshot = { snapshotSequence: number; projects: Project[]; threads: Thread[] };
@@ -1534,13 +1536,77 @@ const cmdThreadCreateInWorktree = async (host: Host, project: Project, title: st
   }
 };
 
+/** The parts of the server's settings (`server.getSettings`) that pick a new thread's model. */
+type ServerSettings = {
+  defaultModelSelection?: ModelSelection | null;
+  providerInstances?: Record<string, { driver: string; enabled?: boolean; config?: unknown }>;
+  projectSettingsOverrides?: Record<string, {
+    defaultModelSelection?: ModelSelection | null;
+    providerInstances?: Record<string, { enabled?: boolean }>;
+  }>;
+  projectSettingsFolded?: boolean;
+};
+
+// Copied from T3 Code's settings contract (packages/contracts/src/settings.ts):
+// built-in drivers that stay off until turned on, and the default instances
+// that run before they are configured. Any other id without an entry has no
+// running instance.
+const DEFAULT_DISABLED_PROVIDER_DRIVERS = new Set(['cursor', 'grok', 'muse', 'pi', 'opencode', 'antigravity']);
+const DEFAULT_ENABLED_DEFAULT_INSTANCES = new Set(['codex', 'claudeAgent']);
+
+// T3's resolveProjectProviderInstanceEnabled: the project's override, else the
+// instance's own flags (an explicit false on either wins), else its driver's
+// default.
+const providerInstanceEnabled = (settings: ServerSettings, projectId: string, instanceId: string): boolean => {
+  const override = settings.projectSettingsOverrides?.[projectId]?.providerInstances?.[instanceId]?.enabled;
+  if (override !== undefined) return override;
+  const instances = settings.providerInstances ?? {};
+  if (!Object.hasOwn(instances, instanceId)) return DEFAULT_ENABLED_DEFAULT_INSTANCES.has(instanceId);
+  const instance = instances[instanceId]!;
+  const config = instance.config;
+  const flag = config !== null && typeof config === 'object' && !Array.isArray(config) ? (config as { enabled?: unknown }).enabled : undefined;
+  const configEnabled = typeof flag === 'boolean' ? flag : undefined;
+  if (instance.enabled === false || configEnabled === false) return false;
+  return instance.enabled ?? configEnabled ?? !DEFAULT_DISABLED_PROVIDER_DRIVERS.has(instance.driver);
+};
+
+// The model T3 Code starts a new thread on when neither the project nor the
+// environment sets one.
+const FALLBACK_MODEL: ModelSelection = { instanceId: 'claudeAgent', model: 'claude-opus-5-5' };
+
+// The model a new thread gets without --model, picked as T3 Code's own
+// resolveProjectSettings does: the project's default, unless it is on a
+// provider instance the project or environment turned off, then the
+// environment's default. The server requires a model on every thread, so it
+// cannot fill this in itself. Until the server has folded project settings
+// into its override record, the project's own field still counts, unless the
+// record overrides it. A null override means no project default.
+const defaultModel = async (host: Host, project: Project, flags: Flags): Promise<ModelSelection> => {
+  let settings: ServerSettings;
+  try {
+    const rpc = await openRpc(host);
+    try {
+      settings = (await rpc.call('server.getSettings', {}, host.timeoutMs ?? 15000)) as ServerSettings;
+    } finally {
+      rpc.close();
+    }
+  } catch (error) {
+    if (!flags.json) warn(`could not read the default model from ${host.name} (${errorMessage(error)}) — using ${modelRef(FALLBACK_MODEL)}`);
+    return FALLBACK_MODEL;
+  }
+  const stored = settings.projectSettingsOverrides?.[project.id]?.defaultModelSelection;
+  const fromProject = stored !== undefined ? stored : settings.projectSettingsFolded ? null : project.defaultModelSelection;
+  if (fromProject && providerInstanceEnabled(settings, project.id, fromProject.instanceId)) return fromProject;
+  return settings.defaultModelSelection ?? FALLBACK_MODEL;
+};
+
 const cmdThreadCreate = async (projectRef: string, title: string, flags: Flags): Promise<void> => {
   const problem = worktreeFlagProblem(flags);
   if (problem) throw new Error(problem);
   const host = pickHost(flags);
   const project = resolveProject(await snapshot(host), projectRef);
   if (!project) throw new Error(`no project matching "${projectRef}" on ${host.name}`);
-  const modelSelection = withOptions(parseModel(flags.model ?? 'claudeAgent/claude-opus-5'), flags.option);
+  const modelSelection = withOptions(flags.model ? parseModel(flags.model) : await defaultModel(host, project, flags), flags.option);
   const protocol = await protocolOf(host);
   if (flags['new-worktree']) {
     return protocol === 1
@@ -2030,7 +2096,7 @@ hostOption(thread.command('create')
   .argument('<project>', 'project id, title, or workspace root')
   .argument('<title...>', 'thread title; everything after the project is used')
   .description('create a thread (idle — use `thread send` to run it, or --new-worktree to start it in a fresh worktree)')
-  .option('--model <instance/model>', 'e.g. claudeAgent/claude-opus-5', 'claudeAgent/claude-opus-5')
+  .option('--model <instance/model>', `e.g. claudeAgent/claude-opus-5-5 (default: the project's default model, as T3 Code picks it)`)
   .option('--option <id=value>', 'model option, e.g. effort=high; repeatable', addOption)
   .option('--branch <branch>', 'git branch to associate with the thread; with --new-worktree, the branch to create')
   .option('--worktree <path>', 'existing git worktree the thread should run in')

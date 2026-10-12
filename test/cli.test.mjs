@@ -80,6 +80,12 @@ test('thread start is still an alias of send', async () => {
   assert.match(stdout, /send\|start/);
 });
 
+test('thread create --help names no fixed default model', async () => {
+  const { stdout } = await cli('thread', 'create', '--help');
+  assert.doesNotMatch(stdout, /default: "claudeAgent/);
+  assert.match(stdout, /project's default model/);
+});
+
 test('bad input exits non-zero', async () => {
   const cases = [
     ['thread', 'send'],
@@ -422,12 +428,16 @@ const ok = (value) => ({ _tag: 'Success', value });
 /** An answer that cuts the connection instead of replying. */
 const DROP = Symbol('drop');
 
+/** A fresh install's server settings, as far as t3ctl reads them: no default model anywhere. */
+const DEFAULT_SETTINGS = { defaultModelSelection: null, providerInstances: {}, projectSettingsOverrides: {}, projectSettingsFolded: true };
+
 /**
  * What a git project answers by default: a feature branch checked out, `main`
  * the default only on origin. A launched thread comes back already on its
  * branch, with the worktree path the server picked.
  */
 const defaultRpc = (request) => {
+  if (request.tag === 'server.getSettings') return ok(DEFAULT_SETTINGS);
   if (request.tag === 'vcs.listRefs') {
     return ok({ isRepo: true, hasPrimaryRemote: true, nextCursor: null, totalCount: 2, refs: [
       { name: 'feature', current: true, isDefault: false, worktreePath: '/tmp' },
@@ -493,7 +503,8 @@ const fakeT3 = async (serverVersion, threads = [], answer = defaultRpc, protocol
   // the address the CLI treats as another machine.
   await new Promise((resolve) => server.listen(0, address === '127.0.0.1' ? address : '0.0.0.0', resolve));
   return {
-    origin: `http://${address}:${server.address().port}`, rpc, server, projectMutations,
+    // `project` is served as it is at each request, so a test can change it.
+    origin: `http://${address}:${server.address().port}`, rpc, server, projectMutations, project: PROJECT,
     get dispatched() {
       return protocol === 1 ? httpDispatched
         : rpc.filter((r) => r.tag === 'orchestration.dispatchCommand').map((r) => r.payload);
@@ -759,9 +770,138 @@ test('thread create says who it is from, as protocol 2 requires', async () => {
     const { threadId, ...rest } = withoutCommandId(w.dispatched[0]);
     assert.deepEqual(rest, {
       type: 'thread.create', createdBy: 'user', creationSource: 'web', projectId: 'p1', title: 'hello',
-      modelSelection: { instanceId: 'claudeAgent', model: 'claude-opus-5' },
+      modelSelection: { instanceId: 'claudeAgent', model: 'claude-opus-5-5' },
       runtimeMode: 'full-access', interactionMode: 'default', branch: null, worktreePath: null,
     });
+  } finally { w.close(); }
+});
+
+// Without --model a thread gets the model T3 itself would give it: the
+// project's default, else the environment's, else T3's built-in default.
+const settingsWorld = async (settings, protocol = 2) =>
+  world(await fakeT3('0.0.45', [THREAD], (request) => request.tag === 'server.getSettings' ? ok(settings) : defaultRpc(request), protocol));
+
+const createdModel = async (w, ...flags) => {
+  const { code, stderr } = await cliIn(w.home, 'thread', 'create', 'alpha', 'hello', ...flags);
+  assert.equal(code, 0, stderr);
+  return w.dispatched.at(-1).modelSelection;
+};
+
+test('thread create without --model uses the project\'s default model', async () => {
+  const project = { instanceId: 'codex', model: 'gpt-6-astra', options: [{ id: 'reasoningEffort', value: 'high' }] };
+  const w = await settingsWorld({
+    ...DEFAULT_SETTINGS,
+    defaultModelSelection: { instanceId: 'claudeAgent', model: 'claude-sonnet-5-5' },
+    projectSettingsOverrides: { p1: { defaultModelSelection: project }, p2: { defaultModelSelection: { instanceId: 'x', model: 'y' } } },
+  });
+  try {
+    assert.deepEqual(await createdModel(w), project);
+    // --option adds to the default rather than replacing it.
+    assert.deepEqual(await createdModel(w, '--option', 'fastMode=true'), { ...project, options: [...project.options, { id: 'fastMode', value: true }] });
+    // --model still wins, and then the settings are not read at all.
+    const reads = w.rpc.filter((r) => r.tag === 'server.getSettings').length;
+    assert.deepEqual(await createdModel(w, '--model', 'claudeAgent/claude-opus-5-5'), { instanceId: 'claudeAgent', model: 'claude-opus-5-5' });
+    assert.equal(w.rpc.filter((r) => r.tag === 'server.getSettings').length, reads);
+  } finally { w.close(); }
+});
+
+test('thread create without --model falls back to the environment\'s default, then T3\'s', async () => {
+  const environment = { instanceId: 'claudeAgent', model: 'claude-sonnet-5-5' };
+  const w = await settingsWorld({ ...DEFAULT_SETTINGS, defaultModelSelection: environment });
+  try {
+    assert.deepEqual(await createdModel(w), environment);
+  } finally { w.close(); }
+
+  const fresh = await threadWorld();
+  try {
+    assert.deepEqual(await createdModel(fresh), { instanceId: 'claudeAgent', model: 'claude-opus-5-5' });
+  } finally { fresh.close(); }
+});
+
+test('a project default on a provider the project turned off is skipped, as T3 does', async () => {
+  const environment = { instanceId: 'claudeAgent', model: 'claude-sonnet-5-5' };
+  const w = await settingsWorld({
+    ...DEFAULT_SETTINGS,
+    defaultModelSelection: environment,
+    projectSettingsOverrides: { p1: { defaultModelSelection: { instanceId: 'codex', model: 'gpt-6-astra' }, providerInstances: { codex: { enabled: false } } } },
+  });
+  try {
+    assert.deepEqual(await createdModel(w), environment);
+  } finally { w.close(); }
+});
+
+test('a project default counts only on a provider instance T3 would run', async () => {
+  const environment = { instanceId: 'claudeAgent', model: 'claude-sonnet-5-5' };
+  const project = (instanceId) => ({ instanceId, model: 'm' });
+  // [instance the project default is on, providerInstances, project's own providerInstances, picked?]
+  const cases = [
+    ['work', { work: { driver: 'codex', config: { enabled: false } } }, undefined, false], // legacy config flag
+    ['work', { work: { driver: 'codex', enabled: true, config: { enabled: false } } }, undefined, false], // either false wins
+    ['work', { work: { driver: 'codex' } }, undefined, true],
+    ['cursor', { cursor: { driver: 'cursor' } }, undefined, false], // driver off by default
+    ['cursor', { cursor: { driver: 'cursor', config: { enabled: true } } }, undefined, true],
+    ['removed', {}, undefined, false], // no such instance any more
+    ['claudeAgent', {}, undefined, true], // built-in default instance
+    ['cursor', { cursor: { driver: 'cursor' } }, { cursor: { enabled: true } }, true], // the project turned it on
+    ['codex', {}, { codex: { enabled: false } }, false], // the project turned it off
+  ];
+  for (const [instanceId, providerInstances, projectInstances, picked] of cases) {
+    const w = await settingsWorld({
+      ...DEFAULT_SETTINGS, defaultModelSelection: environment, providerInstances,
+      projectSettingsOverrides: { p1: { defaultModelSelection: project(instanceId), providerInstances: projectInstances } },
+    });
+    try {
+      assert.deepEqual(await createdModel(w), picked ? project(instanceId) : environment,
+        `${instanceId} with ${JSON.stringify(providerInstances)} / ${JSON.stringify(projectInstances)}`);
+    } finally { w.close(); }
+  }
+});
+
+test('a project default cleared to null is not brought back from the project\'s own field', async () => {
+  const environment = { instanceId: 'claudeAgent', model: 'claude-sonnet-5-5' };
+  const w = await settingsWorld({
+    ...DEFAULT_SETTINGS, projectSettingsFolded: false, defaultModelSelection: environment,
+    projectSettingsOverrides: { p1: { defaultModelSelection: null } },
+  });
+  w.project.defaultModelSelection = { instanceId: 'codex', model: 'gpt-5.6-sol' };
+  try {
+    assert.deepEqual(await createdModel(w), environment);
+  } finally { w.close(); }
+});
+
+test('until the server folds project settings, the project\'s own default still counts', async () => {
+  const legacy = { instanceId: 'codex', model: 'gpt-5.6-sol' };
+  const w = await settingsWorld({ ...DEFAULT_SETTINGS, projectSettingsFolded: false });
+  w.project.defaultModelSelection = legacy;
+  try {
+    assert.deepEqual(await createdModel(w), legacy);
+  } finally { w.close(); }
+
+  // Once folded, the override record alone decides.
+  const folded = await settingsWorld(DEFAULT_SETTINGS);
+  folded.project.defaultModelSelection = legacy;
+  try {
+    assert.deepEqual(await createdModel(folded), { instanceId: 'claudeAgent', model: 'claude-opus-5-5' });
+  } finally { folded.close(); }
+});
+
+test('protocol 1: thread create without --model reads the settings too', async () => {
+  const project = { instanceId: 'codex', model: 'gpt-6-astra' };
+  const w = await settingsWorld({ ...DEFAULT_SETTINGS, projectSettingsOverrides: { p1: { defaultModelSelection: project } } }, 1);
+  try {
+    assert.deepEqual(await createdModel(w), project);
+  } finally { w.close(); }
+});
+
+test('settings that cannot be read fall back to T3\'s default, and say so', async () => {
+  const w = world(await fakeT3('0.0.45', [THREAD], (request) => request.tag === 'server.getSettings' ? {
+    _tag: 'Failure', cause: [{ _tag: 'Fail', error: { _tag: 'ServerSettingsError', message: 'settings.json is unreadable' } }],
+  } : defaultRpc(request)));
+  try {
+    const { code, stderr } = await cliIn(w.home, 'thread', 'create', 'alpha', 'hello');
+    assert.equal(code, 0, stderr);
+    assert.deepEqual(w.dispatched[0].modelSelection, { instanceId: 'claudeAgent', model: 'claude-opus-5-5' });
+    assert.match(stderr, /could not read the default model .*settings\.json is unreadable.*claudeAgent\/claude-opus-5-5/s);
   } finally { w.close(); }
 });
 
@@ -888,11 +1028,13 @@ test('--new-worktree launches the thread in one call, with the app\'s defaults',
     assert.deepEqual(w.dispatched, [], 'the launch makes the thread; nothing else may be dispatched');
     assert.match(w.rpc[0].url, /^\/ws\?wsTicket=ticket-for-Bearer%20tok&orchestrationProtocol=2$/);
 
+    // No --model: the default comes from the server's settings.
+    assert.equal(w.rpc[0].tag, 'server.getSettings');
     // No --base: the default comes from the repo, and origin/main means `main`.
-    assert.deepEqual(w.rpc[0].payload, { cwd: '/tmp', limit: 20 });
-    assert.equal(w.rpc[0].tag, 'vcs.listRefs');
+    assert.deepEqual(w.rpc[1].payload, { cwd: '/tmp', limit: 20 });
+    assert.equal(w.rpc[1].tag, 'vcs.listRefs');
 
-    const { tag, payload } = w.rpc[1];
+    const { tag, payload } = w.rpc[2];
     assert.equal(tag, 'orchestration.launchThread');
     const { commandId, threadId, initialMessage, workspaceStrategy, ...rest } = payload;
     assert.match(commandId, /^[0-9a-f-]{36}$/);
@@ -901,7 +1043,7 @@ test('--new-worktree launches the thread in one call, with the app\'s defaults',
     assert.deepEqual(initialMessage.attachments, []);
     assert.deepEqual(rest, {
       creationSource: 'web', projectId: 'p1', title: 'fix the flake',
-      modelSelection: { instanceId: 'claudeAgent', model: 'claude-opus-5' },
+      modelSelection: { instanceId: 'claudeAgent', model: 'claude-opus-5-5' },
       runtimeMode: 'full-access', interactionMode: 'default',
     });
     assert.match(workspaceStrategy.branch, /^t3code\/[0-9a-f]{8}$/, 'a temporary branch the server renames later');
@@ -919,8 +1061,8 @@ test('--base and --branch are sent as given, and skip the default-branch lookup'
     const { code, stderr } = await cliIn(w.home, 'thread', 'create', 'alpha', 'pin', 'deps',
       '--new-worktree', '--message', 'pin them', '--base', 'develop', '--branch', 'chore/pin-deps', '--runtime-mode', 'supervised');
     assert.equal(code, 0, stderr);
-    assert.deepEqual(w.rpc.map((r) => r.tag), ['orchestration.launchThread']);
-    const { workspaceStrategy, runtimeMode } = w.rpc[0].payload;
+    assert.deepEqual(w.rpc.map((r) => r.tag), ['server.getSettings', 'orchestration.launchThread']);
+    const { workspaceStrategy, runtimeMode } = w.rpc[1].payload;
     assert.equal(workspaceStrategy.baseRef, 'develop');
     assert.equal(workspaceStrategy.branch, 'chore/pin-deps');
     assert.equal(runtimeMode, 'approval-required');
@@ -933,8 +1075,8 @@ test('--new-worktree --json has no sequence to report: the launch answers with t
     const { code, stdout, stderr } = await cliIn(w.home, 'thread', 'create', 'alpha', 'fix', '--new-worktree', '--message', 'go', '--json');
     assert.equal(code, 0, stderr);
     assert.deepEqual(JSON.parse(stdout), {
-      id: w.rpc[1].payload.threadId, title: 'fix', projectId: 'p1', project: 'alpha',
-      host: 'box', model: 'claudeAgent/claude-opus-5', sequence: null,
+      id: w.rpc[2].payload.threadId, title: 'fix', projectId: 'p1', project: 'alpha',
+      host: 'box', model: 'claudeAgent/claude-opus-5-5', sequence: null,
     });
   } finally { w.close(); }
 });
@@ -996,7 +1138,7 @@ test('without --base, a repo with no known default branch asks for one', async (
     assert.notEqual(code, 0);
     assert.match(stderr, /origin\/HEAD is not set — pass --base <branch>/);
     assert.doesNotMatch(stderr, /carries on on the server/, 'nothing was dispatched, so nothing is under way');
-    assert.deepEqual(w.rpc.map((r) => r.tag), ['vcs.listRefs'], 'nothing may be launched without a base');
+    assert.deepEqual(w.rpc.map((r) => r.tag), ['server.getSettings', 'vcs.listRefs'], 'nothing may be launched without a base');
   } finally { w.close(); }
 });
 
@@ -1074,7 +1216,7 @@ test('protocol 1: thread and project create carry createdAt, and go to /dispatch
     const { threadId, ...thread } = v1Command(w.dispatched[0]);
     assert.deepEqual(thread, {
       type: 'thread.create', projectId: 'p1', title: 'hello',
-      modelSelection: { instanceId: 'claudeAgent', model: 'claude-opus-5' },
+      modelSelection: { instanceId: 'claudeAgent', model: 'claude-opus-5-5' },
       runtimeMode: 'full-access', interactionMode: 'default', branch: null, worktreePath: null,
     });
 
@@ -1091,7 +1233,7 @@ test('protocol 1: create and send --json report the sequence /dispatch answered 
     assert.equal(created.code, 0, created.stderr);
     assert.deepEqual(JSON.parse(created.stdout), {
       id: w.dispatched[0].threadId, title: 'hello', projectId: 'p1', project: 'alpha',
-      host: 'box', model: 'claudeAgent/claude-opus-5', sequence: 1,
+      host: 'box', model: 'claudeAgent/claude-opus-5-5', sequence: 1,
     });
 
     const sent = await cliIn(w.home, 'thread', 'send', 'scratch', 'hi', '--json');
@@ -1121,9 +1263,9 @@ test('protocol 1: --new-worktree sends one bootstrapped turn start over the webs
     assert.equal(code, 0, stderr);
     assert.deepEqual(w.dispatched, [], 'a bootstrap over HTTP is silently ignored, so nothing may go there');
     assert.match(w.rpc[0].url, /^\/ws\?wsTicket=ticket-for-Bearer%20tok$/, 'no protocol 2 flag on a protocol 1 socket');
-    assert.deepEqual(w.rpc.map((r) => r.tag), ['vcs.listRefs', 'orchestration.dispatchCommand']);
+    assert.deepEqual(w.rpc.map((r) => r.tag), ['server.getSettings', 'vcs.listRefs', 'orchestration.dispatchCommand']);
 
-    const { type, message, bootstrap, createdAt, modelSelection, runtimeMode, interactionMode } = w.rpc[1].payload;
+    const { type, message, bootstrap, createdAt, modelSelection, runtimeMode, interactionMode } = w.rpc[2].payload;
     assert.equal(type, 'thread.turn.start');
     assert.equal(message.text, 'find out why ci flakes');
     assert.match(bootstrap.prepareWorktree.branch, /^t3code\/[0-9a-f]{8}$/);
