@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.12.0](https://github.com/Goobles/t3ctl/compare/v0.11.0...v0.12.0) (2026-10-12)
+
+
+### Features
+
+* add models command and each thread's model and mode to ls --json ([4c9968e](https://github.com/Goobles/t3ctl/commit/4c9968e459d4798ce7ee6c462e67a759e5b5d734))
+* add models command and each thread's model and mode to ls --json ([1c79fe9](https://github.com/Goobles/t3ctl/commit/1c79fe9409748d34994fa19c94d2bd51993baddc))
+* give models an environment default per host ([359a8f4](https://github.com/Goobles/t3ctl/commit/359a8f4a574d1b65c5756c8aea9d374c446e20f4))
+
+
+### Bug Fixes
+
+* list models as T3's picker does, read past a rival, drop node_modules link ([26d99e0](https://github.com/Goobles/t3ctl/commit/26d99e0928405f2eccef4d851df42e36f82fccfe))
+
 ## [0.11.0](https://github.com/Goobles/t3ctl/compare/v0.10.1...v0.11.0) (2026-10-12)
 
 
