@@ -1125,6 +1125,57 @@ test('models --json reports a host it cannot read as unreachable, and still exit
   } finally { w.close(); rmSync(home, { recursive: true, force: true }); }
 });
 
+// T3's picker (getAppModelOptionsForInstance in apps/web/src/modelSelection.ts) takes built-in
+// models from the probe, custom ones from settings (the probe's lag behind an edit), then hides
+// and orders them by the instance's preferences.
+test('models --json lists the models T3\'s picker shows: hidden ones out, custom ones from settings, in the user\'s order', async () => {
+  const claude = PROVIDERS[0];
+  const providers = [{ ...claude, models: [
+    ...claude.models,
+    { slug: 'claude-sonnet-5-5', name: 'Claude Sonnet 5.5', isCustom: false, capabilities: { optionDescriptors: [EFFORT] } },
+    // Removed in settings since the last probe: gone.
+    { slug: 'old-custom', name: 'old-custom', isCustom: true, capabilities: null },
+    // Still in settings: it keeps the probe's options.
+    { slug: 'my-proxy', name: 'My proxy', isCustom: true, capabilities: { optionDescriptors: [EFFORT] } },
+  ] }];
+  const w = await modelsWorld({
+    ...DEFAULT_SETTINGS,
+    providerInstances: { claudeAgent: { driver: 'claudeAgent', config: { customModels: [
+      { slug: ' my-proxy ', name: 'Proxy' },
+      'brand-new', // added since the last probe
+      'claude-opus-5-5', // a built-in's slug: not a custom model
+      'brand-new',
+    ] } } },
+    providerModelPreferences: { claudeAgent: { hiddenModels: ['claude-haiku-4-5', 'brand-new'], modelOrder: ['claude-sonnet-5-5', 'brand-new'] } },
+  }, providers);
+  try {
+    const { code, stdout, stderr } = await cliIn(w.home, 'models', '--json');
+    assert.equal(code, 0, stderr);
+    // Ordered ones first, the rest as they come; custom models can't be hidden.
+    assert.deepEqual(JSON.parse(stdout).hosts[0].providers[0].models, [
+      { slug: 'claude-sonnet-5-5', name: 'Claude Sonnet 5.5', options: [EFFORT] },
+      { slug: 'brand-new', name: 'brand-new', options: [] },
+      { slug: 'claude-opus-5-5', name: 'Claude Opus 5.5', options: [EFFORT] },
+      { slug: 'my-proxy', name: 'Proxy', options: [EFFORT] },
+    ]);
+  } finally { w.close(); }
+});
+
+test('models reads a host that has a newer server beside it, and warns, as ls does', async () => {
+  const answer = (request) => request.tag === 'server.getSettings' ? ok(DEFAULT_SETTINGS)
+    : request.tag === 'server.getConfig' ? ok({ providers: PROVIDERS }) : defaultRpc(request);
+  const [a, b] = [await fakeT3('0.0.41', [], answer), await fakeT3('0.0.43', [], answer)];
+  const home = splitHome({ name: 'box', origin: a.origin, token: 'tok', environmentId: ENV_ID }, b.origin);
+  try {
+    const { code, stdout, stderr } = await cliIn(home, 'models', '--json');
+    assert.equal(code, 0, stderr);
+    const out = JSON.parse(stdout);
+    assert.deepEqual([out.hosts.map((h) => h.host), out.unreachable], [['box'], []]);
+    assert.match(stderr, /not the only T3 Code server/);
+    assert.deepEqual(a.rpc.map((r) => r.tag).sort(), ['server.getConfig', 'server.getSettings']);
+  } finally { a.close(); b.close(); rmSync(home, { recursive: true, force: true }); }
+});
+
 test('models without --json prints each host\'s providers, models and project defaults', async () => {
   const w = await modelsWorld(DEFAULT_SETTINGS);
   try {

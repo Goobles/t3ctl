@@ -1015,9 +1015,10 @@ const rpcFailure = (tag: string, exit: RpcExit): RpcError => {
 };
 
 // Only write commands open a socket, so the split-brain guard runs here.
-const openRpc = async (host: Host): Promise<RpcSession> => {
+// read: the caller only reads, so a newer server beside this one is warned about (warnRivals), not refused.
+const openRpc = async (host: Host, { read = false } = {}): Promise<RpcSession> => {
   const protocol = await protocolOf(host);
-  await assertNoRival(host);
+  if (!read) await assertNoRival(host);
   const res = await fetch(`${host.origin}/api/auth/websocket-ticket`, {
     method: 'POST',
     headers: host.token ? { authorization: `Bearer ${host.token}` } : {},
@@ -1541,6 +1542,7 @@ type ServerSettings = {
   defaultModelSelection?: ModelSelection | null;
   defaultRuntimeMode?: string;
   providerInstances?: Record<string, { driver: string; enabled?: boolean; config?: unknown }>;
+  providerModelPreferences?: Record<string, { hiddenModels?: string[]; modelOrder?: string[] }>;
   projectSettingsOverrides?: Record<string, {
     defaultModelSelection?: ModelSelection | null;
     defaultRuntimeMode?: string | null;
@@ -1632,7 +1634,43 @@ type ServerProvider = {
   status: string;
   availability?: string;
   supportedRuntimeModes?: string[];
-  models: { slug: string; name: string; isLegacy?: boolean; capabilities?: { optionDescriptors?: ProviderOptionDescriptor[] } | null }[];
+  models: { slug: string; name: string; isCustom?: boolean; isLegacy?: boolean; capabilities?: { optionDescriptors?: ProviderOptionDescriptor[] } | null }[];
+};
+
+// T3's limits on an instance's custom models (MAX_CUSTOM_MODEL_* in apps/web/src/modelSelection.ts).
+const MAX_CUSTOM_MODELS = 32;
+const MAX_CUSTOM_MODEL_LENGTH = 256;
+
+// The models T3's picker lists for a provider instance (getAppModelOptionsForInstance): built-in
+// ones from the probe, custom ones from the instance's settings (config.customModels), since the
+// probe's custom rows lag behind an edit; then the instance's preferences hide built-in models and
+// put the ones in modelOrder first. A model's options come from the probe's row for it, as the
+// picker's (getProviderModelCapabilities), so a custom model added since the last probe has none.
+const pickerModels = (settings: ServerSettings, p: ServerProvider) => {
+  const builtIn = p.models.filter((m) => !m.isCustom);
+  const taken = new Set(builtIn.map((m) => m.slug));
+  const config = settings.providerInstances?.[p.instanceId]?.config;
+  const listed = p.driver !== 'antigravity' && config !== null && typeof config === 'object'
+    ? (config as { customModels?: unknown }).customModels : undefined;
+  const custom: { slug: string; name: string; isCustom: true }[] = [];
+  for (const raw of Array.isArray(listed) ? listed : []) {
+    const entry = (typeof raw === 'string' ? { slug: raw } : raw ?? {}) as { slug?: unknown; name?: unknown };
+    const slug = typeof entry.slug === 'string' ? entry.slug.trim() : '';
+    if (!slug || slug.length > MAX_CUSTOM_MODEL_LENGTH || taken.has(slug)) continue;
+    taken.add(slug);
+    custom.push({ slug, name: (typeof entry.name === 'string' && entry.name.trim()) || slug, isCustom: true });
+    if (custom.length >= MAX_CUSTOM_MODELS) break;
+  }
+  const prefs = settings.providerModelPreferences?.[p.instanceId];
+  const hidden = new Set(prefs?.hiddenModels ?? []);
+  const rank = new Map((prefs?.modelOrder ?? []).map((slug, i) => [slug, i]));
+  // sort is stable: models modelOrder doesn't name keep their order, after those it does.
+  return [...builtIn, ...custom].filter((m) => m.isCustom || !hidden.has(m.slug))
+    .sort((a, b) => (rank.get(a.slug) ?? Infinity) - (rank.get(b.slug) ?? Infinity))
+    .map((m) => ({
+      slug: m.slug, name: m.name, ...('isLegacy' in m && m.isLegacy ? { legacy: true } : {}),
+      options: p.models.find((r) => r.slug === m.slug)?.capabilities?.optionDescriptors ?? [],
+    }));
 };
 
 // Display names for providers that don't send one (T3's PROVIDER_DISPLAY_NAMES).
@@ -1642,7 +1680,7 @@ const DRIVER_NAMES: Record<string, string> = {
 
 const hostModels = async (host: Host) => {
   const [snap, { settings, providers }] = await Promise.all([snapshot(host), (async () => {
-    const rpc = await openRpc(host);
+    const rpc = await openRpc(host, { read: true });
     try {
       const timeout = host.timeoutMs ?? 15000;
       const [settings, config] = await Promise.all([
@@ -1664,9 +1702,7 @@ const hostModels = async (host: Host) => {
     providers: ready.map((p) => ({
       instanceId: p.instanceId, driver: p.driver, name: p.displayName ?? DRIVER_NAMES[p.driver] ?? p.instanceId,
       ...(p.supportedRuntimeModes?.length ? { runtimeModes: p.supportedRuntimeModes } : {}),
-      models: p.models.map((m) => ({
-        slug: m.slug, name: m.name, ...(m.isLegacy ? { legacy: true } : {}), options: m.capabilities?.optionDescriptors ?? [],
-      })),
+      models: pickerModels(settings, p),
     })),
     // What a project with no settings of its own gets: the Scratch project before
     // `thread scratch` first makes it, for one.
@@ -1680,7 +1716,7 @@ const cmdModels = async (flags: Flags): Promise<void> => {
   if (!registered.length) throw new Error('no hosts registered — run: t3ctl host add <origin> <token>');
   const hosts = flags.host ? registered.filter((h) => h.name === flags.host) : registered;
   if (!hosts.length) throw new Error(`no such host: ${flags.host}`);
-  const results = await Promise.allSettled(hosts.map(hostModels));
+  const [results] = await Promise.all([Promise.allSettled(hosts.map(hostModels)), warnRivals(hosts)]);
   const reached = results.flatMap((r) => (r.status === 'fulfilled' ? [r.value] : []));
   const unreachable = results.flatMap((r, i) => (r.status === 'rejected' ? [{ host: hosts[i]!.name, error: errorMessage(r.reason) }] : []));
   if (flags.json) {
