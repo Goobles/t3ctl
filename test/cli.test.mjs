@@ -52,14 +52,14 @@ test('--help lists the commands', async () => {
   const { code, stdout } = await cli('--help');
   assert.equal(code, 0);
   assert.match(stdout, /Commands:/);
-  for (const c of ['ls', 'host', 'hosts', 'project', 'thread', 'export']) {
+  for (const c of ['ls', 'host', 'hosts', 'models', 'project', 'thread', 'export']) {
     assert.match(stdout, new RegExp(`^\\s+${c}\\b`, 'm'), `missing command: ${c}`);
   }
 });
 
 test('every command has its own help', async () => {
   const commands = [
-    ['ls'], ['host', 'add'], ['host', 'rm'], ['hosts'],
+    ['ls'], ['host', 'add'], ['host', 'rm'], ['hosts'], ['models'],
     ['project', 'create'],
     ['thread', 'create'], ['thread', 'scratch'], ['thread', 'send'], ['thread', 'rename'],
     ['thread', 'retitle'], ['thread', 'interrupt'],
@@ -1008,6 +1008,182 @@ test('ls --json lists each thread\'s linked pull requests', async () => {
       { url: 'https://github.com/Sparklink/mainframe/pull/6', repository: 'sparklink/mainframe', number: 6 },
     ]);
     assert.deepEqual(threads.scratch.pullRequests, []);
+  } finally { w.close(); }
+});
+
+test('ls --json gives each thread its model and runtime mode', async () => {
+  const model = { instanceId: 'codex', model: 'gpt-6-astra', options: [{ id: 'reasoningEffort', value: 'high' }] };
+  const w = await threadWorld([{ ...THREAD, modelSelection: model, runtimeMode: 'approval-required' }]);
+  try {
+    const { code, stdout, stderr } = await cliIn(w.home, 'ls', '--json');
+    assert.equal(code, 0, stderr);
+    const [t] = JSON.parse(stdout).projects[0].threads;
+    assert.deepEqual(t.model, model);
+    assert.equal(t.runtimeMode, 'approval-required');
+  } finally { w.close(); }
+});
+
+// ---- models ---------------------------------------------------------------
+// What a new thread can run on, per host: the models of every provider T3's
+// own picker would offer, with the options each takes, and per project the
+// providers it may use and the model and runtime mode T3 would start it on.
+
+const EFFORT = {
+  id: 'effort', label: 'Reasoning', type: 'select', currentValue: 'medium',
+  options: [{ id: 'low', label: 'Low' }, { id: 'medium', label: 'Medium', isDefault: true }, { id: 'high', label: 'High' }],
+};
+const provider = (instanceId, driver, extra = {}) => ({
+  instanceId, driver, enabled: true, installed: true, version: '1', status: 'ready', auth: { status: 'authenticated' },
+  checkedAt: '2026-10-01T00:00:00.000Z', slashCommands: [], skills: [], models: [], ...extra,
+});
+const PROVIDERS = [
+  provider('claudeAgent', 'claudeAgent', {
+    displayName: 'Claude', supportedRuntimeModes: ['approval-required', 'full-access'],
+    models: [
+      { slug: 'claude-opus-5-5', name: 'Claude Opus 5.5', isCustom: false, capabilities: { optionDescriptors: [EFFORT] } },
+      { slug: 'claude-haiku-4-5', name: 'Claude Haiku 4.5', isCustom: false, isLegacy: true, capabilities: null },
+    ],
+  }),
+  provider('codex', 'codex', { models: [{ slug: 'gpt-6-astra', name: 'GPT-6 Astra', isCustom: false, capabilities: { optionDescriptors: [] } }] }),
+  // Neither shows: one is still being checked, the other's driver is missing.
+  provider('cursor', 'cursor', { status: 'warning', models: [{ slug: 'auto', name: 'Auto', isCustom: false, capabilities: null }] }),
+  provider('grok', 'grok', { availability: 'unavailable', models: [{ slug: 'grok-5', name: 'Grok 5', isCustom: false, capabilities: null }] }),
+];
+const modelsWorld = async (settings, providers = PROVIDERS) => world(await fakeT3('0.0.45', [THREAD], (request) =>
+  request.tag === 'server.getSettings' ? ok(settings)
+  : request.tag === 'server.getConfig' ? ok({ providers })
+  : defaultRpc(request)));
+
+test('models --json lists what T3 would offer, with each project\'s defaults', async () => {
+  const w = await modelsWorld({
+    ...DEFAULT_SETTINGS,
+    defaultModelSelection: { instanceId: 'claudeAgent', model: 'claude-opus-5-5' },
+    defaultRuntimeMode: 'auto-accept-edits',
+    projectSettingsOverrides: { p1: { defaultModelSelection: { instanceId: 'codex', model: 'gpt-6-astra' }, defaultRuntimeMode: 'approval-required' } },
+  });
+  try {
+    const { code, stdout, stderr } = await cliIn(w.home, 'models', '--json');
+    assert.equal(code, 0, stderr);
+    const out = JSON.parse(stdout);
+    assert.deepEqual(out.unreachable, []);
+    const [h] = out.hosts;
+    assert.equal(h.host, 'box');
+    assert.deepEqual(h.providers, [
+      {
+        instanceId: 'claudeAgent', driver: 'claudeAgent', name: 'Claude', runtimeModes: ['approval-required', 'full-access'],
+        models: [
+          { slug: 'claude-opus-5-5', name: 'Claude Opus 5.5', options: [EFFORT] },
+          { slug: 'claude-haiku-4-5', name: 'Claude Haiku 4.5', legacy: true, options: [] },
+        ],
+      },
+      { instanceId: 'codex', driver: 'codex', name: 'Codex', models: [{ slug: 'gpt-6-astra', name: 'GPT-6 Astra', options: [] }] },
+    ]);
+    assert.deepEqual(h.projects, [{
+      id: 'p1', title: 'alpha', providers: ['claudeAgent', 'codex'],
+      model: { instanceId: 'codex', model: 'gpt-6-astra' }, runtimeMode: 'approval-required',
+    }]);
+    assert.deepEqual(h.environment, {
+      providers: ['claudeAgent', 'codex'], model: { instanceId: 'claudeAgent', model: 'claude-opus-5-5' }, runtimeMode: 'auto-accept-edits',
+    });
+    // One read of each, however many projects.
+    assert.deepEqual(w.rpc.map((r) => r.tag).sort(), ['server.getConfig', 'server.getSettings']);
+  } finally { w.close(); }
+});
+
+test('models --json: a project falls back to the environment, and leaves out providers it turned off', async () => {
+  const w = await modelsWorld({
+    ...DEFAULT_SETTINGS,
+    projectSettingsOverrides: { p1: { defaultModelSelection: { instanceId: 'codex', model: 'gpt-6-astra' }, providerInstances: { codex: { enabled: false } } } },
+  });
+  try {
+    const { code, stdout, stderr } = await cliIn(w.home, 'models', '--json');
+    assert.equal(code, 0, stderr);
+    const [p] = JSON.parse(stdout).hosts[0].projects;
+    assert.deepEqual(p.providers, ['claudeAgent']);
+    // No default anywhere: T3's own, and its default runtime mode.
+    assert.deepEqual(p.model, { instanceId: 'claudeAgent', model: 'claude-opus-5-5' });
+    assert.equal(p.runtimeMode, 'full-access');
+  } finally { w.close(); }
+});
+
+test('models --json reports a host it cannot read as unreachable, and still exits 0 with others', async () => {
+  const w = await modelsWorld(DEFAULT_SETTINGS);
+  const home = splitHome({ name: 'box', origin: w.origin, token: 'tok', environmentId: ENV_ID }, w.origin);
+  writeFileSync(join(home, '.config', 't3ctl', 'hosts.json'), JSON.stringify({ hosts: [
+    { name: 'box', origin: w.origin, token: 'tok', environmentId: ENV_ID },
+    { name: 'gone', origin: 'http://127.0.0.1:1', token: 'tok', timeoutMs: 2000 },
+  ] }));
+  try {
+    const { code, stdout, stderr } = await cliIn(home, 'models', '--json');
+    assert.equal(code, 0, stderr);
+    const out = JSON.parse(stdout);
+    assert.deepEqual(out.hosts.map((h) => h.host), ['box']);
+    assert.deepEqual(out.unreachable.map((u) => u.host), ['gone']);
+    // --host reads just that one.
+    const one = JSON.parse((await cliIn(home, 'models', '--json', '--host', 'box')).stdout);
+    assert.deepEqual([one.hosts.length, one.unreachable.length], [1, 0]);
+  } finally { w.close(); rmSync(home, { recursive: true, force: true }); }
+});
+
+// T3's picker (getAppModelOptionsForInstance in apps/web/src/modelSelection.ts) takes built-in
+// models from the probe, custom ones from settings (the probe's lag behind an edit), then hides
+// and orders them by the instance's preferences.
+test('models --json lists the models T3\'s picker shows: hidden ones out, custom ones from settings, in the user\'s order', async () => {
+  const claude = PROVIDERS[0];
+  const providers = [{ ...claude, models: [
+    ...claude.models,
+    { slug: 'claude-sonnet-5-5', name: 'Claude Sonnet 5.5', isCustom: false, capabilities: { optionDescriptors: [EFFORT] } },
+    // Removed in settings since the last probe: gone.
+    { slug: 'old-custom', name: 'old-custom', isCustom: true, capabilities: null },
+    // Still in settings: it keeps the probe's options.
+    { slug: 'my-proxy', name: 'My proxy', isCustom: true, capabilities: { optionDescriptors: [EFFORT] } },
+  ] }];
+  const w = await modelsWorld({
+    ...DEFAULT_SETTINGS,
+    providerInstances: { claudeAgent: { driver: 'claudeAgent', config: { customModels: [
+      { slug: ' my-proxy ', name: 'Proxy' },
+      'brand-new', // added since the last probe
+      'claude-opus-5-5', // a built-in's slug: not a custom model
+      'brand-new',
+    ] } } },
+    providerModelPreferences: { claudeAgent: { hiddenModels: ['claude-haiku-4-5', 'brand-new'], modelOrder: ['claude-sonnet-5-5', 'brand-new'] } },
+  }, providers);
+  try {
+    const { code, stdout, stderr } = await cliIn(w.home, 'models', '--json');
+    assert.equal(code, 0, stderr);
+    // Ordered ones first, the rest as they come; custom models can't be hidden.
+    assert.deepEqual(JSON.parse(stdout).hosts[0].providers[0].models, [
+      { slug: 'claude-sonnet-5-5', name: 'Claude Sonnet 5.5', options: [EFFORT] },
+      { slug: 'brand-new', name: 'brand-new', options: [] },
+      { slug: 'claude-opus-5-5', name: 'Claude Opus 5.5', options: [EFFORT] },
+      { slug: 'my-proxy', name: 'Proxy', options: [EFFORT] },
+    ]);
+  } finally { w.close(); }
+});
+
+test('models reads a host that has a newer server beside it, and warns, as ls does', async () => {
+  const answer = (request) => request.tag === 'server.getSettings' ? ok(DEFAULT_SETTINGS)
+    : request.tag === 'server.getConfig' ? ok({ providers: PROVIDERS }) : defaultRpc(request);
+  const [a, b] = [await fakeT3('0.0.41', [], answer), await fakeT3('0.0.43', [], answer)];
+  const home = splitHome({ name: 'box', origin: a.origin, token: 'tok', environmentId: ENV_ID }, b.origin);
+  try {
+    const { code, stdout, stderr } = await cliIn(home, 'models', '--json');
+    assert.equal(code, 0, stderr);
+    const out = JSON.parse(stdout);
+    assert.deepEqual([out.hosts.map((h) => h.host), out.unreachable], [['box'], []]);
+    assert.match(stderr, /not the only T3 Code server/);
+    assert.deepEqual(a.rpc.map((r) => r.tag).sort(), ['server.getConfig', 'server.getSettings']);
+  } finally { a.close(); b.close(); rmSync(home, { recursive: true, force: true }); }
+});
+
+test('models without --json prints each host\'s providers, models and project defaults', async () => {
+  const w = await modelsWorld(DEFAULT_SETTINGS);
+  try {
+    const { code, stdout, stderr } = await cliIn(w.home, 'models');
+    assert.equal(code, 0, stderr);
+    assert.match(stdout, /claudeAgent\/claude-opus-5-5\s+Claude Opus 5\.5\s+effort=low\|medium\|high/);
+    assert.match(stdout, /alpha\s+claudeAgent\/claude-opus-5-5\s+full-access/);
+    assert.doesNotMatch(stdout, /grok/);
   } finally { w.close(); }
 });
 

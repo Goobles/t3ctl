@@ -79,10 +79,13 @@ t3ctl ls --json | jq -r '.projects[].threads[] | select(.status=="running") | .t
 ```
 
 Each thread in `--json` carries `pullRequests`: the PRs linked to it in T3 Code, as
-`{ url, repository, number }`, or `[]` when there are none.
+`{ url, repository, number }`, or `[]` when there are none. `model` is the model it
+runs on (`{ instanceId, model, options? }`) and `runtimeMode` its runtime mode, each
+`null` when the server doesn't say.
 
 The JSON shape is `{projects: [{host, id, title, workspaceRoot, threads: [{id,
-title, branch, status, provider, updatedAt}]}], unreachable: [{host, error}]}`.
+title, branch, status, provider, model, runtimeMode, updatedAt, pullRequests}]}],
+unreachable: [{host, error}]}`.
 
 ### `t3ctl host add <origin> [token] [--name <name>]`
 
@@ -207,6 +210,27 @@ t3ctl hosts
 
 Unreachable hosts are dimmed and show the values last recorded, not live ones.
 `ls` deliberately does *not* probe — it stays a single request per host.
+
+### `t3ctl models [--host <name>] [--json]`
+
+What a new thread can run on, per host: every model of the providers T3 Code's
+own picker offers (installed, checked and ready), as the picker lists them (hidden
+models left out, custom ones from settings, in your order), with the options each takes
+(`effort=low|medium|high`), then each project's default model and runtime mode,
+picked as T3 Code picks them for a new thread. Hosts that don't answer are
+reported, like `ls`; as a read, it only warns about a newer server beside a host.
+
+```sh
+t3ctl models
+t3ctl models --json --host laptop
+```
+
+With `--json`, `hosts[].providers[].models[].options` are T3's option
+descriptors as the server sends them, and `hosts[].projects[]` gives each
+project's `model` (a model selection), `runtimeMode` and `providers`: the
+instance ids it may use, which a project can narrow or widen in its settings.
+`hosts[].environment` is the same for a project without settings of its own.
+Pass the picks on with `thread create --model --option --runtime-mode`.
 
 ### `t3ctl project create <title> <workspace-root>`
 
