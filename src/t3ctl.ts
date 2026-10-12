@@ -1418,7 +1418,7 @@ const cmdProjectCreate = async (title: string, root: string, flags: Flags): Prom
 const printJson = (value: unknown): void => console.log(JSON.stringify(value, null, 2));
 
 /** What `thread create --json` prints, whichever way the thread was made. */
-const createdJson = (host: Host, project: Project, id: string, title: string, model: ModelSelection, sequence: number | null) => ({
+const createdJson = (host: Host, project: Pick<Project, 'id' | 'title'>, id: string, title: string, model: ModelSelection, sequence: number | null) => ({
   id, title, projectId: project.id, project: project.title, host: host.name, model: modelRef(model), sequence,
 });
 
@@ -1581,7 +1581,7 @@ const FALLBACK_MODEL: ModelSelection = { instanceId: 'claudeAgent', model: 'clau
 // cannot fill this in itself. Until the server has folded project settings
 // into its override record, the project's own field still counts, unless the
 // record overrides it. A null override means no project default.
-const defaultModel = async (host: Host, project: Project, flags: Flags): Promise<ModelSelection> => {
+const defaultModel = async (host: Host, project: Pick<Project, 'id' | 'defaultModelSelection'>, flags: Flags): Promise<ModelSelection> => {
   let settings: ServerSettings;
   try {
     const rpc = await openRpc(host);
@@ -1598,6 +1598,38 @@ const defaultModel = async (host: Host, project: Project, flags: Flags): Promise
   const fromProject = stored !== undefined ? stored : settings.projectSettingsFolded ? null : project.defaultModelSelection;
   if (fromProject && providerInstanceEnabled(settings, project.id, fromProject.instanceId)) return fromProject;
   return settings.defaultModelSelection ?? FALLBACK_MODEL;
+};
+
+// A thread without a project, as the app starts one: the server finds or makes its Scratch
+// project ("No project", a plain folder it owns), and a launch at that project's root gives the
+// thread a fresh subfolder of its own. A plain thread.create there would share the root folder.
+// Protocol 1 servers have no Scratch project.
+const cmdThreadScratch = async (title: string, flags: Flags): Promise<void> => {
+  const host = pickHost(flags);
+  if (await protocolOf(host) === 1) throw new Error(`${host.name} runs a T3 Code too old for threads without a project`);
+  const runtimeMode = parseRuntimeMode(flags['runtime-mode'] ?? 'full-access');
+  const interactionMode = flags['interaction-mode'] ?? 'default';
+  const rpc = await openRpc(host);
+  try {
+    const { projectId } = (await rpc.call('projects.ensureScratch', {}, host.timeoutMs ?? 15000)) as { projectId: string };
+    // Without --model, the Scratch project's default as for any project: its override in the
+    // server's settings, else the environment's. (Its own field, which only servers that haven't
+    // folded project settings read, isn't fetched: ensureScratch answers with the id alone.)
+    const modelSelection = withOptions(flags.model ? parseModel(flags.model) : await defaultModel(host, { id: projectId }, flags), flags.option);
+    const threadId = crypto.randomUUID();
+    const { projection } = (await rpc.call('orchestration.launchThread', {
+      commandId: crypto.randomUUID(), creationSource: FROM_USER.creationSource, threadId,
+      projectId, title, modelSelection, runtimeMode, interactionMode,
+      workspaceStrategy: { type: 'root' },
+      ...(flags.message ? { initialMessage: { messageId: crypto.randomUUID(), text: flags.message, attachments: [] } } : {}),
+    }, LAUNCH_WAIT_MS)) as LaunchResult;
+    // launchThread answers with the thread, not a sequence.
+    if (flags.json) return printJson(createdJson(host, { id: projectId, title: 'No project' }, threadId, title, modelSelection, null));
+    console.log(`${flags.message ? 'started' : 'created'} ${bold(title)} without a project on ${host.name}\n  id     ${threadId}\n` +
+      `  folder ${projection.thread.worktreePath ?? '-'}\n  model  ${describeModel(modelSelection)}\n  mode   ${runtimeMode} / ${interactionMode}`);
+  } finally {
+    rpc.close();
+  }
 };
 
 const cmdThreadCreate = async (projectRef: string, title: string, flags: Flags): Promise<void> => {
@@ -2107,6 +2139,17 @@ hostOption(thread.command('create')
   .option('--interaction-mode <mode>', 'default | plan', 'default')
   .option('--json', 'print the new thread as JSON, and errors as {"error": ...} on stderr'))
   .action((ref: string, title: string[], o: OptionValues) => cmdThreadCreate(ref, title.join(' '), toFlags(o)));
+
+hostOption(thread.command('scratch')
+  .argument('<title...>', 'thread title')
+  .description('create a thread without a project, in a fresh folder of its own (idle unless --message)')
+  .option('--model <instance/model>', `e.g. claudeAgent/claude-opus-5-5 (default: the Scratch project's default model, as T3 Code picks it)`)
+  .option('--option <id=value>', 'model option, e.g. effort=high; repeatable', addOption)
+  .option('--message <text>', 'the first message, which starts the agent (quote it)')
+  .option('--runtime-mode <mode>', RUNTIME_MODE_HELP, 'full-access')
+  .option('--interaction-mode <mode>', 'default | plan', 'default')
+  .option('--json', 'print the new thread as JSON, and errors as {"error": ...} on stderr'))
+  .action((title: string[], o: OptionValues) => cmdThreadScratch(title.join(' '), toFlags(o)));
 
 hostOption(thread.command('send')
   .alias('start')
