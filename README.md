@@ -208,6 +208,25 @@ t3ctl hosts
 Unreachable hosts are dimmed and show the values last recorded, not live ones.
 `ls` deliberately does *not* probe — it stays a single request per host.
 
+### `t3ctl models [--host <name>] [--json]`
+
+What a new thread can run on, per host: every model of the providers T3 Code's
+own picker offers (installed, checked and ready), with the options each takes
+(`effort=low|medium|high`), then each project's default model and runtime mode,
+picked as T3 Code picks them for a new thread. Hosts that don't answer are
+reported, like `ls`.
+
+```sh
+t3ctl models
+t3ctl models --json --host laptop
+```
+
+With `--json`, `hosts[].providers[].models[].options` are T3's option
+descriptors as the server sends them, and `hosts[].projects[]` gives each
+project's `model` (a model selection), `runtimeMode` and `providers`: the
+instance ids it may use, which a project can narrow or widen in its settings.
+Pass the picks on with `thread create --model --option --runtime-mode`.
+
 ### `t3ctl project create <title> <workspace-root>`
 
 Register an existing directory on the host as a project. For a local host the

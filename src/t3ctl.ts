@@ -285,7 +285,7 @@ const cmdLs = async ({ threads: showThreads, all: showAll, json: asJson }: LsOpt
         host: host.name, id: p.id, title: p.title, workspaceRoot: p.workspaceRoot,
         threads: snap.threads.filter((t) => t.projectId === p.id)
           .filter((t) => showAll || (!t.deletedAt && !t.archivedAt))
-          .map((t) => ({ id: t.id, title: t.title, branch: t.branch, status: threadStatus(t), provider: t.providerInstanceId ?? t.session?.providerName ?? null, updatedAt: t.updatedAt, pullRequests: pullRequestsOf(t) })),
+          .map((t) => ({ id: t.id, title: t.title, branch: t.branch, status: threadStatus(t), provider: t.providerInstanceId ?? t.session?.providerName ?? null, model: t.modelSelection ?? null, runtimeMode: t.runtimeMode ?? null, updatedAt: t.updatedAt, pullRequests: pullRequestsOf(t) })),
       })));
     console.log(JSON.stringify({ projects: out, unreachable: failed.map((f) => ({ host: f.host.name, error: f.error })) }, null, 2));
     return;
@@ -1536,12 +1536,14 @@ const cmdThreadCreateInWorktree = async (host: Host, project: Project, title: st
   }
 };
 
-/** The parts of the server's settings (`server.getSettings`) that pick a new thread's model. */
+/** The parts of the server's settings (`server.getSettings`) that pick a new thread's model and mode. */
 type ServerSettings = {
   defaultModelSelection?: ModelSelection | null;
+  defaultRuntimeMode?: string;
   providerInstances?: Record<string, { driver: string; enabled?: boolean; config?: unknown }>;
   projectSettingsOverrides?: Record<string, {
     defaultModelSelection?: ModelSelection | null;
+    defaultRuntimeMode?: string | null;
     providerInstances?: Record<string, { enabled?: boolean }>;
   }>;
   projectSettingsFolded?: boolean;
@@ -1581,6 +1583,13 @@ const FALLBACK_MODEL: ModelSelection = { instanceId: 'claudeAgent', model: 'clau
 // cannot fill this in itself. Until the server has folded project settings
 // into its override record, the project's own field still counts, unless the
 // record overrides it. A null override means no project default.
+const resolveDefaultModel = (settings: ServerSettings, project: Pick<Project, 'id' | 'defaultModelSelection'>): ModelSelection => {
+  const stored = settings.projectSettingsOverrides?.[project.id]?.defaultModelSelection;
+  const fromProject = stored !== undefined ? stored : settings.projectSettingsFolded ? null : project.defaultModelSelection;
+  if (fromProject && providerInstanceEnabled(settings, project.id, fromProject.instanceId)) return fromProject;
+  return settings.defaultModelSelection ?? FALLBACK_MODEL;
+};
+
 const defaultModel = async (host: Host, project: Pick<Project, 'id' | 'defaultModelSelection'>, flags: Flags): Promise<ModelSelection> => {
   let settings: ServerSettings;
   try {
@@ -1594,10 +1603,102 @@ const defaultModel = async (host: Host, project: Pick<Project, 'id' | 'defaultMo
     if (!flags.json) warn(`could not read the default model from ${host.name} (${errorMessage(error)}) — using ${modelRef(FALLBACK_MODEL)}`);
     return FALLBACK_MODEL;
   }
-  const stored = settings.projectSettingsOverrides?.[project.id]?.defaultModelSelection;
-  const fromProject = stored !== undefined ? stored : settings.projectSettingsFolded ? null : project.defaultModelSelection;
-  if (fromProject && providerInstanceEnabled(settings, project.id, fromProject.instanceId)) return fromProject;
-  return settings.defaultModelSelection ?? FALLBACK_MODEL;
+  return resolveDefaultModel(settings, project);
+};
+
+// The runtime mode T3 starts a project's new thread in (resolveProjectSettings):
+// the project's, else the environment's, else full access. A null or unknown
+// project value defers.
+const resolveDefaultRuntimeMode = (settings: ServerSettings, projectId: string): string => {
+  const stored = settings.projectSettingsOverrides?.[projectId]?.defaultRuntimeMode;
+  const mode = stored ?? settings.defaultRuntimeMode;
+  return mode && mode in RUNTIME_MODES ? mode : 'full-access';
+};
+
+// ---- models ---------------------------------------------------------------
+// What a new thread can run on, for tools that pick a model before calling
+// `thread create` (mainframe's composer): per host, the providers T3's picker
+// offers (isProviderInstancePickerReady in apps/web/src/providerInstances.ts:
+// available and ready; enabled is per project, below), each model with the
+// option descriptors it takes, and per project the providers it may use and the
+// model and runtime mode T3 would give its new thread.
+
+/** The parts of `server.getConfig`'s providers (ServerProvider) this reads. */
+type ProviderOptionDescriptor = { id: string; label: string; type: string } & Record<string, unknown>;
+type ServerProvider = {
+  instanceId: string;
+  driver: string;
+  displayName?: string;
+  status: string;
+  availability?: string;
+  supportedRuntimeModes?: string[];
+  models: { slug: string; name: string; isLegacy?: boolean; capabilities?: { optionDescriptors?: ProviderOptionDescriptor[] } | null }[];
+};
+
+// Display names for providers that don't send one (T3's PROVIDER_DISPLAY_NAMES).
+const DRIVER_NAMES: Record<string, string> = {
+  claudeAgent: 'Claude', codex: 'Codex', cursor: 'Cursor', opencode: 'OpenCode', grok: 'Grok', pi: 'Pi', antigravity: 'Antigravity',
+};
+
+const hostModels = async (host: Host) => {
+  const [snap, { settings, providers }] = await Promise.all([snapshot(host), (async () => {
+    const rpc = await openRpc(host);
+    try {
+      const timeout = host.timeoutMs ?? 15000;
+      const [settings, config] = await Promise.all([
+        rpc.call('server.getSettings', {}, timeout) as Promise<ServerSettings>,
+        rpc.call('server.getConfig', {}, timeout) as Promise<{ providers: ServerProvider[] }>,
+      ]);
+      return { settings, providers: config.providers };
+    } finally {
+      rpc.close();
+    }
+  })()]);
+  const ready = providers.filter((p) => p.availability !== 'unavailable' && p.status === 'ready');
+  return {
+    host: host.name,
+    providers: ready.map((p) => ({
+      instanceId: p.instanceId, driver: p.driver, name: p.displayName ?? DRIVER_NAMES[p.driver] ?? p.instanceId,
+      ...(p.supportedRuntimeModes?.length ? { runtimeModes: p.supportedRuntimeModes } : {}),
+      models: p.models.map((m) => ({
+        slug: m.slug, name: m.name, ...(m.isLegacy ? { legacy: true } : {}), options: m.capabilities?.optionDescriptors ?? [],
+      })),
+    })),
+    projects: snap.projects.filter((p) => !p.deletedAt).map((p) => ({
+      id: p.id, title: p.title,
+      providers: ready.filter((r) => providerInstanceEnabled(settings, p.id, r.instanceId)).map((r) => r.instanceId),
+      model: resolveDefaultModel(settings, p), runtimeMode: resolveDefaultRuntimeMode(settings, p.id),
+    })),
+  };
+};
+
+const cmdModels = async (flags: Flags): Promise<void> => {
+  const registered = readHosts();
+  if (!registered.length) throw new Error('no hosts registered — run: t3ctl host add <origin> <token>');
+  const hosts = flags.host ? registered.filter((h) => h.name === flags.host) : registered;
+  if (!hosts.length) throw new Error(`no such host: ${flags.host}`);
+  const results = await Promise.allSettled(hosts.map(hostModels));
+  const reached = results.flatMap((r) => (r.status === 'fulfilled' ? [r.value] : []));
+  const unreachable = results.flatMap((r, i) => (r.status === 'rejected' ? [{ host: hosts[i]!.name, error: errorMessage(r.reason) }] : []));
+  if (flags.json) {
+    printJson({ hosts: reached, unreachable });
+  } else {
+    for (const h of reached) {
+      console.log(`\n${bold(h.host)}`);
+      for (const p of h.providers) {
+        for (const m of p.models) {
+          const options = m.options.map((o) => (Array.isArray(o.options)
+            ? `${o.id}=${(o.options as { id: string }[]).map((c) => c.id).join('|')}` : o.id));
+          console.log(`  ${`${p.instanceId}/${m.slug}`.padEnd(36)}  ${m.name.padEnd(24)}  ${dim(options.join(' '))}${m.legacy ? dim(' (legacy)') : ''}`);
+        }
+      }
+      console.log(dim('  project defaults'));
+      for (const p of h.projects) console.log(`  ${p.title.padEnd(36)}  ${modelRef(p.model).padEnd(24)}  ${p.runtimeMode}`);
+    }
+  }
+  for (const u of unreachable) console.error(`${sgr('31', '✕', process.stderr)} ${u.host} ${dim(u.error, process.stderr)}`);
+  // Partial results are still useful, so only a total failure is an error.
+  if (unreachable.length === hosts.length) process.exitCode = 1;
 };
 
 // A thread without a project, as the app starts one: the server finds or makes its Scratch
@@ -2048,6 +2149,12 @@ program.command('ls')
   .option('-a, --all', 'include archived and deleted items')
   .option('--json', 'emit JSON instead of a table')
   .action((o: OptionValues) => cmdLs(o));
+
+program.command('models')
+  .description('list the models a new thread can use on each host, and each project\'s default model and mode')
+  .option('--host <name>', 'just this registered host (default: all)')
+  .option('--json', 'emit JSON instead of a table')
+  .action((o: OptionValues) => cmdModels(toFlags(o)));
 
 const host = program.command('host').description('manage the host registry');
 
