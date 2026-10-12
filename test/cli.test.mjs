@@ -61,7 +61,7 @@ test('every command has its own help', async () => {
   const commands = [
     ['ls'], ['host', 'add'], ['host', 'rm'], ['hosts'],
     ['project', 'create'],
-    ['thread', 'create'], ['thread', 'send'], ['thread', 'rename'],
+    ['thread', 'create'], ['thread', 'scratch'], ['thread', 'send'], ['thread', 'rename'],
     ['thread', 'retitle'], ['thread', 'interrupt'],
     ['thread', 'snooze'], ['thread', 'unsnooze'], ['thread', 'runtime-mode'],
     ['thread', 'settle'], ['thread', 'archive'], ['thread', 'unarchive'],
@@ -1162,6 +1162,89 @@ test('--new-worktree flag mistakes are caught before anything is sent', async ()
   } finally { w.close(); }
 });
 
+// ---- thread scratch -----------------------------------------------------------
+// A thread without a project: the server finds or makes its Scratch project
+// ("No project"), and a launch at that project's root claims a fresh folder for
+// the thread, as the app does. A plain thread.create would share the root.
+
+const scratchRpc = (request, settings = DEFAULT_SETTINGS) => {
+  if (request.tag === 'projects.ensureScratch') return ok({ projectId: 'scratch-1' });
+  if (request.tag === 'server.getSettings') return ok(settings);
+  if (request.tag === 'orchestration.launchThread') {
+    const { threadId } = request.payload;
+    return ok({ threadId, resumed: false, projection: { thread: { id: threadId, branch: null, worktreePath: '/home/me/.t3/scratch/look-around' } } });
+  }
+  return ok({ sequence: 7 });
+};
+
+test('thread scratch launches an idle thread in a folder of its own, outside any project', async () => {
+  const w = world(await fakeT3('0.0.45', [], scratchRpc));
+  try {
+    const { code, stdout, stderr } = await cliIn(w.home, 'thread', 'scratch', 'look', 'around');
+    assert.equal(code, 0, stderr);
+    assert.deepEqual(w.dispatched, [], 'the launch makes the thread; nothing else may be dispatched');
+    // The Scratch project first, then its default model (none set: T3's own), then the launch.
+    assert.deepEqual(w.rpc.map((r) => r.tag), ['projects.ensureScratch', 'server.getSettings', 'orchestration.launchThread']);
+    assert.deepEqual(w.rpc[0].payload, {});
+    const { commandId, threadId, ...rest } = w.rpc[2].payload;
+    assert.match(commandId, /^[0-9a-f-]{36}$/);
+    assert.match(threadId, /^[0-9a-f-]{36}$/);
+    assert.deepEqual(rest, {
+      creationSource: 'web', projectId: 'scratch-1', title: 'look around',
+      modelSelection: { instanceId: 'claudeAgent', model: 'claude-opus-5-5' },
+      runtimeMode: 'full-access', interactionMode: 'default', workspaceStrategy: { type: 'root' },
+    });
+    assert.ok(stdout.includes(threadId), stdout);
+    assert.ok(stdout.includes('folder /home/me/.t3/scratch/look-around'), stdout);
+  } finally { w.close(); }
+});
+
+test('thread scratch --message starts it, and --json prints it like thread create', async () => {
+  const w = world(await fakeT3('0.0.45', [], scratchRpc));
+  try {
+    const { code, stdout, stderr } = await cliIn(w.home, 'thread', 'scratch', 'try', 'it', '--message', 'what is 2+2', '--json');
+    assert.equal(code, 0, stderr);
+    const { initialMessage, threadId } = w.rpc.find((r) => r.tag === 'orchestration.launchThread').payload;
+    assert.equal(initialMessage.text, 'what is 2+2');
+    assert.deepEqual(initialMessage.attachments, []);
+    assert.deepEqual(JSON.parse(stdout), {
+      id: threadId, title: 'try it', projectId: 'scratch-1', project: 'No project',
+      host: 'box', model: 'claudeAgent/claude-opus-5-5', sequence: null,
+    });
+  } finally { w.close(); }
+});
+
+test('without --model, thread scratch takes the Scratch project\'s default model, with --option on top', async () => {
+  const project = { instanceId: 'codex', model: 'gpt-6-astra', options: [{ id: 'reasoningEffort', value: 'high' }] };
+  const settings = { ...DEFAULT_SETTINGS, defaultModelSelection: { instanceId: 'claudeAgent', model: 'claude-sonnet-5-5' },
+    projectSettingsOverrides: { 'scratch-1': { defaultModelSelection: project } } };
+  const w = world(await fakeT3('0.0.45', [], (request) => scratchRpc(request, settings)));
+  const launched = () => w.rpc.findLast((r) => r.tag === 'orchestration.launchThread').payload.modelSelection;
+  try {
+    let { code, stderr } = await cliIn(w.home, 'thread', 'scratch', 'x', '--option', 'fastMode=true');
+    assert.equal(code, 0, stderr);
+    assert.deepEqual(launched(), { ...project, options: [...project.options, { id: 'fastMode', value: true }] });
+    // --model wins, and the settings aren't read for it.
+    const reads = w.rpc.filter((r) => r.tag === 'server.getSettings').length;
+    ({ code, stderr } = await cliIn(w.home, 'thread', 'scratch', 'y', '--model', 'claudeAgent/claude-opus-5-5', '--option', 'effort=low'));
+    assert.equal(code, 0, stderr);
+    assert.deepEqual(launched(), { instanceId: 'claudeAgent', model: 'claude-opus-5-5', options: [{ id: 'effort', value: 'low' }] });
+    assert.equal(w.rpc.filter((r) => r.tag === 'server.getSettings').length, reads);
+  } finally { w.close(); }
+});
+
+test('thread scratch reports a host that offers no Scratch project', async () => {
+  const w = world(await fakeT3('0.0.45', [], (request) => request.tag === 'projects.ensureScratch'
+    ? { _tag: 'Failure', cause: [{ _tag: 'Fail', error: { _tag: 'OrchestrationDispatchCommandError', message: 'Scratch is unavailable here.' } }] }
+    : scratchRpc(request)));
+  try {
+    const { code, stderr } = await cliIn(w.home, 'thread', 'scratch', 'x');
+    assert.notEqual(code, 0);
+    assert.match(stderr, /Scratch is unavailable here/);
+    assert.deepEqual(w.rpc.map((r) => r.tag), ['projects.ensureScratch']);
+  } finally { w.close(); }
+});
+
 // ---- protocol 1 servers -------------------------------------------------------
 // A server whose descriptor names no protocol is from before Orchestrator V2.
 // t3ctl must still drive it exactly as before: reads from /snapshot, commands
@@ -1169,6 +1252,17 @@ test('--new-worktree flag mistakes are caught before anything is sent', async ()
 // bootstrap. These pin those shapes, so a protocol 2 change cannot leak in.
 
 const v1World = async (threads = [THREAD], answer = defaultRpc) => world(await fakeT3('0.0.43', threads, answer, 1));
+
+test('protocol 1: thread scratch says the server is too old, and sends nothing', async () => {
+  const w = await v1World();
+  try {
+    const { code, stderr } = await cliIn(w.home, 'thread', 'scratch', 'x');
+    assert.notEqual(code, 0);
+    assert.match(stderr, /too old for threads without a project/);
+    assert.deepEqual(w.rpc, []);
+    assert.deepEqual(w.dispatched, []);
+  } finally { w.close(); }
+});
 
 /** Split off the fields every protocol 1 command stamps: a uuid commandId and an ISO createdAt. */
 const v1Command = (command) => {

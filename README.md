@@ -331,6 +331,32 @@ on the thread, and starts the agent anyway. If the connection drops or t3ctl
 times out, the setup keeps going on the server; `t3ctl ls -t` shows where it
 got to.
 
+### `t3ctl thread scratch <title>`
+
+Create a thread without a project, as the app's "No project" does. The server
+keeps a Scratch project (a plain folder under `~/.t3/scratch` on the host,
+outside any repository) and gives each thread there a fresh folder of its own.
+The thread is idle unless `--message` starts it.
+
+```sh
+t3ctl thread scratch "look into the dns change" --host laptop
+```
+```
+created look into the dns change without a project on laptop
+  id     0f5c1e2a-...
+  folder /Users/you/.t3/scratch/look-into-the-dns-change
+  model  claudeAgent/claude-opus-5-5
+  mode   full-access / default
+```
+
+It takes `--model`, `--option`, `--message`, `--runtime-mode`,
+`--interaction-mode`, `--json` and `--host` as `thread create` does. Without
+`--model`, the thread gets the Scratch project's default model, picked as for
+any project. With
+`--json`, `project` is `No project` and `sequence` is `null`. A host whose T3
+Code data directory sits inside a git repository offers no Scratch project, and
+servers speaking orchestration protocol 1 have none.
+
 ### `t3ctl thread send <thread> <message...>`
 
 Send a message to a thread and run the agent. This is how you continue a
