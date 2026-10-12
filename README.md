@@ -207,16 +207,21 @@ Unreachable hosts are dimmed and show the values last recorded, not live ones.
 
 ### `t3ctl project create <title> <workspace-root>`
 
-Register an existing directory on the host as a project. The path is resolved
-locally (`~` expands) and must already exist — t3ctl will not create it.
+Register an existing directory on the host as a project. For a local host the
+path is resolved here (`~` expands) and must already exist — t3ctl will not
+create it.
 
 ```sh
 t3ctl project create t3ctl ~/Code/t3ctl
 ```
 
-> Note: the workspace root is interpreted on the **host**, so this really only
-> makes sense for a host whose filesystem you share — i.e. `localhost`. For a
-> remote host, pass the remote absolute path and skip the `~` shorthand.
+For a remote host (another machine's origin, or one reached over ssh) the path
+is that machine's: pass it as an absolute path, not `~/…`, which would name
+this machine's home. t3ctl sends it as given and the host's server checks it.
+
+```sh
+t3ctl project create t3ctl /Users/me/Code/t3ctl --host mac
+```
 
 ### `t3ctl thread create <project> <title>`
 

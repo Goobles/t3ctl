@@ -1365,8 +1365,15 @@ const cmdThreadRetitle = async (thread: Thread, host: Host, timeoutSeconds: numb
 
 const cmdProjectCreate = async (title: string, root: string, flags: Flags): Promise<void> => {
   const host = pickHost(flags);
-  const workspaceRoot = path.resolve(root.replace(/^~/, os.homedir()));
-  if (!fs.existsSync(workspaceRoot)) throw new Error(`workspace root does not exist: ${workspaceRoot}`);
+  // Only a local host shares this machine's filesystem. Another machine's server
+  // validates the root itself, and ~ or a relative path would be resolved here.
+  let workspaceRoot = root;
+  if (isLocalHost(host)) {
+    workspaceRoot = path.resolve(root.replace(/^~/, os.homedir()));
+    if (!fs.existsSync(workspaceRoot)) throw new Error(`workspace root does not exist: ${workspaceRoot}`);
+  } else if (!path.isAbsolute(root)) {
+    throw new Error(`workspace root must be an absolute path on ${host.name}: ${root}`);
+  }
   const projectId = crypto.randomUUID();
   if (await protocolOf(host) === 1) {
     const { sequence } = await dispatch(host, {
@@ -1766,16 +1773,19 @@ const queryOverHttp = async (host: Host, since: string, until: string): Promise<
  */
 const LOOPBACK = new Set(['localhost', '127.0.0.1', '::1', '[::1]']);
 
-const strategyFor = (host: Host): Strategy => {
+/** Whether the host runs on this machine, sharing its database and filesystem. */
+const isLocalHost = (host: Host): boolean => {
   // A host reached over ssh has a loopback origin too, but it is the local end
   // of a tunnel: its database is on the other machine.
-  if (host.ssh) return 'http';
+  if (host.ssh) return false;
   let hostname = '';
   try {
     hostname = new URL(host.origin).hostname;
   } catch { /* an unparseable origin is not loopback; let the HTTP path report it */ }
-  return LOOPBACK.has(hostname) ? 'sqlite' : 'http';
+  return LOOPBACK.has(hostname);
 };
+
+const strategyFor = (host: Host): Strategy => (isLocalHost(host) ? 'sqlite' : 'http');
 
 const readPrompts = (host: Host, strategy: Strategy, since: string, until: string): Promise<PromptRow[]> => {
   if (strategy === 'sqlite') return queryLocal(since, until);
