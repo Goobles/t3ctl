@@ -1082,6 +1082,9 @@ test('models --json lists what T3 would offer, with each project\'s defaults', a
       id: 'p1', title: 'alpha', providers: ['claudeAgent', 'codex'],
       model: { instanceId: 'codex', model: 'gpt-6-astra' }, runtimeMode: 'approval-required',
     }]);
+    assert.deepEqual(h.environment, {
+      providers: ['claudeAgent', 'codex'], model: { instanceId: 'claudeAgent', model: 'claude-opus-5-5' }, runtimeMode: 'auto-accept-edits',
+    });
     // One read of each, however many projects.
     assert.deepEqual(w.rpc.map((r) => r.tag).sort(), ['server.getConfig', 'server.getSettings']);
   } finally { w.close(); }

@@ -1655,6 +1655,10 @@ const hostModels = async (host: Host) => {
     }
   })()]);
   const ready = providers.filter((p) => p.availability !== 'unavailable' && p.status === 'ready');
+  const defaultsFor = (p: Pick<Project, 'id' | 'defaultModelSelection'>) => ({
+    providers: ready.filter((r) => providerInstanceEnabled(settings, p.id, r.instanceId)).map((r) => r.instanceId),
+    model: resolveDefaultModel(settings, p), runtimeMode: resolveDefaultRuntimeMode(settings, p.id),
+  });
   return {
     host: host.name,
     providers: ready.map((p) => ({
@@ -1664,11 +1668,10 @@ const hostModels = async (host: Host) => {
         slug: m.slug, name: m.name, ...(m.isLegacy ? { legacy: true } : {}), options: m.capabilities?.optionDescriptors ?? [],
       })),
     })),
-    projects: snap.projects.filter((p) => !p.deletedAt).map((p) => ({
-      id: p.id, title: p.title,
-      providers: ready.filter((r) => providerInstanceEnabled(settings, p.id, r.instanceId)).map((r) => r.instanceId),
-      model: resolveDefaultModel(settings, p), runtimeMode: resolveDefaultRuntimeMode(settings, p.id),
-    })),
+    // What a project with no settings of its own gets: the Scratch project before
+    // `thread scratch` first makes it, for one.
+    environment: defaultsFor({ id: '' }),
+    projects: snap.projects.filter((p) => !p.deletedAt).map((p) => ({ id: p.id, title: p.title, ...defaultsFor(p) })),
   };
 };
 

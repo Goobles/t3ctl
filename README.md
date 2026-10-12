@@ -225,6 +225,7 @@ With `--json`, `hosts[].providers[].models[].options` are T3's option
 descriptors as the server sends them, and `hosts[].projects[]` gives each
 project's `model` (a model selection), `runtimeMode` and `providers`: the
 instance ids it may use, which a project can narrow or widen in its settings.
+`hosts[].environment` is the same for a project without settings of its own.
 Pass the picks on with `thread create --model --option --runtime-mode`.
 
 ### `t3ctl project create <title> <workspace-root>`
