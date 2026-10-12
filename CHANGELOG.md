@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.11.0](https://github.com/Goobles/t3ctl/compare/v0.10.1...v0.11.0) (2026-10-12)
+
+
+### Features
+
+* add thread scratch to start a thread without a project ([1005872](https://github.com/Goobles/t3ctl/commit/100587203c6db3caf227862e8b07f0aec8a154e4))
+* add thread scratch to start a thread without a project ([c42dbf2](https://github.com/Goobles/t3ctl/commit/c42dbf2e0e347af83bb6d70437f45c31e3075b63))
+* list each thread's linked pull requests in ls --json ([aa0fceb](https://github.com/Goobles/t3ctl/commit/aa0fcebef772e99c4a76feac342f82129a48a1fa))
+
+
+### Bug Fixes
+
+* give new threads the project's default model, not opus 5 ([64b4a96](https://github.com/Goobles/t3ctl/commit/64b4a96ee0d892587c791117d85fcf4de5b9d3d1))
+* give new threads the project's default model, not opus 5 ([653ef73](https://github.com/Goobles/t3ctl/commit/653ef7391c280613688333c70e8dbf25f1ae5774))
+* match T3's provider availability and null project defaults ([dc47242](https://github.com/Goobles/t3ctl/commit/dc472427672cf3b88001cb08ef0441c96f81d64c))
+
 ## [0.10.1](https://github.com/Goobles/t3ctl/compare/v0.10.0...v0.10.1) (2026-10-12)
 
 
