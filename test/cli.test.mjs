@@ -830,6 +830,45 @@ test('a project default on a provider the project turned off is skipped, as T3 d
   } finally { w.close(); }
 });
 
+test('a project default counts only on a provider instance T3 would run', async () => {
+  const environment = { instanceId: 'claudeAgent', model: 'claude-sonnet-5-5' };
+  const project = (instanceId) => ({ instanceId, model: 'm' });
+  // [instance the project default is on, providerInstances, project's own providerInstances, picked?]
+  const cases = [
+    ['work', { work: { driver: 'codex', config: { enabled: false } } }, undefined, false], // legacy config flag
+    ['work', { work: { driver: 'codex', enabled: true, config: { enabled: false } } }, undefined, false], // either false wins
+    ['work', { work: { driver: 'codex' } }, undefined, true],
+    ['cursor', { cursor: { driver: 'cursor' } }, undefined, false], // driver off by default
+    ['cursor', { cursor: { driver: 'cursor', config: { enabled: true } } }, undefined, true],
+    ['removed', {}, undefined, false], // no such instance any more
+    ['claudeAgent', {}, undefined, true], // built-in default instance
+    ['cursor', { cursor: { driver: 'cursor' } }, { cursor: { enabled: true } }, true], // the project turned it on
+    ['codex', {}, { codex: { enabled: false } }, false], // the project turned it off
+  ];
+  for (const [instanceId, providerInstances, projectInstances, picked] of cases) {
+    const w = await settingsWorld({
+      ...DEFAULT_SETTINGS, defaultModelSelection: environment, providerInstances,
+      projectSettingsOverrides: { p1: { defaultModelSelection: project(instanceId), providerInstances: projectInstances } },
+    });
+    try {
+      assert.deepEqual(await createdModel(w), picked ? project(instanceId) : environment,
+        `${instanceId} with ${JSON.stringify(providerInstances)} / ${JSON.stringify(projectInstances)}`);
+    } finally { w.close(); }
+  }
+});
+
+test('a project default cleared to null is not brought back from the project\'s own field', async () => {
+  const environment = { instanceId: 'claudeAgent', model: 'claude-sonnet-5-5' };
+  const w = await settingsWorld({
+    ...DEFAULT_SETTINGS, projectSettingsFolded: false, defaultModelSelection: environment,
+    projectSettingsOverrides: { p1: { defaultModelSelection: null } },
+  });
+  w.project.defaultModelSelection = { instanceId: 'codex', model: 'gpt-5.6-sol' };
+  try {
+    assert.deepEqual(await createdModel(w), environment);
+  } finally { w.close(); }
+});
+
 test('until the server folds project settings, the project\'s own default still counts', async () => {
   const legacy = { instanceId: 'codex', model: 'gpt-5.6-sol' };
   const w = await settingsWorld({ ...DEFAULT_SETTINGS, projectSettingsFolded: false });
