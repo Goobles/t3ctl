@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.1](https://github.com/Goobles/t3ctl/compare/v0.10.0...v0.10.1) (2026-10-12)
+
+
+### Bug Fixes
+
+* check project workspace root only on local hosts ([fdd9965](https://github.com/Goobles/t3ctl/commit/fdd9965337acc299e20da6862de4f8d50a90bf54))
+
 ## [0.10.0](https://github.com/Goobles/t3ctl/compare/v0.9.1...v0.10.0) (2026-10-08)
 
 
