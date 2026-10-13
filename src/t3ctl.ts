@@ -1843,8 +1843,9 @@ const hostModels = async (host: Host) => {
       rpc.value.call('server.getSettings', {}, timeout) as Promise<ServerSettings>,
       rpc.value.call('server.getConfig', {}, timeout) as Promise<{ providers: ServerProvider[]; newProjectsRoot?: string }>,
     ]);
-    // In the order of T3's provider rail, which the lists of instance ids below follow too.
-    const ready = pickerInstanceOrder(config.providers.filter((p) => p.availability !== 'unavailable' && p.status === 'ready'));
+    // In the order of T3's provider rail, which the lists of instance ids below follow too. T3 sorts
+    // every instance and filters afterwards, so one that isn't ready still places its driver's group.
+    const ready = pickerInstanceOrder(config.providers).filter((p) => p.availability !== 'unavailable' && p.status === 'ready');
     const defaultsFor = (p: Pick<Project, 'id' | 'defaultModelSelection'>) => ({
       providers: ready.filter((r) => providerInstanceEnabled(settings, p.id, r.instanceId)).map((r) => r.instanceId),
       model: resolveDefaultModel(settings, p), runtimeMode: resolveDefaultRuntimeMode(settings, p.id),

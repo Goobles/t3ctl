@@ -1277,6 +1277,27 @@ test('models --json lists providers in T3\'s rail order and favourites as its Fa
   } finally { w.close(); }
 });
 
+// T3 orders every instance before it leaves out the ones that aren't ready: a codex instance still
+// being checked keeps codex's group, and so codex-work, ahead of Claude.
+test('models --json orders providers before leaving out unready ones, as T3\'s rail does', async () => {
+  const [claude, codex] = PROVIDERS;
+  const providers = [
+    { ...codex, availability: 'unavailable' },
+    claude,
+    { ...provider('codex-work', 'codex'), models: codex.models },
+  ];
+  const w = await modelsWorld({ ...DEFAULT_SETTINGS, favorites: [
+    { provider: 'claudeAgent', model: 'claude-opus-5-5' }, { provider: 'codex-work', model: 'gpt-6-astra' },
+  ] }, providers);
+  try {
+    const { code, stdout, stderr } = await cliIn(w.home, 'models', '--json');
+    assert.equal(code, 0, stderr);
+    const [h] = JSON.parse(stdout).hosts;
+    assert.deepEqual(h.providers.map((p) => p.instanceId), ['codex-work', 'claudeAgent']);
+    assert.deepEqual(h.favorites, [{ instanceId: 'codex-work', model: 'gpt-6-astra' }, { instanceId: 'claudeAgent', model: 'claude-opus-5-5' }]);
+  } finally { w.close(); }
+});
+
 test('models --json: no favourites in the settings (null before a client migrates its own) is none', async () => {
   const w = await modelsWorld({ ...DEFAULT_SETTINGS, favorites: null });
   try {
