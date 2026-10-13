@@ -215,8 +215,8 @@ Unreachable hosts are dimmed and show the values last recorded, not live ones.
 
 What a new thread can run on, per host: every model of the providers T3 Code's
 own picker offers (installed, checked and ready), as the picker lists them (hidden
-models left out, custom ones from settings, in your order), with the options each takes
-(`effort=low|medium|high`), then each project's default model, runtime mode and
+models left out, custom ones from settings, in your order), favourites marked ★, with the
+options each takes (`effort=low|medium|high`), then each project's default model, runtime mode and
 workspace (`local` or `worktree`), picked as T3 Code picks them for a new thread. Hosts that don't answer are
 reported, like `ls`; as a read, it only warns about a newer server beside a host.
 
@@ -235,6 +235,13 @@ else the host's, else the repository's `t3.json`, else `local` (a project made
 from just a name stays `local` until it has a thread). Reading `t3.json` costs
 one more call per project, made only when no setting decides.
 `hosts[].environment` is the same for a project without settings of its own.
+`hosts[].favorites` lists the models starred in T3 Code (`{ instanceId, model }`,
+from the server's settings), only those still offered, in the order of T3's
+Favourites tab: by provider, then in each provider's model order.
+`hosts[].providers` (and the `providers` of projects and `environment`) come in
+the order of T3's provider rail: grouped by driver, each driver's default
+instance first. Each provider's `models` come in its picker's order, with
+favourites left where they are rather than grouped first.
 Pass the picks on with `thread create --model --option --runtime-mode`, and
 `--new-worktree` for `worktree`.
 
