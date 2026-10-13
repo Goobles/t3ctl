@@ -237,9 +237,11 @@ one more call per project, made only when no setting decides.
 `hosts[].environment` is the same for a project without settings of its own.
 `hosts[].favorites` lists the models starred in T3 Code (`{ instanceId, model }`,
 from the server's settings), only those still offered, in the order of T3's
-Favourites tab: by provider as its picker orders them, then in each provider's
-model order. Each provider's `models` come in that order too, with favourites
-left where they are rather than grouped first.
+Favourites tab: by provider, then in each provider's model order.
+`hosts[].providers` (and the `providers` of projects and `environment`) come in
+the order of T3's provider rail: grouped by driver, each driver's default
+instance first. Each provider's `models` come in its picker's order, with
+favourites left where they are rather than grouped first.
 Pass the picks on with `thread create --model --option --runtime-mode`, and
 `--new-worktree` for `worktree`.
 

@@ -1843,7 +1843,8 @@ const hostModels = async (host: Host) => {
       rpc.value.call('server.getSettings', {}, timeout) as Promise<ServerSettings>,
       rpc.value.call('server.getConfig', {}, timeout) as Promise<{ providers: ServerProvider[]; newProjectsRoot?: string }>,
     ]);
-    const ready = config.providers.filter((p) => p.availability !== 'unavailable' && p.status === 'ready');
+    // In the order of T3's provider rail, which the lists of instance ids below follow too.
+    const ready = pickerInstanceOrder(config.providers.filter((p) => p.availability !== 'unavailable' && p.status === 'ready'));
     const defaultsFor = (p: Pick<Project, 'id' | 'defaultModelSelection'>) => ({
       providers: ready.filter((r) => providerInstanceEnabled(settings, p.id, r.instanceId)).map((r) => r.instanceId),
       model: resolveDefaultModel(settings, p), runtimeMode: resolveDefaultRuntimeMode(settings, p.id),
@@ -1855,13 +1856,13 @@ const hostModels = async (host: Host) => {
       models: pickerModels(settings, p),
     }));
     // Favourites as T3's Favourites tab lists them (ModelPickerContent.tsx sorts that tab with
-    // sortProviderModelItems): those still offered, by provider in the rail's order, then in each
-    // provider's model order.
+    // sortProviderModelItems): those still offered, by provider in the rail's order (already
+    // theirs), then in each provider's model order.
     const starred = new Set((settings.favorites ?? []).map((f) => `${f.provider}:${f.model}`));
     return {
       host: host.name,
       providers,
-      favorites: pickerInstanceOrder(providers).flatMap((p) => p.models
+      favorites: providers.flatMap((p) => p.models
         .filter((m) => starred.has(`${p.instanceId}:${m.slug}`)).map((m) => ({ instanceId: p.instanceId, model: m.slug }))),
       // What a project with no settings of its own gets: the Scratch project before
       // `thread scratch` first makes it, for one. It has no repository, so no t3.json.

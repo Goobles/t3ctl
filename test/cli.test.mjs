@@ -1236,7 +1236,7 @@ test('models --json lists the models T3\'s picker shows: hidden ones out, custom
 // Favourites live in the server's settings; T3's Favourites tab lists the ones still offered by
 // provider in the rail's order (each driver's default instance first), then in each provider's
 // model order, whatever order they were starred in.
-test('models --json lists the host\'s favourites as T3\'s Favourites tab orders them, and plain models stars them', async () => {
+test('models --json lists providers in T3\'s rail order and favourites as its Favourites tab orders them, and plain models stars them', async () => {
   const [claude, codex] = PROVIDERS;
   const providers = [
     { ...provider('codex-work', 'codex', { displayName: 'Codex (work)' }), models: codex.models },
@@ -1265,14 +1265,15 @@ test('models --json lists the host\'s favourites as T3\'s Favourites tab orders 
       { instanceId: 'claudeAgent', model: 'claude-sonnet-5-5' },
       { instanceId: 'claudeAgent', model: 'claude-opus-5-5' },
     ]);
-    // providers keep the server's order, and favourites aren't pulled to the top of their provider.
+    // providers come in the rail's order too, and favourites aren't pulled to the top of their provider.
     assert.deepEqual(h.providers.map((p) => [p.instanceId, p.models.map((m) => m.slug)]), [
-      ['codex-work', ['gpt-6-astra']], ['claudeAgent', ['claude-sonnet-5-5', 'claude-opus-5-5']], ['codex', ['gpt-6-astra']],
+      ['codex', ['gpt-6-astra']], ['codex-work', ['gpt-6-astra']], ['claudeAgent', ['claude-sonnet-5-5', 'claude-opus-5-5']],
     ]);
+    assert.deepEqual(h.environment.providers, ['codex', 'claudeAgent']);
     const plain = await cliIn(w.home, 'models');
     assert.equal(plain.code, 0, plain.stderr);
     const starred = plain.stdout.split('\n').filter((l) => l.startsWith('★ ')).map((l) => l.slice(2).split(/\s+/)[0]);
-    assert.deepEqual(starred, ['codex-work/gpt-6-astra', 'claudeAgent/claude-sonnet-5-5', 'claudeAgent/claude-opus-5-5', 'codex/gpt-6-astra']);
+    assert.deepEqual(starred, ['codex/gpt-6-astra', 'codex-work/gpt-6-astra', 'claudeAgent/claude-sonnet-5-5', 'claudeAgent/claude-opus-5-5']);
   } finally { w.close(); }
 });
 
