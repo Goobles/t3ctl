@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.14.0](https://github.com/Goobles/t3ctl/compare/v0.13.0...v0.14.0) (2026-10-13)
+
+
+### Features
+
+* list each host's model favourites in models, and star them ([93f0193](https://github.com/Goobles/t3ctl/commit/93f0193672e1537dd0ece42c494586d482120326))
+* list each host's model favourites in models, and star them ([9e54013](https://github.com/Goobles/t3ctl/commit/9e54013860ec7155a55d3966eb0f19c7e691b320))
+* list models' providers in T3's rail order ([7360dc4](https://github.com/Goobles/t3ctl/commit/7360dc4536e3a0b03883418a33b4c47e525066b4))
+
+
+### Bug Fixes
+
+* order models' providers before leaving out unready ones ([0a694c9](https://github.com/Goobles/t3ctl/commit/0a694c9b86925483ae77bd6967f8bf9bd449c762))
+
 ## [0.13.0](https://github.com/Goobles/t3ctl/compare/v0.12.0...v0.13.0) (2026-10-13)
 
 
