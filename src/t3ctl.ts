@@ -109,6 +109,8 @@ type Project = {
   deletedAt?: string | null;
   /** The project's own default model, which servers that have not folded their project settings still honour. */
   defaultModelSelection?: ModelSelection | null;
+  /** Likewise its own default for where a new thread runs: `local` or `worktree`. */
+  defaultThreadEnvMode?: string | null;
 };
 
 type Snapshot = { snapshotSequence: number; projects: Project[]; threads: Thread[] };
@@ -1428,7 +1430,7 @@ const createdJson = (host: Host, project: Pick<Project, 'id' | 'title'>, id: str
 // always sent: without one the server adds a detached worktree at the commit.
 const temporaryBranch = (): string => `t3code/${crypto.randomUUID().slice(0, 8)}`;
 
-type VcsRef = { name: string; isRemote?: boolean; remoteName?: string; isDefault: boolean };
+type VcsRef = { name: string; isRemote?: boolean; remoteName?: string; current: boolean; isDefault: boolean; worktreePath: string | null };
 
 // The default is origin/HEAD, which the server keeps on the first page of
 // vcs.listRefs. It can be listed as `origin/main` when there is no local main.
@@ -1438,6 +1440,51 @@ const defaultBranch = async (rpc: RpcSession, project: Project): Promise<string>
   const ref = list.refs.find((r) => r.isDefault);
   if (!ref) throw new Error(`cannot tell the default branch of ${project.title}: origin/HEAD is not set — pass --base <branch>`);
   return ref.isRemote && ref.remoteName ? ref.name.slice(ref.remoteName.length + 1) : ref.name;
+};
+
+// The page size T3's branch pickers ask for (VCS_REF_LIST_LIMIT in apps/web/src/state/queries.ts).
+const REF_PAGE = 100;
+
+// A project's branches as T3's branch pickers list them (usePaginatedBranches):
+// every page of vcs.listRefs, merged by name. The server has already dropped
+// each origin/<x> that has a local <x> and put the current and default branch
+// first; this puts local branches before remote ones and keeps its order
+// within each.
+const cmdProjectBranches = async (projectRef: string, flags: Flags): Promise<void> => {
+  const host = pickHost(flags);
+  const project = resolveProject(await snapshot(host), projectRef);
+  if (!project) throw new Error(`no project matching "${projectRef}" on ${host.name}`);
+  const refs = new Map<string, VcsRef>();
+  const rpc = await openRpc(host, { read: true });
+  try {
+    for (let cursor: number | null = 0; cursor !== null;) {
+      const page = (await rpc.call('vcs.listRefs', { cwd: project.workspaceRoot, limit: REF_PAGE, ...(cursor ? { cursor } : {}) }, 30_000)) as
+        { isRepo: boolean; refs: VcsRef[]; nextCursor: number | null };
+      if (!page.isRepo) throw new Error(`${project.title} (${project.workspaceRoot}) is not a git repository`);
+      for (const ref of page.refs) refs.set(ref.name, ref);
+      // A cursor that does not move on would page forever.
+      cursor = page.nextCursor !== null && page.nextCursor > cursor ? page.nextCursor : null;
+    }
+  } finally {
+    rpc.close();
+  }
+  const listed = [...refs.values()];
+  const branches = [...listed.filter((r) => !r.isRemote), ...listed.filter((r) => r.isRemote)].map((r) => ({
+    name: r.name, current: r.current, default: r.isDefault, remote: r.isRemote === true, worktreePath: r.worktreePath ?? null,
+  }));
+  if (flags.json) {
+    return printJson({
+      project: { id: project.id, title: project.title },
+      current: branches.find((b) => b.current)?.name ?? null,
+      default: branches.find((b) => b.default)?.name ?? null,
+      branches,
+    });
+  }
+  const width = Math.max(0, ...branches.map((b) => b.name.length));
+  for (const b of branches) {
+    const tags = [b.default && 'default', b.remote && 'remote', b.worktreePath].filter(Boolean).join('  ');
+    console.log(`${b.current ? '*' : ' '} ${b.name.padEnd(width)}  ${dim(tags)}`.trimEnd());
+  }
 };
 
 const worktreeFlagProblem = (flags: Flags): string | null => {
@@ -1541,11 +1588,14 @@ const cmdThreadCreateInWorktree = async (host: Host, project: Project, title: st
 type ServerSettings = {
   defaultModelSelection?: ModelSelection | null;
   defaultRuntimeMode?: string;
+  /** Null or absent: the repository's t3.json decides, then `local`. */
+  defaultThreadEnvMode?: string | null;
   providerInstances?: Record<string, { driver: string; enabled?: boolean; config?: unknown }>;
   providerModelPreferences?: Record<string, { hiddenModels?: string[]; modelOrder?: string[] }>;
   projectSettingsOverrides?: Record<string, {
     defaultModelSelection?: ModelSelection | null;
     defaultRuntimeMode?: string | null;
+    defaultThreadEnvMode?: string | null;
     providerInstances?: Record<string, { enabled?: boolean }>;
   }>;
   projectSettingsFolded?: boolean;
@@ -1617,13 +1667,62 @@ const resolveDefaultRuntimeMode = (settings: ServerSettings, projectId: string):
   return mode && mode in RUNTIME_MODES ? mode : 'full-access';
 };
 
+const isThreadEnvMode = (mode: unknown): mode is 'local' | 'worktree' => mode === 'local' || mode === 'worktree';
+
+// Where T3 starts a project's new thread, `local` (the project checkout) or
+// `worktree` (a new one), as resolveProjectSettings and resolveNewThreadEnvMode
+// in packages/shared/src/projectSettings.ts pick it: the project's setting
+// (its own field until the server has folded those), else the environment's,
+// else the repository's t3.json, else local. A project made from just a name
+// (a folder directly in newProjectsRoot) starts local while it has no threads,
+// even when the environment says worktree. Only the setting tiers are read
+// here: `file` reads t3.json, and only when they leave the mode open.
+const resolveThreadEnvMode = async (
+  settings: ServerSettings,
+  project: Pick<Project, 'id' | 'defaultThreadEnvMode' | 'workspaceRoot'>,
+  { newProjectsRoot, hasThreads, file }: { newProjectsRoot?: string; hasThreads: boolean; file: () => Promise<unknown> },
+): Promise<'local' | 'worktree'> => {
+  const stored = settings.projectSettingsOverrides?.[project.id]?.defaultThreadEnvMode;
+  const fromProject = stored !== undefined ? stored : settings.projectSettingsFolded ? null : project.defaultThreadEnvMode;
+  if (isThreadEnvMode(fromProject)) return fromProject;
+  const environment = settings.defaultThreadEnvMode;
+  if (environment === 'worktree' && !hasThreads && newProjectsRoot && isDirectChild(newProjectsRoot, project.workspaceRoot)) return 'local';
+  if (isThreadEnvMode(environment)) return environment;
+  const fromFile = await file();
+  return isThreadEnvMode(fromFile) ? fromFile : 'local';
+};
+
+/** Whether `folder` sits directly inside `root`, compared as T3 does (normalizeProjectPathForComparison). */
+const isDirectChild = (root: string, folder: string): boolean => {
+  const norm = (p: string) => {
+    const trimmed = p.trim().replace(/[\\/]+$/, '') || p.trim();
+    return /^([a-zA-Z]:|\\\\)/.test(trimmed) ? trimmed.replaceAll('/', '\\').toLowerCase() : trimmed;
+  };
+  const [r, f] = [norm(root), norm(folder)];
+  const sep = r.includes('\\') ? '\\' : '/';
+  const prefix = r.endsWith(sep) ? r : `${r}${sep}`;
+  return f.startsWith(prefix) && f.length > prefix.length && !f.slice(prefix.length).includes(sep);
+};
+
+// The repository's t3.json says where its threads start; a missing,
+// unreadable or truncated file says nothing (readT3ProjectFile in apps/web).
+const readT3JsonEnvMode = async (rpc: RpcSession, workspaceRoot: string, timeoutMs: number): Promise<unknown> => {
+  try {
+    const file = (await rpc.call('projects.readFile', { cwd: workspaceRoot, relativePath: 't3.json' }, timeoutMs)) as { contents: string; truncated: boolean };
+    return file.truncated ? null : (JSON.parse(file.contents) as { defaultThreadEnvMode?: unknown })?.defaultThreadEnvMode;
+  } catch {
+    return null;
+  }
+};
+
 // ---- models ---------------------------------------------------------------
 // What a new thread can run on, for tools that pick a model before calling
 // `thread create` (mainframe's composer): per host, the providers T3's picker
 // offers (isProviderInstancePickerReady in apps/web/src/providerInstances.ts:
 // available and ready; enabled is per project, below), each model with the
 // option descriptors it takes, and per project the providers it may use and the
-// model and runtime mode T3 would give its new thread.
+// model, runtime mode and workspace (local or a new worktree) T3 would give its
+// new thread.
 
 /** The parts of `server.getConfig`'s providers (ServerProvider) this reads. */
 type ProviderOptionDescriptor = { id: string; label: string; type: string } & Record<string, unknown>;
@@ -1679,36 +1778,43 @@ const DRIVER_NAMES: Record<string, string> = {
 };
 
 const hostModels = async (host: Host) => {
-  const [snap, { settings, providers }] = await Promise.all([snapshot(host), (async () => {
-    const rpc = await openRpc(host, { read: true });
-    try {
-      const timeout = host.timeoutMs ?? 15000;
-      const [settings, config] = await Promise.all([
-        rpc.call('server.getSettings', {}, timeout) as Promise<ServerSettings>,
-        rpc.call('server.getConfig', {}, timeout) as Promise<{ providers: ServerProvider[] }>,
-      ]);
-      return { settings, providers: config.providers };
-    } finally {
-      rpc.close();
-    }
-  })()]);
-  const ready = providers.filter((p) => p.availability !== 'unavailable' && p.status === 'ready');
-  const defaultsFor = (p: Pick<Project, 'id' | 'defaultModelSelection'>) => ({
-    providers: ready.filter((r) => providerInstanceEnabled(settings, p.id, r.instanceId)).map((r) => r.instanceId),
-    model: resolveDefaultModel(settings, p), runtimeMode: resolveDefaultRuntimeMode(settings, p.id),
-  });
-  return {
-    host: host.name,
-    providers: ready.map((p) => ({
-      instanceId: p.instanceId, driver: p.driver, name: p.displayName ?? DRIVER_NAMES[p.driver] ?? p.instanceId,
-      ...(p.supportedRuntimeModes?.length ? { runtimeModes: p.supportedRuntimeModes } : {}),
-      models: pickerModels(settings, p),
-    })),
-    // What a project with no settings of its own gets: the Scratch project before
-    // `thread scratch` first makes it, for one.
-    environment: defaultsFor({ id: '' }),
-    projects: snap.projects.filter((p) => !p.deletedAt).map((p) => ({ id: p.id, title: p.title, ...defaultsFor(p) })),
-  };
+  const timeout = host.timeoutMs ?? 15000;
+  const [snap, rpc] = await Promise.allSettled([snapshot(host), openRpc(host, { read: true })]);
+  if (rpc.status === 'rejected') throw rpc.reason;
+  try {
+    if (snap.status === 'rejected') throw snap.reason;
+    const [settings, config] = await Promise.all([
+      rpc.value.call('server.getSettings', {}, timeout) as Promise<ServerSettings>,
+      rpc.value.call('server.getConfig', {}, timeout) as Promise<{ providers: ServerProvider[]; newProjectsRoot?: string }>,
+    ]);
+    const ready = config.providers.filter((p) => p.availability !== 'unavailable' && p.status === 'ready');
+    const defaultsFor = (p: Pick<Project, 'id' | 'defaultModelSelection'>) => ({
+      providers: ready.filter((r) => providerInstanceEnabled(settings, p.id, r.instanceId)).map((r) => r.instanceId),
+      model: resolveDefaultModel(settings, p), runtimeMode: resolveDefaultRuntimeMode(settings, p.id),
+    });
+    const live = snap.value.threads.filter((t) => !t.deletedAt && !t.archivedAt);
+    return {
+      host: host.name,
+      providers: ready.map((p) => ({
+        instanceId: p.instanceId, driver: p.driver, name: p.displayName ?? DRIVER_NAMES[p.driver] ?? p.instanceId,
+        ...(p.supportedRuntimeModes?.length ? { runtimeModes: p.supportedRuntimeModes } : {}),
+        models: pickerModels(settings, p),
+      })),
+      // What a project with no settings of its own gets: the Scratch project before
+      // `thread scratch` first makes it, for one. It has no repository, so no t3.json.
+      environment: { ...defaultsFor({ id: '' }), threadEnvMode: isThreadEnvMode(settings.defaultThreadEnvMode) ? settings.defaultThreadEnvMode : 'local' },
+      projects: await Promise.all(snap.value.projects.filter((p) => !p.deletedAt).map(async (p) => ({
+        id: p.id, title: p.title, ...defaultsFor(p),
+        threadEnvMode: await resolveThreadEnvMode(settings, p, {
+          ...(config.newProjectsRoot ? { newProjectsRoot: config.newProjectsRoot } : {}),
+          hasThreads: live.some((t) => t.projectId === p.id),
+          file: () => readT3JsonEnvMode(rpc.value, p.workspaceRoot, timeout),
+        }),
+      }))),
+    };
+  } finally {
+    rpc.value.close();
+  }
 };
 
 const cmdModels = async (flags: Flags): Promise<void> => {
@@ -1732,7 +1838,7 @@ const cmdModels = async (flags: Flags): Promise<void> => {
         }
       }
       console.log(dim('  project defaults'));
-      for (const p of h.projects) console.log(`  ${p.title.padEnd(36)}  ${modelRef(p.model).padEnd(24)}  ${p.runtimeMode}`);
+      for (const p of h.projects) console.log(`  ${p.title.padEnd(36)}  ${modelRef(p.model).padEnd(24)}  ${p.runtimeMode.padEnd(17)}  ${p.threadEnvMode}`);
     }
   }
   for (const u of unreachable) console.error(`${sgr('31', '✕', process.stderr)} ${u.host} ${dim(u.error, process.stderr)}`);
@@ -2190,7 +2296,7 @@ program.command('ls')
   .action((o: OptionValues) => cmdLs(o));
 
 program.command('models')
-  .description('list the models a new thread can use on each host, and each project\'s default model and mode')
+  .description('list the models a new thread can use on each host, and each project\'s default model, mode and workspace')
   .option('--host <name>', 'just this registered host (default: all)')
   .option('--json', 'emit JSON instead of a table')
   .action((o: OptionValues) => cmdModels(toFlags(o)));
@@ -2267,6 +2373,12 @@ hostOption(project.command('create')
   .argument('<workspace-root>', 'existing directory the project maps to')
   .description('create a project for an existing directory'))
   .action((title: string, root: string, o: OptionValues) => cmdProjectCreate(title, root, toFlags(o)));
+
+hostOption(project.command('branches')
+  .argument('<project>', 'project id, title, or workspace root')
+  .description("list the project's git branches, as T3 Code's branch picker does: * marks the checked-out one")
+  .option('--json', 'emit JSON, and errors as {"error": ...} on stderr'))
+  .action((ref: string, o: OptionValues) => cmdProjectBranches(ref, toFlags(o)));
 
 const thread = program.command('thread').description('create and drive threads');
 
