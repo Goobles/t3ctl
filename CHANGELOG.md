@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.13.0](https://github.com/Goobles/t3ctl/compare/v0.12.0...v0.13.0) (2026-10-13)
+
+
+### Features
+
+* list a project's branches, and give models each project's workspace mode ([d3b2249](https://github.com/Goobles/t3ctl/commit/d3b224998eb14b7eaef7ac2e27010a28b13258ce))
+* list a project's branches, and give models each project's workspace mode ([86fcb97](https://github.com/Goobles/t3ctl/commit/86fcb97de28600ba224f613643c05e6ffc7470b2))
+
+
+### Bug Fixes
+
+* resolve a project's thread workspace from t3.json exactly as T3 does ([856b4aa](https://github.com/Goobles/t3ctl/commit/856b4aa55e4b1036f3764856f50287c50166af01))
+
 ## [0.12.0](https://github.com/Goobles/t3ctl/compare/v0.11.0...v0.12.0) (2026-10-12)
 
 
