@@ -1673,21 +1673,28 @@ const isThreadEnvMode = (mode: unknown): mode is 'local' | 'worktree' => mode ==
 // `worktree` (a new one), as resolveProjectSettings and resolveNewThreadEnvMode
 // in packages/shared/src/projectSettings.ts pick it: the project's setting
 // (its own field until the server has folded those), else the environment's,
-// else the repository's t3.json, else local. A project made from just a name
-// (a folder directly in newProjectsRoot) starts local while it has no threads,
-// even when the environment says worktree. Only the setting tiers are read
-// here: `file` reads t3.json, and only when they leave the mode open.
+// else the repository's t3.json, else local. A project setting of null skips
+// the environment and goes on to t3.json: T3 writes the null over the
+// environment's value before the file fills it in. A project made from just a
+// name (a folder directly in newProjectsRoot) starts local while it has no
+// threads, even when the environment says worktree. Only the setting tiers are
+// read here: `file` reads t3.json, and only when they leave the mode open.
 const resolveThreadEnvMode = async (
   settings: ServerSettings,
   project: Pick<Project, 'id' | 'defaultThreadEnvMode' | 'workspaceRoot'>,
   { newProjectsRoot, hasThreads, file }: { newProjectsRoot?: string; hasThreads: boolean; file: () => Promise<unknown> },
 ): Promise<'local' | 'worktree'> => {
+  // The override record wins over the project's own field, which only counts
+  // before the fold and, being a plain field, never overrides with null.
   const stored = settings.projectSettingsOverrides?.[project.id]?.defaultThreadEnvMode;
-  const fromProject = stored !== undefined ? stored : settings.projectSettingsFolded ? null : project.defaultThreadEnvMode;
+  const fromProject = stored === null || isThreadEnvMode(stored) ? stored
+    : !settings.projectSettingsFolded && isThreadEnvMode(project.defaultThreadEnvMode) ? project.defaultThreadEnvMode : undefined;
   if (isThreadEnvMode(fromProject)) return fromProject;
-  const environment = settings.defaultThreadEnvMode;
-  if (environment === 'worktree' && !hasThreads && newProjectsRoot && isDirectChild(newProjectsRoot, project.workspaceRoot)) return 'local';
-  if (isThreadEnvMode(environment)) return environment;
+  if (fromProject === undefined) {
+    const environment = settings.defaultThreadEnvMode;
+    if (environment === 'worktree' && !hasThreads && newProjectsRoot && isDirectChild(newProjectsRoot, project.workspaceRoot)) return 'local';
+    if (isThreadEnvMode(environment)) return environment;
+  }
   const fromFile = await file();
   return isThreadEnvMode(fromFile) ? fromFile : 'local';
 };
@@ -1709,11 +1716,48 @@ const isDirectChild = (root: string, folder: string): boolean => {
 const readT3JsonEnvMode = async (rpc: RpcSession, workspaceRoot: string, timeoutMs: number): Promise<unknown> => {
   try {
     const file = (await rpc.call('projects.readFile', { cwd: workspaceRoot, relativePath: 't3.json' }, timeoutMs)) as { contents: string; truncated: boolean };
-    return file.truncated ? null : (JSON.parse(file.contents) as { defaultThreadEnvMode?: unknown })?.defaultThreadEnvMode;
+    return file.truncated ? null : parseT3ProjectFile(file.contents)?.defaultThreadEnvMode;
   } catch {
     return null;
   }
 };
+
+// t3.json as T3 reads it (parseT3ProjectFile in packages/shared/src/t3ProjectFile.ts):
+// JSONC with the same three rewrites as its fromLenientJson (// comments, /* */
+// comments, trailing commas, each leaving string literals alone), then the whole
+// T3ProjectFile schema. A file that fails anywhere counts as no file at all, so
+// a bad `scripts` entry also drops a good defaultThreadEnvMode. Unknown keys
+// pass, as Effect's Struct ignores them.
+const parseT3ProjectFile = (contents: string): Record<string, unknown> | null => {
+  const keepStrings = (match: string, literal: string | undefined) => (literal ? match : '');
+  const stripped = contents
+    .replace(/("(?:[^"\\]|\\.)*")|\/\/[^\n]*/g, keepStrings)
+    .replace(/("(?:[^"\\]|\\.)*")|\/\*[\s\S]*?\*\//g, keepStrings)
+    .replace(/("(?:[^"\\]|\\.)*")|,(\s*[}\]])/g, (match, literal: string | undefined, bracket: string | undefined) => (literal ? match : bracket ?? ''));
+  let file: unknown;
+  try { file = JSON.parse(stripped); } catch { return null; }
+  return isT3ProjectFile(file) ? file : null;
+};
+
+const isRecord = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v);
+// T3's trimmedNonEmpty: the raw string within the limit, and non-empty before and after trimming.
+const isTrimmedNonEmpty = (v: unknown, max = Infinity): boolean => typeof v === 'string' && v.length <= max && v.trim().length > 0;
+// An optionalKey field: absent, or present and valid (null is not absent).
+const optional = (o: Record<string, unknown>, key: string, valid: (v: unknown) => boolean): boolean => !Object.hasOwn(o, key) || valid(o[key]);
+const SCRIPT_ICONS = ['play', 'test', 'lint', 'configure', 'build', 'debug'];
+const isBoolean = (v: unknown): boolean => typeof v === 'boolean';
+const isT3ProjectFileScript = (s: unknown): boolean => isRecord(s)
+  && isTrimmedNonEmpty(s['name']) && isTrimmedNonEmpty(s['command'])
+  && optional(s, 'icon', (v) => SCRIPT_ICONS.includes(v as string))
+  && ['runOnWorktreeCreate', 'runOnSettle', 'async', 'autoOpenPreview'].every((k) => optional(s, k, isBoolean))
+  && optional(s, 'previewUrl', (v) => isTrimmedNonEmpty(v));
+// T3ProjectFile in packages/contracts/src/t3ProjectFile.ts.
+const isT3ProjectFile = (f: unknown): f is Record<string, unknown> => isRecord(f)
+  && optional(f, '$schema', (v) => typeof v === 'string')
+  && optional(f, 'iconPath', (v) => isTrimmedNonEmpty(v, 512))
+  && optional(f, 'defaultThreadEnvMode', isThreadEnvMode)
+  && optional(f, 'worktreeSubmodules', (v) => v === 'recursive' || v === 'top-level' || v === 'none')
+  && optional(f, 'scripts', (v) => Array.isArray(v) && v.length <= 50 && v.every(isT3ProjectFileScript));
 
 // ---- models ---------------------------------------------------------------
 // What a new thread can run on, for tools that pick a model before calling

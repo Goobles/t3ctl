@@ -1295,6 +1295,43 @@ test('models --json: the environment outranks t3.json, the project outranks both
   try { assert.deepEqual(await envModeOf(unfolded), ['worktree', 'local']); } finally { unfolded.close(); }
 });
 
+// T3 writes a null project setting over the environment's value, and only then fills the gap
+// from t3.json (resolveProjectOverrides, then applyProjectFile).
+test('models --json: a project setting of null skips the environment and goes on to t3.json', async () => {
+  const settings = { ...DEFAULT_SETTINGS, defaultThreadEnvMode: 'worktree', projectSettingsOverrides: { p1: { defaultThreadEnvMode: null } } };
+  for (const [t3json, mode] of [[JSON.stringify({ defaultThreadEnvMode: 'local' }), 'local'], [undefined, 'local'], [JSON.stringify({ defaultThreadEnvMode: 'worktree' }), 'worktree']]) {
+    const w = await envModeWorld(settings, { t3json });
+    try {
+      assert.deepEqual(await envModeOf(w), [mode, 'worktree'], String(t3json));
+      assert.ok(w.rpc.some((r) => r.tag === 'projects.readFile'));
+    } finally { w.close(); }
+  }
+  // Before the fold, the null in the record outranks the project's own field too.
+  const unfolded = await envModeWorld({ ...settings, projectSettingsFolded: false });
+  unfolded.project.defaultThreadEnvMode = 'worktree';
+  try { assert.deepEqual(await envModeOf(unfolded), ['local', 'worktree']); } finally { unfolded.close(); }
+});
+
+// T3 reads t3.json as JSONC and decodes the whole file (parseT3ProjectFile), so one bad field
+// discards a good defaultThreadEnvMode.
+test('models --json reads t3.json as T3 does: JSONC, and nothing from a file its schema rejects', async () => {
+  const cases = [
+    ['{\n  // where threads start\n  "$schema": "https://t3.codes/schema/t3.json",\n  /* a, block */ "defaultThreadEnvMode": "worktree",\n}', 'worktree'],
+    ['{ "defaultThreadEnvMode": "worktree", "scripts": [{ "name": "Dev", "command": "a,]", }, ], }', 'worktree'],
+    [JSON.stringify({ defaultThreadEnvMode: 'worktree', somethingNewer: { x: 1 } }), 'worktree'],
+    [JSON.stringify({ defaultThreadEnvMode: 'worktree', scripts: 42 }), 'local'],
+    [JSON.stringify({ defaultThreadEnvMode: 'worktree', scripts: [{ name: '  ', command: 'vp dev' }] }), 'local'],
+    [JSON.stringify({ defaultThreadEnvMode: 'worktree', scripts: [{ name: 'Dev', command: 'vp dev', icon: 'rocket' }] }), 'local'],
+    [JSON.stringify({ defaultThreadEnvMode: 'worktree', iconPath: null }), 'local'],
+    [JSON.stringify({ defaultThreadEnvMode: 'worktree', worktreeSubmodules: 'all' }), 'local'],
+    ['[]', 'local'],
+  ];
+  for (const [t3json, mode] of cases) {
+    const w = await envModeWorld(DEFAULT_SETTINGS, { t3json });
+    try { assert.deepEqual(await envModeOf(w), [mode, 'local'], t3json); } finally { w.close(); }
+  }
+});
+
 test('models --json: a project made from just a name starts local until it has a thread', async () => {
   const settings = { ...DEFAULT_SETTINGS, defaultThreadEnvMode: 'worktree' };
   // The fake project lives at /tmp: directly in a newProjectsRoot of /.
