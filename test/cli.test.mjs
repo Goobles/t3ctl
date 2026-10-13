@@ -969,6 +969,76 @@ test('project create checks the workspace root only on a local host', async () =
   } finally { remote.close(); }
 });
 
+// ---- project branches ---------------------------------------------------------
+// T3's branch pickers page through vcs.listRefs and merge the pages by name; the
+// server has already put the current and default branch first and dropped every
+// origin/<x> that has a local <x>.
+
+const ref = (name, extra = {}) => ({ name, current: false, isDefault: false, worktreePath: null, ...extra });
+const remoteRef = (name, extra = {}) => ref(name, { isRemote: true, remoteName: 'origin', ...extra });
+const REF_PAGES = [
+  { isRepo: true, hasPrimaryRemote: true, nextCursor: 3, totalCount: 5, refs: [
+    ref('feature', { current: true, worktreePath: '/tmp' }),
+    remoteRef('origin/main', { isDefault: true }),
+    ref('fix/x', { worktreePath: '/wt/alpha/fix-x' }),
+  ] },
+  // A ref the first page already listed is not listed twice.
+  { isRepo: true, hasPrimaryRemote: true, nextCursor: null, totalCount: 5, refs: [ref('fix/x', { worktreePath: '/wt/alpha/fix-x' }), remoteRef('origin/dev'), ref('old')] },
+];
+const branchesWorld = async (pages = REF_PAGES) => world(await fakeT3('0.0.45', [THREAD], (request) =>
+  request.tag === 'vcs.listRefs' ? ok(pages[request.payload.cursor ? 1 : 0]) : defaultRpc(request)));
+
+test('project branches --json lists every page, locals first, with the current and default branch', async () => {
+  const w = await branchesWorld();
+  try {
+    const { code, stdout, stderr } = await cliIn(w.home, 'project', 'branches', 'alpha', '--json');
+    assert.equal(code, 0, stderr);
+    assert.deepEqual(JSON.parse(stdout), {
+      project: { id: 'p1', title: 'alpha' },
+      current: 'feature',
+      default: 'origin/main',
+      branches: [
+        { name: 'feature', current: true, default: false, remote: false, worktreePath: '/tmp' },
+        { name: 'fix/x', current: false, default: false, remote: false, worktreePath: '/wt/alpha/fix-x' },
+        { name: 'old', current: false, default: false, remote: false, worktreePath: null },
+        { name: 'origin/main', current: false, default: true, remote: true, worktreePath: null },
+        { name: 'origin/dev', current: false, default: false, remote: true, worktreePath: null },
+      ],
+    });
+    // T3's page size, the second page from the first one's cursor; nothing written.
+    assert.deepEqual(w.rpc.map((r) => r.payload), [{ cwd: '/tmp', limit: 100 }, { cwd: '/tmp', limit: 100, cursor: 3 }]);
+    assert.deepEqual(w.dispatched, []);
+  } finally { w.close(); }
+});
+
+test('project branches prints one branch per line, * on the current one', async () => {
+  const w = await branchesWorld();
+  try {
+    const { code, stdout, stderr } = await cliIn(w.home, 'project', 'branches', 'alpha');
+    assert.equal(code, 0, stderr);
+    assert.deepEqual(stdout.trimEnd().split('\n'), [
+      '* feature      /tmp',
+      '  fix/x        /wt/alpha/fix-x',
+      '  old',
+      '  origin/main  default  remote',
+      '  origin/dev   remote',
+    ]);
+  } finally { w.close(); }
+});
+
+test('project branches reports a folder that is not a repository, and an unknown project, as errors', async () => {
+  const w = await branchesWorld([{ isRepo: false, hasPrimaryRemote: false, nextCursor: null, totalCount: 0, refs: [] }]);
+  try {
+    const plain = await cliIn(w.home, 'project', 'branches', 'alpha');
+    assert.notEqual(plain.code, 0);
+    assert.match(plain.stderr, /alpha \(\/tmp\) is not a git repository/);
+    const json = await cliIn(w.home, 'project', 'branches', 'nope', '--json');
+    assert.notEqual(json.code, 0);
+    assert.deepEqual(JSON.parse(json.stderr), { error: 'no project matching "nope" on box' });
+    assert.equal(json.stdout, '');
+  } finally { w.close(); }
+});
+
 test('ls reads thread status and provider from the shell snapshot', async () => {
   const failed = { ...THREAD, id: '33333333-3333-4333-8333-333333333333', title: 'broken', status: 'failed', providerInstanceId: 'codex' };
   const w = await threadWorld([THREAD, BUSY, failed]);
@@ -1059,7 +1129,8 @@ test('models --json lists what T3 would offer, with each project\'s defaults', a
     ...DEFAULT_SETTINGS,
     defaultModelSelection: { instanceId: 'claudeAgent', model: 'claude-opus-5-5' },
     defaultRuntimeMode: 'auto-accept-edits',
-    projectSettingsOverrides: { p1: { defaultModelSelection: { instanceId: 'codex', model: 'gpt-6-astra' }, defaultRuntimeMode: 'approval-required' } },
+    defaultThreadEnvMode: 'local',
+    projectSettingsOverrides: { p1: { defaultModelSelection: { instanceId: 'codex', model: 'gpt-6-astra' }, defaultRuntimeMode: 'approval-required', defaultThreadEnvMode: 'worktree' } },
   });
   try {
     const { code, stdout, stderr } = await cliIn(w.home, 'models', '--json');
@@ -1080,12 +1151,13 @@ test('models --json lists what T3 would offer, with each project\'s defaults', a
     ]);
     assert.deepEqual(h.projects, [{
       id: 'p1', title: 'alpha', providers: ['claudeAgent', 'codex'],
-      model: { instanceId: 'codex', model: 'gpt-6-astra' }, runtimeMode: 'approval-required',
+      model: { instanceId: 'codex', model: 'gpt-6-astra' }, runtimeMode: 'approval-required', threadEnvMode: 'worktree',
     }]);
     assert.deepEqual(h.environment, {
       providers: ['claudeAgent', 'codex'], model: { instanceId: 'claudeAgent', model: 'claude-opus-5-5' }, runtimeMode: 'auto-accept-edits',
+      threadEnvMode: 'local',
     });
-    // One read of each, however many projects.
+    // One read of each, however many projects, and no t3.json when the settings decide.
     assert.deepEqual(w.rpc.map((r) => r.tag).sort(), ['server.getConfig', 'server.getSettings']);
   } finally { w.close(); }
 });
@@ -1172,8 +1244,103 @@ test('models reads a host that has a newer server beside it, and warns, as ls do
     const out = JSON.parse(stdout);
     assert.deepEqual([out.hosts.map((h) => h.host), out.unreachable], [['box'], []]);
     assert.match(stderr, /not the only T3 Code server/);
-    assert.deepEqual(a.rpc.map((r) => r.tag).sort(), ['server.getConfig', 'server.getSettings']);
+    // No setting picks the workspace, so the project's t3.json is read too.
+    assert.deepEqual(a.rpc.map((r) => r.tag).sort(), ['projects.readFile', 'server.getConfig', 'server.getSettings']);
   } finally { a.close(); b.close(); rmSync(home, { recursive: true, force: true }); }
+});
+
+// T3 picks a new thread's workspace (resolveProjectSettings and resolveNewThreadEnvMode in
+// packages/shared/src/projectSettings.ts): project setting, environment, the repo's t3.json, local.
+const envModeWorld = async (settings, { t3json, newProjectsRoot, threads = [THREAD] } = {}) => {
+  const w = world(await fakeT3('0.0.45', threads, (request) =>
+    request.tag === 'server.getSettings' ? ok(settings)
+    : request.tag === 'server.getConfig' ? ok({ providers: PROVIDERS, ...(newProjectsRoot ? { newProjectsRoot } : {}) })
+    : request.tag === 'projects.readFile'
+      ? t3json === undefined ? { _tag: 'Failure', cause: [{ _tag: 'Fail', error: { _tag: 'ProjectReadFileError', message: 'ENOENT' } }] }
+      : ok({ relativePath: 't3.json', contents: t3json, byteLength: t3json.length, truncated: false })
+    : defaultRpc(request)));
+  return w;
+};
+const envModeOf = async (w) => {
+  const { code, stdout, stderr } = await cliIn(w.home, 'models', '--json');
+  assert.equal(code, 0, stderr);
+  const [h] = JSON.parse(stdout).hosts;
+  return [h.projects[0].threadEnvMode, h.environment.threadEnvMode];
+};
+
+test('models --json: with no setting, a project starts where its t3.json says, else local', async () => {
+  const w = await envModeWorld(DEFAULT_SETTINGS, { t3json: JSON.stringify({ defaultThreadEnvMode: 'worktree' }) });
+  try {
+    assert.deepEqual(await envModeOf(w), ['worktree', 'local']);
+    assert.deepEqual(w.rpc.find((r) => r.tag === 'projects.readFile').payload, { cwd: '/tmp', relativePath: 't3.json' });
+  } finally { w.close(); }
+  for (const t3json of [undefined, '{not json', JSON.stringify({ defaultThreadEnvMode: 'cloud' })]) {
+    const none = await envModeWorld(DEFAULT_SETTINGS, { t3json });
+    try { assert.deepEqual(await envModeOf(none), ['local', 'local'], String(t3json)); } finally { none.close(); }
+  }
+});
+
+test('models --json: the environment outranks t3.json, the project outranks both', async () => {
+  const t3json = JSON.stringify({ defaultThreadEnvMode: 'local' });
+  const env = await envModeWorld({ ...DEFAULT_SETTINGS, defaultThreadEnvMode: 'worktree' }, { t3json });
+  try {
+    assert.deepEqual(await envModeOf(env), ['worktree', 'worktree']);
+    assert.ok(!env.rpc.some((r) => r.tag === 'projects.readFile'));
+  } finally { env.close(); }
+  const project = await envModeWorld({ ...DEFAULT_SETTINGS, defaultThreadEnvMode: 'worktree', projectSettingsOverrides: { p1: { defaultThreadEnvMode: 'local' } } }, { t3json });
+  try { assert.deepEqual(await envModeOf(project), ['local', 'worktree']); } finally { project.close(); }
+  // Until the server folds project settings, the project's own field counts.
+  const unfolded = await envModeWorld({ ...DEFAULT_SETTINGS, projectSettingsFolded: false });
+  unfolded.project.defaultThreadEnvMode = 'worktree';
+  try { assert.deepEqual(await envModeOf(unfolded), ['worktree', 'local']); } finally { unfolded.close(); }
+});
+
+// T3 writes a null project setting over the environment's value, and only then fills the gap
+// from t3.json (resolveProjectOverrides, then applyProjectFile).
+test('models --json: a project setting of null skips the environment and goes on to t3.json', async () => {
+  const settings = { ...DEFAULT_SETTINGS, defaultThreadEnvMode: 'worktree', projectSettingsOverrides: { p1: { defaultThreadEnvMode: null } } };
+  for (const [t3json, mode] of [[JSON.stringify({ defaultThreadEnvMode: 'local' }), 'local'], [undefined, 'local'], [JSON.stringify({ defaultThreadEnvMode: 'worktree' }), 'worktree']]) {
+    const w = await envModeWorld(settings, { t3json });
+    try {
+      assert.deepEqual(await envModeOf(w), [mode, 'worktree'], String(t3json));
+      assert.ok(w.rpc.some((r) => r.tag === 'projects.readFile'));
+    } finally { w.close(); }
+  }
+  // Before the fold, the null in the record outranks the project's own field too.
+  const unfolded = await envModeWorld({ ...settings, projectSettingsFolded: false });
+  unfolded.project.defaultThreadEnvMode = 'worktree';
+  try { assert.deepEqual(await envModeOf(unfolded), ['local', 'worktree']); } finally { unfolded.close(); }
+});
+
+// T3 reads t3.json as JSONC and decodes the whole file (parseT3ProjectFile), so one bad field
+// discards a good defaultThreadEnvMode.
+test('models --json reads t3.json as T3 does: JSONC, and nothing from a file its schema rejects', async () => {
+  const cases = [
+    ['{\n  // where threads start\n  "$schema": "https://t3.codes/schema/t3.json",\n  /* a, block */ "defaultThreadEnvMode": "worktree",\n}', 'worktree'],
+    ['{ "defaultThreadEnvMode": "worktree", "scripts": [{ "name": "Dev", "command": "a,]", }, ], }', 'worktree'],
+    [JSON.stringify({ defaultThreadEnvMode: 'worktree', somethingNewer: { x: 1 } }), 'worktree'],
+    [JSON.stringify({ defaultThreadEnvMode: 'worktree', scripts: 42 }), 'local'],
+    [JSON.stringify({ defaultThreadEnvMode: 'worktree', scripts: [{ name: '  ', command: 'vp dev' }] }), 'local'],
+    [JSON.stringify({ defaultThreadEnvMode: 'worktree', scripts: [{ name: 'Dev', command: 'vp dev', icon: 'rocket' }] }), 'local'],
+    [JSON.stringify({ defaultThreadEnvMode: 'worktree', iconPath: null }), 'local'],
+    [JSON.stringify({ defaultThreadEnvMode: 'worktree', worktreeSubmodules: 'all' }), 'local'],
+    ['[]', 'local'],
+  ];
+  for (const [t3json, mode] of cases) {
+    const w = await envModeWorld(DEFAULT_SETTINGS, { t3json });
+    try { assert.deepEqual(await envModeOf(w), [mode, 'local'], t3json); } finally { w.close(); }
+  }
+});
+
+test('models --json: a project made from just a name starts local until it has a thread', async () => {
+  const settings = { ...DEFAULT_SETTINGS, defaultThreadEnvMode: 'worktree' };
+  // The fake project lives at /tmp: directly in a newProjectsRoot of /.
+  const fresh = await envModeWorld(settings, { newProjectsRoot: '/', threads: [] });
+  try { assert.deepEqual(await envModeOf(fresh), ['local', 'worktree']); } finally { fresh.close(); }
+  const used = await envModeWorld(settings, { newProjectsRoot: '/' });
+  try { assert.deepEqual(await envModeOf(used), ['worktree', 'worktree']); } finally { used.close(); }
+  const elsewhere = await envModeWorld(settings, { newProjectsRoot: '/home', threads: [] });
+  try { assert.deepEqual(await envModeOf(elsewhere), ['worktree', 'worktree']); } finally { elsewhere.close(); }
 });
 
 test('models without --json prints each host\'s providers, models and project defaults', async () => {
@@ -1182,7 +1349,7 @@ test('models without --json prints each host\'s providers, models and project de
     const { code, stdout, stderr } = await cliIn(w.home, 'models');
     assert.equal(code, 0, stderr);
     assert.match(stdout, /claudeAgent\/claude-opus-5-5\s+Claude Opus 5\.5\s+effort=low\|medium\|high/);
-    assert.match(stdout, /alpha\s+claudeAgent\/claude-opus-5-5\s+full-access/);
+    assert.match(stdout, /alpha\s+claudeAgent\/claude-opus-5-5\s+full-access\s+local/);
     assert.doesNotMatch(stdout, /grok/);
   } finally { w.close(); }
 });

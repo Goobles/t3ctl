@@ -216,8 +216,8 @@ Unreachable hosts are dimmed and show the values last recorded, not live ones.
 What a new thread can run on, per host: every model of the providers T3 Code's
 own picker offers (installed, checked and ready), as the picker lists them (hidden
 models left out, custom ones from settings, in your order), with the options each takes
-(`effort=low|medium|high`), then each project's default model and runtime mode,
-picked as T3 Code picks them for a new thread. Hosts that don't answer are
+(`effort=low|medium|high`), then each project's default model, runtime mode and
+workspace (`local` or `worktree`), picked as T3 Code picks them for a new thread. Hosts that don't answer are
 reported, like `ls`; as a read, it only warns about a newer server beside a host.
 
 ```sh
@@ -227,10 +227,16 @@ t3ctl models --json --host laptop
 
 With `--json`, `hosts[].providers[].models[].options` are T3's option
 descriptors as the server sends them, and `hosts[].projects[]` gives each
-project's `model` (a model selection), `runtimeMode` and `providers`: the
-instance ids it may use, which a project can narrow or widen in its settings.
+project's `model` (a model selection), `runtimeMode`, `threadEnvMode` and
+`providers`: the instance ids it may use, which a project can narrow or widen in
+its settings. `threadEnvMode` is `worktree` when T3 would start the thread in a
+new worktree and `local` when in the project's checkout: the project's setting,
+else the host's, else the repository's `t3.json`, else `local` (a project made
+from just a name stays `local` until it has a thread). Reading `t3.json` costs
+one more call per project, made only when no setting decides.
 `hosts[].environment` is the same for a project without settings of its own.
-Pass the picks on with `thread create --model --option --runtime-mode`.
+Pass the picks on with `thread create --model --option --runtime-mode`, and
+`--new-worktree` for `worktree`.
 
 ### `t3ctl project create <title> <workspace-root>`
 
@@ -249,6 +255,41 @@ this machine's home. t3ctl sends it as given and the host's server checks it.
 ```sh
 t3ctl project create t3ctl /Users/me/Code/t3ctl --host mac
 ```
+
+### `t3ctl project branches <project> [--json]`
+
+The project's git branches on its host, as T3 Code's branch pickers list them:
+local branches, then remote-tracking ones, leaving out each `origin/<x>` that
+has a local `<x>`. Within each, the checked-out and default branch come first,
+then the most recently committed. `*` marks the checked-out branch.
+
+```sh
+t3ctl project branches t3ctl
+```
+```
+* fix/flaky-test  /Users/you/.t3/worktrees/t3ctl/fix-flaky-test
+  main            default
+  old-idea
+  origin/release  remote
+```
+
+With `--json`:
+
+```json
+{
+  "project": { "id": "…", "title": "t3ctl" },
+  "current": "fix/flaky-test",
+  "default": "main",
+  "branches": [
+    { "name": "fix/flaky-test", "current": true, "default": false, "remote": false, "worktreePath": "/Users/you/.t3/worktrees/t3ctl/fix-flaky-test" },
+    { "name": "main", "current": false, "default": true, "remote": false, "worktreePath": null }
+  ]
+}
+```
+
+`current` and `default` are `null` when there is none (`default` comes from
+`origin/HEAD`, and can be a remote one such as `origin/main`). Any `name` works
+as `thread create --new-worktree --base <name>`, as it does in the app.
 
 ### `t3ctl thread create <project> <title>`
 
@@ -702,7 +743,7 @@ no way to present either. The transports above are the options.
 
 ## Scripting t3ctl
 
-`ls`, `export prompts`, `thread create` and `thread send` take `--json`. With
+`ls`, `models`, `project branches`, `export prompts`, `thread create` and `thread send` take `--json`. With
 it, stdout carries only the JSON, and an error is one line on stderr, with the
 exit code still non-zero:
 
