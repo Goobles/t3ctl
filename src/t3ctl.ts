@@ -1592,6 +1592,8 @@ type ServerSettings = {
   defaultThreadEnvMode?: string | null;
   providerInstances?: Record<string, { driver: string; enabled?: boolean; config?: unknown }>;
   providerModelPreferences?: Record<string, { hiddenModels?: string[]; modelOrder?: string[] }>;
+  /** Null until a client migrates its own saved list; t3ctl can't see that, so null reads as none. */
+  favorites?: { provider: string; model: string }[] | null;
   projectSettingsOverrides?: Record<string, {
     defaultModelSelection?: ModelSelection | null;
     defaultRuntimeMode?: string | null;
@@ -1787,7 +1789,8 @@ const MAX_CUSTOM_MODEL_LENGTH = 256;
 // The models T3's picker lists for a provider instance (getAppModelOptionsForInstance): built-in
 // ones from the probe, custom ones from the instance's settings (config.customModels), since the
 // probe's custom rows lag behind an edit; then the instance's preferences hide built-in models and
-// put the ones in modelOrder first. A model's options come from the probe's row for it, as the
+// put the ones in modelOrder first, the rest in their own order (sortModelsForProviderInstance in
+// apps/web/src/modelOrdering.ts, without grouping favourites). A model's options come from the probe's row for it, as the
 // picker's (getProviderModelCapabilities), so a custom model added since the last probe has none.
 const pickerModels = (settings: ServerSettings, p: ServerProvider) => {
   const builtIn = p.models.filter((m) => !m.isCustom);
@@ -1816,6 +1819,15 @@ const pickerModels = (settings: ServerSettings, p: ServerProvider) => {
     }));
 };
 
+// The order of T3's provider rail and of its Favourites tab (sortProviderInstanceEntries in
+// apps/web/src/providerInstances.ts): grouped by driver in the order drivers first appear, each
+// driver's default instance (whose id is the driver) before the others.
+const pickerInstanceOrder = <P extends { instanceId: string; driver: string }>(providers: P[]): P[] => {
+  const byDriver = new Map<string, P[]>();
+  for (const p of providers) byDriver.set(p.driver, [...byDriver.get(p.driver) ?? [], p]);
+  return [...byDriver.values()].flatMap((ps) => [...ps.filter((p) => p.instanceId === p.driver), ...ps.filter((p) => p.instanceId !== p.driver)]);
+};
+
 // Display names for providers that don't send one (T3's PROVIDER_DISPLAY_NAMES).
 const DRIVER_NAMES: Record<string, string> = {
   claudeAgent: 'Claude', codex: 'Codex', cursor: 'Cursor', opencode: 'OpenCode', grok: 'Grok', pi: 'Pi', antigravity: 'Antigravity',
@@ -1837,13 +1849,20 @@ const hostModels = async (host: Host) => {
       model: resolveDefaultModel(settings, p), runtimeMode: resolveDefaultRuntimeMode(settings, p.id),
     });
     const live = snap.value.threads.filter((t) => !t.deletedAt && !t.archivedAt);
+    const providers = ready.map((p) => ({
+      instanceId: p.instanceId, driver: p.driver, name: p.displayName ?? DRIVER_NAMES[p.driver] ?? p.instanceId,
+      ...(p.supportedRuntimeModes?.length ? { runtimeModes: p.supportedRuntimeModes } : {}),
+      models: pickerModels(settings, p),
+    }));
+    // Favourites as T3's Favourites tab lists them (ModelPickerContent.tsx sorts that tab with
+    // sortProviderModelItems): those still offered, by provider in the rail's order, then in each
+    // provider's model order.
+    const starred = new Set((settings.favorites ?? []).map((f) => `${f.provider}:${f.model}`));
     return {
       host: host.name,
-      providers: ready.map((p) => ({
-        instanceId: p.instanceId, driver: p.driver, name: p.displayName ?? DRIVER_NAMES[p.driver] ?? p.instanceId,
-        ...(p.supportedRuntimeModes?.length ? { runtimeModes: p.supportedRuntimeModes } : {}),
-        models: pickerModels(settings, p),
-      })),
+      providers,
+      favorites: pickerInstanceOrder(providers).flatMap((p) => p.models
+        .filter((m) => starred.has(`${p.instanceId}:${m.slug}`)).map((m) => ({ instanceId: p.instanceId, model: m.slug }))),
       // What a project with no settings of its own gets: the Scratch project before
       // `thread scratch` first makes it, for one. It has no repository, so no t3.json.
       environment: { ...defaultsFor({ id: '' }), threadEnvMode: isThreadEnvMode(settings.defaultThreadEnvMode) ? settings.defaultThreadEnvMode : 'local' },
@@ -1874,11 +1893,12 @@ const cmdModels = async (flags: Flags): Promise<void> => {
   } else {
     for (const h of reached) {
       console.log(`\n${bold(h.host)}`);
+      const starred = new Set(h.favorites.map((f) => `${f.instanceId}:${f.model}`));
       for (const p of h.providers) {
         for (const m of p.models) {
           const options = m.options.map((o) => (Array.isArray(o.options)
             ? `${o.id}=${(o.options as { id: string }[]).map((c) => c.id).join('|')}` : o.id));
-          console.log(`  ${`${p.instanceId}/${m.slug}`.padEnd(36)}  ${m.name.padEnd(24)}  ${dim(options.join(' '))}${m.legacy ? dim(' (legacy)') : ''}`);
+          console.log(`${starred.has(`${p.instanceId}:${m.slug}`) ? '★ ' : '  '}${`${p.instanceId}/${m.slug}`.padEnd(36)}  ${m.name.padEnd(24)}  ${dim(options.join(' '))}${m.legacy ? dim(' (legacy)') : ''}`);
         }
       }
       console.log(dim('  project defaults'));
