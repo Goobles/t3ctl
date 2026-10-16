@@ -2306,6 +2306,7 @@ const FLAG_NAMES = {
   name: 'name', timeout: 'timeout',
   runtimeMode: 'runtime-mode', interactionMode: 'interaction-mode',
   option: 'option', newWorktree: 'new-worktree', base: 'base', message: 'message', json: 'json',
+  ttl: 'ttl', t3Version: 't3-version',
 };
 // Only carry options that were actually supplied. Emitting every key
 // unconditionally made `'name' in flags` always true, which made host add bail

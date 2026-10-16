@@ -1918,6 +1918,10 @@ if (args.includes('-fN')) {
 `);
   chmodSync(join(fakeBin, 'ssh'), 0o755);
 
+  // npm: records that it ran; with --t3-version given, host add must not ask it.
+  writeFileSync(join(fakeBin, 'npm'), `#!/bin/sh\ntouch ${JSON.stringify(join(root, 'npm-called'))}\nexit 1\n`);
+  chmodSync(join(fakeBin, 'npm'), 0o755);
+
   const server = spawn(exe, [bin, 'serve'], { env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' }, stdio: 'ignore' });
   const runtime = join(home, '.t3', 'userdata', 'server-runtime.json');
   for (let i = 0; i < 100 && !existsSync(runtime); i++) await new Promise((r) => setTimeout(r, 50));
@@ -1936,13 +1940,14 @@ if (args.includes('-fN')) {
 test('host add over ssh mints the token with a desktop app\'s own server bundle', async () => {
   const host = await fakeDesktopHost();
   try {
-    const { code, stdout, stderr } = await run(process.execPath, [CLI, 'host', 'add', 'g@mac', '--name', 'mac', '--t3-version', '0.0.0'], {
+    const { code, stdout, stderr } = await run(process.execPath, [CLI, 'host', 'add', 'g@mac', '--name', 'mac', '--t3-version', '0.0.0', '--ttl', '7d'], {
       env: { ...process.env, HOME: host.home, PATH: `${host.fakeBin}:${process.env.PATH}` },
     }).then((r) => ({ code: 0, ...r }), (e) => ({ code: e.code ?? 1, stdout: e.stdout ?? '', stderr: e.stderr ?? '' }));
     assert.equal(code, 0, stderr);
 
     const call = JSON.parse(readFileSync(join(host.root, 'auth-call.json'), 'utf8'));
-    assert.deepEqual(call, { argv: ['auth', 'session', 'issue', '--json', '--label', 't3ctl:mac', '--ttl', '30d'], electron: '1' });
+    assert.deepEqual(call, { argv: ['auth', 'session', 'issue', '--json', '--label', 't3ctl:mac', '--ttl', '7d'], electron: '1' });
+    assert.ok(!existsSync(join(host.root, 'npm-called')), '--t3-version was given, so npm must not be asked');
     const { hosts } = JSON.parse(readFileSync(join(host.home, '.config', 't3ctl', 'hosts.json'), 'utf8'));
     assert.deepEqual(hosts.map((h) => [h.name, h.ssh, h.token]), [['mac', 'g@mac', 'desktop-token']]);
     assert.ok(stdout.includes(`ELECTRON_RUN_AS_NODE=1 '${host.exe}' '${host.bin}' auth session revoke s1`), stdout);
