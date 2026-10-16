@@ -230,9 +230,31 @@ thread, prepares the worktree and runs the setup script before the server
 answers; a failed fetch or checkout deletes the thread again, and the error says
 so (`bootstrapThreadDisposition`). In protocol 2 it is one
 `orchestration.launchThread` call (with `workspaceStrategy: {type: "worktree",
-baseRef, branch, startFromOrigin: true}`), which answers once the thread
+baseRef, branch, startFromOrigin}`), which answers once the thread
 exists; the worktree and setup script carry on in the background as the run's
 preparation, so a failure there shows in the thread, not in t3ctl's output.
+
+### New-thread defaults
+
+`thread create` and `thread scratch` fill in what the flags leave open the way
+the app's new-thread draft does (`useHandleNewThread` in
+`apps/web/src/hooks/useHandleNewThread.ts`, which calls `resolveProjectSettings`
+in `packages/shared/src/projectSettings.ts`), from `server.getSettings`:
+
+| Field | Project | Environment | T3's built-in |
+|---|---|---|---|
+| `modelSelection` (with its `options`) | `projectSettingsOverrides[id].defaultModelSelection`, or the project's own field before `projectSettingsFolded`, if its provider instance is enabled | `defaultModelSelection` | `claudeAgent/claude-opus-5-5` |
+| `runtimeMode` | `projectSettingsOverrides[id].defaultRuntimeMode` | `defaultRuntimeMode` | `full-access` (`DEFAULT_RUNTIME_MODE`) |
+| `startFromOrigin` (`--new-worktree`) | `projectSettingsOverrides[id].newWorktreesStartFromOrigin` | `newWorktreesStartFromOrigin` | `true` (`resolveNewDraftStartFromOrigin` in `apps/web/src/lib/chatThreadActions.ts`) |
+| `interactionMode` | — | — | `default` (`DEFAULT_PROVIDER_INTERACTION_MODE`) |
+
+There is no user-level tier: T3's client settings hold none of these. The app
+does carry the interaction mode over from the thread you were in, and, when
+neither the project nor the environment sets a model, the last model picked
+(that thread's, else `stickyModelSelectionByProvider`), but those live in the
+browser, so t3ctl has nothing to read. The server's own bootstrap
+thread (`apps/server/src/serverRuntimeStartup.ts`) resolves the model and mode
+the same way.
 
 ### Simple thread commands
 

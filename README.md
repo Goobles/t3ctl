@@ -317,12 +317,20 @@ Flags:
 | `--branch <name>` | none | Git branch for the thread. With `--new-worktree`, the branch to create (default: a temporary `t3code/<8 hex>`) |
 | `--worktree <path>` | none | Existing worktree path |
 | `--new-worktree` | off | Have the server create a worktree and start the thread in it — see [below](#starting-a-thread-in-a-new-worktree). Needs `--message` |
-| `--base <branch>` | the repo's default branch | With `--new-worktree`: the branch to start from |
+| `--base <branch>` | the repo's default branch | With `--new-worktree`: the branch to start from, on `origin` unless T3 Code's "new worktrees start from origin" setting is off for the project, else the environment |
 | `--message <text>` | none | With `--new-worktree`: the first message, which starts the agent. Quote it — see below |
-| `--runtime-mode <mode>` | `full-access` | `approval-required`, `auto-accept-edits`, `auto`, `full-access` — see [Runtime modes](#runtime-modes) for the app's names |
-| `--interaction-mode <mode>` | `default` | `default` or `plan` |
+| `--runtime-mode <mode>` | the project's default access | `approval-required`, `auto-accept-edits`, `auto`, `full-access` — see [Runtime modes](#runtime-modes) for the app's names. Without it, the access T3 Code would give the thread: the project's, else the environment's, else `full-access` |
+| `--interaction-mode <mode>` | `default` | `default` or `plan`. T3 Code has no setting for this; its new threads start in `default` too |
 | `--json` | off | Print the new thread as JSON — see [Scripting t3ctl](#scripting-t3ctl) |
 | `--host <name>` | the only host | Which host to act on |
+
+Every default comes from where T3 Code takes it when you start a thread in the
+app: the project's settings, else the environment's (the host's settings), else
+T3's built-in default. t3ctl reads them from the server (`server.getSettings`)
+only when a flag leaves something to fill in. If it can't read them, it warns
+and uses T3's built-in defaults. When no default model is set, the app falls
+back to the model you last picked, but it keeps that in the browser, so t3ctl
+can't see it.
 
 `--model` splits on the **first** slash, so slashed model names work as-is:
 `--model opencode/github-copilot/gpt-5.4`.
@@ -376,7 +384,8 @@ started fix the flaky test in t3ctl on laptop
   seq      4471
 ```
 
-The server fetches `origin/<base>`, adds the worktree under
+The server fetches `origin/<base>` (or uses the local `<base>` when T3 Code's
+settings say new worktrees start locally), adds the worktree under
 `~/.t3/worktrees/<repo>/` on the host, checks out submodules, runs the
 project's setup script, and then starts the agent on `--message`. A temporary
 `t3code/<8 hex>` branch is renamed after the conversation's first turn, just
@@ -423,8 +432,8 @@ created look into the dns change without a project on laptop
 
 It takes `--model`, `--option`, `--message`, `--runtime-mode`,
 `--interaction-mode`, `--json` and `--host` as `thread create` does. Without
-`--model`, the thread gets the Scratch project's default model, picked as for
-any project. With
+`--model` and `--runtime-mode`, the thread gets the Scratch project's default
+model and access, picked as for any project. With
 `--json`, `project` is `No project` and `sequence` is `null`. A host whose T3
 Code data directory sits inside a git repository offers no Scratch project, and
 servers speaking orchestration protocol 1 have none.
@@ -566,7 +575,8 @@ everywhere a mode is** — here, and in `--runtime-mode` on `thread create` and
 | `auto` | Auto | — | Supported providers approve routine actions; others still ask. |
 | `full-access` | Full access | `full` | Commands and edits without prompts. |
 
-`full-access` is the default, for threads and for t3ctl.
+A new thread gets the project's default access from T3 Code's settings, else the
+environment's, else `full-access` — in the app and in t3ctl alike.
 
 ### `t3ctl thread settle|archive|unarchive|unpin|delete <thread>`
 
