@@ -1128,6 +1128,9 @@ const RUNTIME_MODE_ALIASES: Record<string, string> = {
 };
 /** One spelling of the accepted values, shared by the help text and the error. */
 const RUNTIME_MODE_HELP = 'approval-required (supervised) | auto-accept-edits | auto | full-access (full)';
+// Where `thread create` and `thread scratch` take a mode from when none is given.
+const RUNTIME_MODE_DEFAULT_HELP = (whose: string) => `the ${whose}'s default access in T3 Code's settings, else the environment's, else full-access`;
+const INTERACTION_MODE_DEFAULT_HELP = 'default, as in T3 Code, which has no setting for it';
 
 const parseRuntimeMode = (raw: string): string => {
   const given = raw.trim().toLowerCase();
@@ -1501,9 +1504,8 @@ const worktreeFlagProblem = (flags: Flags): string | null => {
 // checkout deletes the thread again; a failed setup script does not.
 const BOOTSTRAP_WAIT_MS = 15 * 60_000;
 
-const cmdThreadCreateInWorktreeV1 = async (host: Host, project: Project, title: string, modelSelection: ModelSelection, flags: Flags): Promise<void> => {
-  const runtimeMode = parseRuntimeMode(flags['runtime-mode'] ?? 'full-access');
-  const interactionMode = flags['interaction-mode'] ?? 'default';
+const cmdThreadCreateInWorktreeV1 = async (host: Host, project: Project, title: string, made: NewThread, flags: Flags): Promise<void> => {
+  const { modelSelection, runtimeMode, interactionMode, startFromOrigin } = made;
   const rpc = await openRpc(host);
   try {
     const baseBranch = flags.base ?? await defaultBranch(rpc, project);
@@ -1522,7 +1524,7 @@ const cmdThreadCreateInWorktreeV1 = async (host: Host, project: Project, title: 
         },
         // requireWorktree: fail rather than quietly run in the project checkout
         // when the project is not a repo or the base has no commit.
-        prepareWorktree: { projectCwd: project.workspaceRoot, baseBranch, branch, startFromOrigin: true, requireWorktree: true },
+        prepareWorktree: { projectCwd: project.workspaceRoot, baseBranch, branch, startFromOrigin, requireWorktree: true },
         runSetupScript: true,
       },
       createdAt,
@@ -1555,9 +1557,8 @@ const LAUNCH_WAIT_MS = 2 * 60_000;
 
 type LaunchResult = { threadId: string; projection: { thread: Thread } };
 
-const cmdThreadCreateInWorktree = async (host: Host, project: Project, title: string, modelSelection: ModelSelection, flags: Flags): Promise<void> => {
-  const runtimeMode = parseRuntimeMode(flags['runtime-mode'] ?? 'full-access');
-  const interactionMode = flags['interaction-mode'] ?? 'default';
+const cmdThreadCreateInWorktree = async (host: Host, project: Project, title: string, made: NewThread, flags: Flags): Promise<void> => {
+  const { modelSelection, runtimeMode, interactionMode, startFromOrigin } = made;
   const rpc = await openRpc(host);
   try {
     const baseBranch = flags.base ?? await defaultBranch(rpc, project);
@@ -1566,7 +1567,7 @@ const cmdThreadCreateInWorktree = async (host: Host, project: Project, title: st
     const { projection } = (await rpc.call('orchestration.launchThread', {
       commandId: crypto.randomUUID(), creationSource: FROM_USER.creationSource, threadId,
       projectId: project.id, title, modelSelection, runtimeMode, interactionMode,
-      workspaceStrategy: { type: 'worktree', baseRef: baseBranch, branch, startFromOrigin: true },
+      workspaceStrategy: { type: 'worktree', baseRef: baseBranch, branch, startFromOrigin },
       initialMessage: { messageId: crypto.randomUUID(), text: flags.message, attachments: [] },
     }, LAUNCH_WAIT_MS).catch((error: unknown) => {
       if (error instanceof RpcError) throw error;
@@ -1590,6 +1591,7 @@ type ServerSettings = {
   defaultRuntimeMode?: string;
   /** Null or absent: the repository's t3.json decides, then `local`. */
   defaultThreadEnvMode?: string | null;
+  newWorktreesStartFromOrigin?: boolean;
   providerInstances?: Record<string, { driver: string; enabled?: boolean; config?: unknown }>;
   providerModelPreferences?: Record<string, { hiddenModels?: string[]; modelOrder?: string[] }>;
   /** Null until a client migrates its own saved list; t3ctl can't see that, so null reads as none. */
@@ -1598,6 +1600,7 @@ type ServerSettings = {
     defaultModelSelection?: ModelSelection | null;
     defaultRuntimeMode?: string | null;
     defaultThreadEnvMode?: string | null;
+    newWorktreesStartFromOrigin?: boolean;
     providerInstances?: Record<string, { enabled?: boolean }>;
   }>;
   projectSettingsFolded?: boolean;
@@ -1644,22 +1647,6 @@ const resolveDefaultModel = (settings: ServerSettings, project: Pick<Project, 'i
   return settings.defaultModelSelection ?? FALLBACK_MODEL;
 };
 
-const defaultModel = async (host: Host, project: Pick<Project, 'id' | 'defaultModelSelection'>, flags: Flags): Promise<ModelSelection> => {
-  let settings: ServerSettings;
-  try {
-    const rpc = await openRpc(host);
-    try {
-      settings = (await rpc.call('server.getSettings', {}, host.timeoutMs ?? 15000)) as ServerSettings;
-    } finally {
-      rpc.close();
-    }
-  } catch (error) {
-    if (!flags.json) warn(`could not read the default model from ${host.name} (${errorMessage(error)}) — using ${modelRef(FALLBACK_MODEL)}`);
-    return FALLBACK_MODEL;
-  }
-  return resolveDefaultModel(settings, project);
-};
-
 // The runtime mode T3 starts a project's new thread in (resolveProjectSettings):
 // the project's, else the environment's, else full access. A null or unknown
 // project value defers.
@@ -1667,6 +1654,48 @@ const resolveDefaultRuntimeMode = (settings: ServerSettings, projectId: string):
   const stored = settings.projectSettingsOverrides?.[projectId]?.defaultRuntimeMode;
   const mode = stored ?? settings.defaultRuntimeMode;
   return mode && mode in RUNTIME_MODES ? mode : 'full-access';
+};
+
+// Whether a new worktree starts from origin/<base> or the local branch, as T3's
+// resolveNewDraftStartFromOrigin reads newWorktreesStartFromOrigin: the
+// project's, else the environment's, else from origin.
+const resolveStartFromOrigin = (settings: ServerSettings, projectId: string): boolean => {
+  const value = settings.projectSettingsOverrides?.[projectId]?.newWorktreesStartFromOrigin ?? settings.newWorktreesStartFromOrigin;
+  return typeof value === 'boolean' ? value : true;
+};
+
+/** What a new thread starts with. */
+type NewThread = { modelSelection: ModelSelection; runtimeMode: string; interactionMode: string; startFromOrigin: boolean };
+
+// The flags given, and the rest as T3's new-thread draft fills it in
+// (useHandleNewThread in apps/web): model, runtime mode and start-from-origin
+// from the project's settings, else the environment's, else T3's built-ins.
+// T3 has no setting for the interaction mode: a new thread starts in `default`.
+// The settings are read only when a flag leaves something to fill in.
+const newThreadDefaults = async (
+  host: Host, project: Pick<Project, 'id' | 'defaultModelSelection'>, flags: Flags, { worktree = false } = {},
+): Promise<NewThread> => {
+  const runtimeMode = flags['runtime-mode'] ? parseRuntimeMode(flags['runtime-mode']) : null;
+  let settings: ServerSettings | null = null;
+  if (!flags.model || !runtimeMode || worktree) {
+    try {
+      const rpc = await openRpc(host);
+      try {
+        settings = (await rpc.call('server.getSettings', {}, host.timeoutMs ?? 15000)) as ServerSettings;
+      } finally {
+        rpc.close();
+      }
+    } catch (error) {
+      const builtIns = [!flags.model && modelRef(FALLBACK_MODEL), !runtimeMode && 'full-access', worktree && 'new worktrees from origin'].filter(Boolean);
+      if (!flags.json) warn(`could not read the new-thread defaults from ${host.name} (${errorMessage(error)}) — using T3's built-in ${builtIns.join(', ')}`);
+    }
+  }
+  return {
+    modelSelection: withOptions(flags.model ? parseModel(flags.model) : settings ? resolveDefaultModel(settings, project) : FALLBACK_MODEL, flags.option),
+    runtimeMode: runtimeMode ?? (settings ? resolveDefaultRuntimeMode(settings, project.id) : 'full-access'),
+    interactionMode: flags['interaction-mode'] ?? 'default',
+    startFromOrigin: settings ? resolveStartFromOrigin(settings, project.id) : true,
+  };
 };
 
 const isThreadEnvMode = (mode: unknown): mode is 'local' | 'worktree' => mode === 'local' || mode === 'worktree';
@@ -1919,15 +1948,15 @@ const cmdModels = async (flags: Flags): Promise<void> => {
 const cmdThreadScratch = async (title: string, flags: Flags): Promise<void> => {
   const host = pickHost(flags);
   if (await protocolOf(host) === 1) throw new Error(`${host.name} runs a T3 Code too old for threads without a project`);
-  const runtimeMode = parseRuntimeMode(flags['runtime-mode'] ?? 'full-access');
-  const interactionMode = flags['interaction-mode'] ?? 'default';
+  // A bad mode fails before the server makes the Scratch project.
+  if (flags['runtime-mode']) parseRuntimeMode(flags['runtime-mode']);
   const rpc = await openRpc(host);
   try {
     const { projectId } = (await rpc.call('projects.ensureScratch', {}, host.timeoutMs ?? 15000)) as { projectId: string };
-    // Without --model, the Scratch project's default as for any project: its override in the
-    // server's settings, else the environment's. (Its own field, which only servers that haven't
-    // folded project settings read, isn't fetched: ensureScratch answers with the id alone.)
-    const modelSelection = withOptions(flags.model ? parseModel(flags.model) : await defaultModel(host, { id: projectId }, flags), flags.option);
+    // Without --model or --runtime-mode, the Scratch project's defaults as for any project: its
+    // override in the server's settings, else the environment's. (Its own field, which only servers
+    // that haven't folded project settings read, isn't fetched: ensureScratch answers with the id alone.)
+    const { modelSelection, runtimeMode, interactionMode } = await newThreadDefaults(host, { id: projectId }, flags);
     const threadId = crypto.randomUUID();
     const { projection } = (await rpc.call('orchestration.launchThread', {
       commandId: crypto.randomUUID(), creationSource: FROM_USER.creationSource, threadId,
@@ -1950,26 +1979,25 @@ const cmdThreadCreate = async (projectRef: string, title: string, flags: Flags):
   const host = pickHost(flags);
   const project = resolveProject(await snapshot(host), projectRef);
   if (!project) throw new Error(`no project matching "${projectRef}" on ${host.name}`);
-  const modelSelection = withOptions(flags.model ? parseModel(flags.model) : await defaultModel(host, project, flags), flags.option);
+  const made = await newThreadDefaults(host, project, flags, { worktree: flags['new-worktree'] });
+  const { modelSelection, runtimeMode, interactionMode } = made;
   const protocol = await protocolOf(host);
   if (flags['new-worktree']) {
     return protocol === 1
-      ? cmdThreadCreateInWorktreeV1(host, project, title, modelSelection, flags)
-      : cmdThreadCreateInWorktree(host, project, title, modelSelection, flags);
+      ? cmdThreadCreateInWorktreeV1(host, project, title, made, flags)
+      : cmdThreadCreateInWorktree(host, project, title, made, flags);
   }
   const threadId = crypto.randomUUID();
   const { sequence } = await dispatch(host, {
     type: 'thread.create', commandId: crypto.randomUUID(),
     // Protocol 2 records who created the thread; protocol 1 when.
     ...(protocol === 1 ? { createdAt: new Date().toISOString() } : FROM_USER),
-    threadId, projectId: project.id, title, modelSelection,
-    runtimeMode: parseRuntimeMode(flags['runtime-mode'] ?? 'full-access'),
-    interactionMode: flags['interaction-mode'] ?? 'default',
+    threadId, projectId: project.id, title, modelSelection, runtimeMode, interactionMode,
     branch: flags.branch ?? null,
     worktreePath: flags.worktree ?? null,
   });
   if (flags.json) return printJson(createdJson(host, project, threadId, title, modelSelection, sequence));
-  console.log(`created thread ${bold(title)} in ${project.title} on ${host.name}\n  id    ${threadId}\n  model ${describeModel(modelSelection)}\n  seq   ${sequence}`);
+  console.log(`created thread ${bold(title)} in ${project.title} on ${host.name}\n  id    ${threadId}\n  model ${describeModel(modelSelection)}\n  mode  ${runtimeMode} / ${interactionMode}\n  seq   ${sequence}`);
 };
 
 const cmdThreadSimple = async (verb: string, ref: string, flags: Flags): Promise<void> => {
@@ -2452,26 +2480,26 @@ hostOption(thread.command('create')
   .argument('<project>', 'project id, title, or workspace root')
   .argument('<title...>', 'thread title; everything after the project is used')
   .description('create a thread (idle — use `thread send` to run it, or --new-worktree to start it in a fresh worktree)')
-  .option('--model <instance/model>', `e.g. claudeAgent/claude-opus-5-5 (default: the project's default model, as T3 Code picks it)`)
+  .option('--model <instance/model>', `e.g. claudeAgent/claude-opus-5-5 (default: the project's default model in T3 Code's settings, else the environment's, else T3's)`)
   .option('--option <id=value>', 'model option, e.g. effort=high; repeatable', addOption)
   .option('--branch <branch>', 'git branch to associate with the thread; with --new-worktree, the branch to create')
   .option('--worktree <path>', 'existing git worktree the thread should run in')
   .option('--new-worktree', 'have the server create a worktree and start the thread in it; needs --message')
-  .option('--base <branch>', "with --new-worktree: branch to start from (default: the repo's default branch)")
+  .option('--base <branch>', "with --new-worktree: branch to start from (default: the repo's default branch); from origin unless T3 Code's settings say to start new worktrees locally")
   .option('--message <text>', 'with --new-worktree: the first message, which starts the agent (quote it)')
-  .option('--runtime-mode <mode>', RUNTIME_MODE_HELP, 'full-access')
-  .option('--interaction-mode <mode>', 'default | plan', 'default')
+  .option('--runtime-mode <mode>', `${RUNTIME_MODE_HELP} (default: ${RUNTIME_MODE_DEFAULT_HELP('project')})`)
+  .option('--interaction-mode <mode>', `default | plan (default: ${INTERACTION_MODE_DEFAULT_HELP})`)
   .option('--json', 'print the new thread as JSON, and errors as {"error": ...} on stderr'))
   .action((ref: string, title: string[], o: OptionValues) => cmdThreadCreate(ref, title.join(' '), toFlags(o)));
 
 hostOption(thread.command('scratch')
   .argument('<title...>', 'thread title')
   .description('create a thread without a project, in a fresh folder of its own (idle unless --message)')
-  .option('--model <instance/model>', `e.g. claudeAgent/claude-opus-5-5 (default: the Scratch project's default model, as T3 Code picks it)`)
+  .option('--model <instance/model>', `e.g. claudeAgent/claude-opus-5-5 (default: the Scratch project's default model in T3 Code's settings, else the environment's, else T3's)`)
   .option('--option <id=value>', 'model option, e.g. effort=high; repeatable', addOption)
   .option('--message <text>', 'the first message, which starts the agent (quote it)')
-  .option('--runtime-mode <mode>', RUNTIME_MODE_HELP, 'full-access')
-  .option('--interaction-mode <mode>', 'default | plan', 'default')
+  .option('--runtime-mode <mode>', `${RUNTIME_MODE_HELP} (default: ${RUNTIME_MODE_DEFAULT_HELP('Scratch project')})`)
+  .option('--interaction-mode <mode>', `default | plan (default: ${INTERACTION_MODE_DEFAULT_HELP})`)
   .option('--json', 'print the new thread as JSON, and errors as {"error": ...} on stderr'))
   .action((title: string[], o: OptionValues) => cmdThreadScratch(title.join(' '), toFlags(o)));
 

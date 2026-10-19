@@ -84,6 +84,8 @@ test('thread create --help names no fixed default model', async () => {
   const { stdout } = await cli('thread', 'create', '--help');
   assert.doesNotMatch(stdout, /default: "claudeAgent/);
   assert.match(stdout, /project's default model/);
+  assert.doesNotMatch(stdout, /default: "full-access"|default: "default"/);
+  assert.match(stdout.replace(/\s+/g, ' '), /project's default access in T3 Code's settings, else the environment's, else full-access/);
 });
 
 test('bad input exits non-zero', async () => {
@@ -798,9 +800,9 @@ test('thread create without --model uses the project\'s default model', async ()
     assert.deepEqual(await createdModel(w), project);
     // --option adds to the default rather than replacing it.
     assert.deepEqual(await createdModel(w, '--option', 'fastMode=true'), { ...project, options: [...project.options, { id: 'fastMode', value: true }] });
-    // --model still wins, and then the settings are not read at all.
+    // --model still wins, and with --runtime-mode too the settings are not read at all.
     const reads = w.rpc.filter((r) => r.tag === 'server.getSettings').length;
-    assert.deepEqual(await createdModel(w, '--model', 'claudeAgent/claude-opus-5-5'), { instanceId: 'claudeAgent', model: 'claude-opus-5-5' });
+    assert.deepEqual(await createdModel(w, '--model', 'claudeAgent/claude-opus-5-5', '--runtime-mode', 'auto'), { instanceId: 'claudeAgent', model: 'claude-opus-5-5' });
     assert.equal(w.rpc.filter((r) => r.tag === 'server.getSettings').length, reads);
   } finally { w.close(); }
 });
@@ -901,7 +903,62 @@ test('settings that cannot be read fall back to T3\'s default, and say so', asyn
     const { code, stderr } = await cliIn(w.home, 'thread', 'create', 'alpha', 'hello');
     assert.equal(code, 0, stderr);
     assert.deepEqual(w.dispatched[0].modelSelection, { instanceId: 'claudeAgent', model: 'claude-opus-5-5' });
-    assert.match(stderr, /could not read the default model .*settings\.json is unreadable.*claudeAgent\/claude-opus-5-5/s);
+    assert.equal(w.dispatched[0].runtimeMode, 'full-access');
+    assert.match(stderr, /could not read the new-thread defaults .*settings\.json is unreadable.*built-in claudeAgent\/claude-opus-5-5, full-access/s);
+  } finally { w.close(); }
+});
+
+// Without --runtime-mode a thread gets the access T3 itself would give it, by
+// the same chain: the project's setting, else the environment's, else full access.
+const createdRuntimeMode = async (w, ...flags) => {
+  const { code, stderr } = await cliIn(w.home, 'thread', 'create', 'alpha', 'hello', ...flags);
+  assert.equal(code, 0, stderr);
+  return w.dispatched.at(-1).runtimeMode;
+};
+
+test('thread create without --runtime-mode takes the project\'s default access, then the environment\'s, then T3\'s', async () => {
+  const cases = [
+    [{ defaultRuntimeMode: 'auto-accept-edits', projectSettingsOverrides: { p1: { defaultRuntimeMode: 'approval-required' }, p2: { defaultRuntimeMode: 'auto' } } }, 'approval-required'],
+    [{ defaultRuntimeMode: 'auto-accept-edits', projectSettingsOverrides: { p2: { defaultRuntimeMode: 'approval-required' } } }, 'auto-accept-edits'],
+    [{ defaultRuntimeMode: 'auto' }, 'auto'],
+    [{}, 'full-access'], // a server whose settings predate the field
+  ];
+  for (const [settings, expected] of cases) {
+    const w = await settingsWorld({ ...DEFAULT_SETTINGS, ...settings });
+    try {
+      assert.equal(await createdRuntimeMode(w), expected, JSON.stringify(settings));
+    } finally { w.close(); }
+  }
+});
+
+test('--runtime-mode still wins, and with --model too the settings are not read', async () => {
+  const w = await settingsWorld({ ...DEFAULT_SETTINGS, defaultRuntimeMode: 'approval-required' });
+  try {
+    const { stdout } = await cliIn(w.home, 'thread', 'create', 'alpha', 'hello');
+    assert.match(stdout, /mode {2}approval-required \/ default/, 'the summary says which mode was picked');
+    assert.equal(await createdRuntimeMode(w, '--runtime-mode', 'full'), 'full-access');
+    const reads = w.rpc.filter((r) => r.tag === 'server.getSettings').length;
+    assert.equal(await createdRuntimeMode(w, '--runtime-mode', 'auto', '--model', 'claudeAgent/claude-opus-5-5'), 'auto');
+    assert.equal(w.rpc.filter((r) => r.tag === 'server.getSettings').length, reads);
+    // --model alone still reads them, for the mode.
+    assert.equal(await createdRuntimeMode(w, '--model', 'claudeAgent/claude-opus-5-5'), 'approval-required');
+  } finally { w.close(); }
+});
+
+test('the interaction mode has no setting in T3: default unless --interaction-mode says otherwise', async () => {
+  const w = await settingsWorld(DEFAULT_SETTINGS);
+  try {
+    assert.equal((await cliIn(w.home, 'thread', 'create', 'alpha', 'hello')).code, 0);
+    assert.equal(w.dispatched.at(-1).interactionMode, 'default');
+    assert.equal((await cliIn(w.home, 'thread', 'create', 'alpha', 'hello', '--interaction-mode', 'plan')).code, 0);
+    assert.equal(w.dispatched.at(-1).interactionMode, 'plan');
+  } finally { w.close(); }
+});
+
+test('protocol 1: thread create without --runtime-mode reads the settings too', async () => {
+  const w = await settingsWorld({ ...DEFAULT_SETTINGS, projectSettingsOverrides: { p1: { defaultRuntimeMode: 'auto' } } }, 1);
+  try {
+    assert.equal(await createdRuntimeMode(w), 'auto');
   } finally { w.close(); }
 });
 
@@ -1472,6 +1529,38 @@ test('--new-worktree launches the thread in one call, with the app\'s defaults',
   } finally { w.close(); }
 });
 
+test('--new-worktree starts from origin or the local branch as T3\'s settings say, with their default access', async () => {
+  const cases = [
+    [{ newWorktreesStartFromOrigin: true, projectSettingsOverrides: { p1: { newWorktreesStartFromOrigin: false } } }, false],
+    [{ newWorktreesStartFromOrigin: false, projectSettingsOverrides: { p1: { newWorktreesStartFromOrigin: true } } }, true],
+    [{ newWorktreesStartFromOrigin: false }, false],
+    [{}, true], // a server whose settings predate the field
+  ];
+  for (const [settings, startFromOrigin] of cases) {
+    const w = await worktreeWorld((request) => request.tag === 'server.getSettings'
+      ? ok({ ...DEFAULT_SETTINGS, defaultRuntimeMode: 'auto', ...settings }) : defaultRpc(request));
+    try {
+      const { code, stderr } = await cliIn(w.home, 'thread', 'create', 'alpha', 'x', '--new-worktree', '--message', 'go');
+      assert.equal(code, 0, stderr);
+      const { workspaceStrategy, runtimeMode } = w.rpc.find((r) => r.tag === 'orchestration.launchThread').payload;
+      assert.equal(workspaceStrategy.startFromOrigin, startFromOrigin, JSON.stringify(settings));
+      assert.equal(runtimeMode, 'auto');
+    } finally { w.close(); }
+  }
+});
+
+test('--new-worktree reads the settings even with --model and --runtime-mode, for where to start from', async () => {
+  const w = await worktreeWorld((request) => request.tag === 'server.getSettings'
+    ? ok({ ...DEFAULT_SETTINGS, newWorktreesStartFromOrigin: false }) : defaultRpc(request));
+  try {
+    const { code, stderr } = await cliIn(w.home, 'thread', 'create', 'alpha', 'x', '--new-worktree', '--message', 'go',
+      '--model', 'codex/gpt-6-astra', '--runtime-mode', 'auto');
+    assert.equal(code, 0, stderr);
+    assert.equal(w.rpc[0].tag, 'server.getSettings');
+    assert.equal(w.rpc.find((r) => r.tag === 'orchestration.launchThread').payload.workspaceStrategy.startFromOrigin, false);
+  } finally { w.close(); }
+});
+
 test('--base and --branch are sent as given, and skip the default-branch lookup', async () => {
   const w = await worktreeWorld();
   try {
@@ -1641,12 +1730,36 @@ test('without --model, thread scratch takes the Scratch project\'s default model
     let { code, stderr } = await cliIn(w.home, 'thread', 'scratch', 'x', '--option', 'fastMode=true');
     assert.equal(code, 0, stderr);
     assert.deepEqual(launched(), { ...project, options: [...project.options, { id: 'fastMode', value: true }] });
-    // --model wins, and the settings aren't read for it.
+    // --model wins, and with --runtime-mode too the settings aren't read.
     const reads = w.rpc.filter((r) => r.tag === 'server.getSettings').length;
-    ({ code, stderr } = await cliIn(w.home, 'thread', 'scratch', 'y', '--model', 'claudeAgent/claude-opus-5-5', '--option', 'effort=low'));
+    ({ code, stderr } = await cliIn(w.home, 'thread', 'scratch', 'y', '--model', 'claudeAgent/claude-opus-5-5', '--option', 'effort=low', '--runtime-mode', 'auto'));
     assert.equal(code, 0, stderr);
     assert.deepEqual(launched(), { instanceId: 'claudeAgent', model: 'claude-opus-5-5', options: [{ id: 'effort', value: 'low' }] });
     assert.equal(w.rpc.filter((r) => r.tag === 'server.getSettings').length, reads);
+  } finally { w.close(); }
+});
+
+test('without --runtime-mode, thread scratch takes the Scratch project\'s default access, else the environment\'s', async () => {
+  const cases = [
+    [{ defaultRuntimeMode: 'auto', projectSettingsOverrides: { 'scratch-1': { defaultRuntimeMode: 'approval-required' } } }, 'approval-required'],
+    [{ defaultRuntimeMode: 'auto', projectSettingsOverrides: { p1: { defaultRuntimeMode: 'approval-required' } } }, 'auto'],
+  ];
+  for (const [settings, expected] of cases) {
+    const w = world(await fakeT3('0.0.45', [], (request) => scratchRpc(request, { ...DEFAULT_SETTINGS, ...settings })));
+    try {
+      const { code, stderr } = await cliIn(w.home, 'thread', 'scratch', 'x');
+      assert.equal(code, 0, stderr);
+      assert.equal(w.rpc.find((r) => r.tag === 'orchestration.launchThread').payload.runtimeMode, expected);
+    } finally { w.close(); }
+  }
+});
+
+test('thread scratch rejects a bad --runtime-mode before the server makes the Scratch project', async () => {
+  const w = world(await fakeT3('0.0.45', [], scratchRpc));
+  try {
+    const { code } = await cliIn(w.home, 'thread', 'scratch', 'x', '--runtime-mode', 'yolo');
+    assert.notEqual(code, 0);
+    assert.deepEqual(w.rpc, []);
   } finally { w.close(); }
 });
 
@@ -1793,6 +1906,18 @@ test('protocol 1: --new-worktree sends one bootstrapped turn start over the webs
     });
     // The path is the one the server reports, read back from the thread.
     assert.ok(stdout.includes(`worktree /wt/alpha/${bootstrap.prepareWorktree.branch.replace('/', '-')}`), stdout);
+  } finally { w.close(); }
+});
+
+test('protocol 1: --new-worktree starts locally when the project says so', async () => {
+  const w = await v1World([], (request) => request.tag === 'server.getSettings'
+    ? ok({ ...DEFAULT_SETTINGS, projectSettingsOverrides: { p1: { newWorktreesStartFromOrigin: false, defaultRuntimeMode: 'auto' } } }) : defaultRpc(request));
+  try {
+    const { code, stderr } = await cliIn(w.home, 'thread', 'create', 'alpha', 'x', '--new-worktree', '--message', 'go');
+    assert.equal(code, 0, stderr);
+    const { bootstrap, runtimeMode } = w.rpc.find((r) => r.tag === 'orchestration.dispatchCommand').payload;
+    assert.equal(bootstrap.prepareWorktree.startFromOrigin, false);
+    assert.equal(runtimeMode, 'auto');
   } finally { w.close(); }
 });
 
