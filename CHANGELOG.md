@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.14.1](https://github.com/Goobles/t3ctl/compare/v0.14.0...v0.14.1) (2026-10-19)
+
+
+### Bug Fixes
+
+* take new threads' default access and worktree start from T3's settings ([88f8d18](https://github.com/Goobles/t3ctl/commit/88f8d182866970f4ba15ea5aefc07f413f3c7217))
+* take new threads' default access and worktree start from T3's settings ([9c2d14b](https://github.com/Goobles/t3ctl/commit/9c2d14bc43630500e06f5ddeb9c7d880c31caa74))
+
 ## [0.14.0](https://github.com/Goobles/t3ctl/compare/v0.13.0...v0.14.0) (2026-10-13)
 
 
