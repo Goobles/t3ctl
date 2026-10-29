@@ -79,13 +79,19 @@ t3ctl ls --json | jq -r '.projects[].threads[] | select(.status=="running") | .t
 ```
 
 Each thread in `--json` carries `pullRequests`: the PRs linked to it in T3 Code, as
-`{ url, repository, number }`, or `[]` when there are none. `model` is the model it
-runs on (`{ instanceId, model, options? }`) and `runtimeMode` its runtime mode, each
-`null` when the server doesn't say.
+`{ url, repository, number, linkedAt, snapshot }`, or `[]` when there are none.
+`snapshot` is the PR as of T3's last sync with GitHub (`syncedAt`): `{ state, title,
+headBranch, baseBranch, isDraft, checksState, mergeability, reviewDecision, mergedAt,
+closedAt, updatedAt, syncedAt }`, or `null` before T3 synced it. Ask GitHub when you
+need it as it is now. `model` is the model it runs on (`{ instanceId, model, options? }`)
+and `runtimeMode` its runtime mode, each `null` when the server doesn't say.
+`parentThreadId` is the thread that started it as a subagent (`null` for one nothing
+started) and `rootThreadId` the top of that tree (its own id for one nothing started);
+both are `null` on servers that don't say.
 
 The JSON shape is `{projects: [{host, id, title, workspaceRoot, threads: [{id,
-title, branch, status, provider, model, runtimeMode, updatedAt, pullRequests}]}],
-unreachable: [{host, error}]}`.
+title, branch, status, provider, model, runtimeMode, updatedAt, parentThreadId,
+rootThreadId, pullRequests}]}], unreachable: [{host, error}]}`.
 
 ### `t3ctl host add <origin> [token] [--name <name>]`
 

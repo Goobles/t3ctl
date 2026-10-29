@@ -1131,10 +1131,32 @@ test('ls --json lists each thread\'s linked pull requests', async () => {
     assert.equal(code, 0, stderr);
     const threads = Object.fromEntries(JSON.parse(stdout).projects[0].threads.map((t) => [t.title, t]));
     assert.deepEqual(threads.linked.pullRequests, [
-      { url: 'https://github.com/Sparklink/mainframe/pull/5', repository: 'sparklink/mainframe', number: 5 },
-      { url: 'https://github.com/Sparklink/mainframe/pull/6', repository: 'sparklink/mainframe', number: 6 },
+      {
+        url: 'https://github.com/Sparklink/mainframe/pull/5', repository: 'sparklink/mainframe', number: 5, linkedAt: '2026-10-01T00:00:00.000Z',
+        snapshot: {
+          state: 'merged', title: 'x', headBranch: 'a', baseBranch: 'main', isDraft: false, checksState: null, mergeability: null,
+          reviewDecision: null, mergedAt: null, closedAt: null, updatedAt: null, syncedAt: '2026-10-01T00:00:00.000Z',
+        },
+      },
+      { url: 'https://github.com/Sparklink/mainframe/pull/6', repository: 'sparklink/mainframe', number: 6, linkedAt: '2026-10-01T00:00:00.000Z', snapshot: null },
     ]);
     assert.deepEqual(threads.scratch.pullRequests, []);
+  } finally { w.close(); }
+});
+
+// mainframe finds an orchestrator thread's subagents through these.
+test('ls --json gives each thread its parent and root thread', async () => {
+  const root = '55555555-5555-4555-8555-555555555555';
+  const child = { ...THREAD, id: '66666666-6666-4666-8666-666666666666', title: 'child', lineage: { parentThreadId: root, rootThreadId: root, relationshipToParent: 'subagent' } };
+  const w = await threadWorld([THREAD, child]);
+  try {
+    const { code, stdout, stderr } = await cliIn(w.home, 'ls', '--json');
+    assert.equal(code, 0, stderr);
+    const threads = Object.fromEntries(JSON.parse(stdout).projects[0].threads.map((t) => [t.title, t]));
+    assert.equal(threads.child.parentThreadId, root);
+    assert.equal(threads.child.rootThreadId, root);
+    assert.equal(threads.scratch.parentThreadId, null);
+    assert.equal(threads.scratch.rootThreadId, null);
   } finally { w.close(); }
 });
 

@@ -71,6 +71,8 @@ type Thread = {
   hasActionableProposedPlan?: boolean;
   /** Pull requests linked to the thread (ThreadPullRequestLink); absent on servers from before linking. */
   pullRequests?: PullRequestLink[];
+  /** Where a subagent thread hangs: the thread that started it and the top of its tree. Absent on older servers. */
+  lineage?: { parentThreadId?: string | null; rootThreadId?: string | null } | null;
   // Protocol 1 fields.
   session?: { status: string; providerName?: string | null; activeTurnId?: string | null } | null;
   latestTurn?: { state?: string } | null;
@@ -87,6 +89,25 @@ type PullRequestLink = {
   url: string;
   /** `stack-dismissed` marks a stack member the user unlinked; T3 hides those. */
   source: string;
+  linkedAt?: string;
+  /** The PR as of T3's last sync with GitHub (`syncedAt`); null before the first. */
+  snapshot?: PullRequestSnapshot | null;
+};
+
+/** The fields t3ctl passes on from T3's snapshot of a linked pull request. */
+type PullRequestSnapshot = {
+  state: string;
+  title: string;
+  headBranch: string;
+  baseBranch: string;
+  isDraft: boolean;
+  checksState?: string | null;
+  mergeability?: string | null;
+  reviewDecision?: string | null;
+  mergedAt?: string | null;
+  closedAt?: string | null;
+  updatedAt?: string | null;
+  syncedAt: string;
 };
 
 /** A conversation message from a thread projection. */
@@ -268,11 +289,18 @@ const collect = async (hosts: Host[]): Promise<{ ok: Reached[]; failed: Unreache
 
 type LsOptions = { threads?: boolean; all?: boolean; json?: boolean };
 
-// The same links T3's own list_thread_pull_requests tool reports. No state:
-// T3 only knows it as of its last sync with the host, which can be stale.
+// The same links T3's own list_thread_pull_requests tool reports, each with
+// T3's snapshot of the PR. That is only as fresh as T3's last sync with GitHub
+// (its syncedAt), so a reader that needs the PR as it is now asks GitHub.
 const pullRequestsOf = (t: Thread) => (t.pullRequests ?? [])
   .filter((l) => l.source !== 'stack-dismissed')
-  .map((l) => ({ url: l.url, repository: l.repository, number: l.number }));
+  .map((l) => ({ url: l.url, repository: l.repository, number: l.number, linkedAt: l.linkedAt ?? null, snapshot: snapshotOf(l.snapshot) }));
+
+const snapshotOf = (s: PullRequestSnapshot | null | undefined) => s && {
+  state: s.state, title: s.title, headBranch: s.headBranch, baseBranch: s.baseBranch, isDraft: s.isDraft,
+  checksState: s.checksState ?? null, mergeability: s.mergeability ?? null, reviewDecision: s.reviewDecision ?? null,
+  mergedAt: s.mergedAt ?? null, closedAt: s.closedAt ?? null, updatedAt: s.updatedAt ?? null, syncedAt: s.syncedAt,
+};
 
 const cmdLs = async ({ threads: showThreads, all: showAll, json: asJson }: LsOptions): Promise<void> => {
   const hosts = readHosts();
@@ -287,7 +315,7 @@ const cmdLs = async ({ threads: showThreads, all: showAll, json: asJson }: LsOpt
         host: host.name, id: p.id, title: p.title, workspaceRoot: p.workspaceRoot,
         threads: snap.threads.filter((t) => t.projectId === p.id)
           .filter((t) => showAll || (!t.deletedAt && !t.archivedAt))
-          .map((t) => ({ id: t.id, title: t.title, branch: t.branch, status: threadStatus(t), provider: t.providerInstanceId ?? t.session?.providerName ?? null, model: t.modelSelection ?? null, runtimeMode: t.runtimeMode ?? null, updatedAt: t.updatedAt, pullRequests: pullRequestsOf(t) })),
+          .map((t) => ({ id: t.id, title: t.title, branch: t.branch, status: threadStatus(t), provider: t.providerInstanceId ?? t.session?.providerName ?? null, model: t.modelSelection ?? null, runtimeMode: t.runtimeMode ?? null, updatedAt: t.updatedAt, parentThreadId: t.lineage?.parentThreadId ?? null, rootThreadId: t.lineage?.rootThreadId ?? null, pullRequests: pullRequestsOf(t) })),
       })));
     console.log(JSON.stringify({ projects: out, unreachable: failed.map((f) => ({ host: f.host.name, error: f.error })) }, null, 2));
     return;
