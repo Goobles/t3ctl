@@ -1121,6 +1121,8 @@ test('ls --json lists each thread\'s linked pull requests', async () => {
     pullRequests: [
       link(5, { snapshot: { state: 'merged', title: 'x', headBranch: 'a', baseBranch: 'main', isDraft: false, updatedAt: null, syncedAt: '2026-10-01T00:00:00.000Z' } }),
       link(6),
+      // Older servers leave snapshot out; it still comes out as null.
+      (({ snapshot, ...rest }) => rest)(link(8)),
       // A tombstone for a stack member the user unlinked; T3 hides it too.
       link(7, { source: 'stack-dismissed' }),
     ],
@@ -1139,6 +1141,7 @@ test('ls --json lists each thread\'s linked pull requests', async () => {
         },
       },
       { url: 'https://github.com/Sparklink/mainframe/pull/6', repository: 'sparklink/mainframe', number: 6, linkedAt: '2026-10-01T00:00:00.000Z', snapshot: null },
+      { url: 'https://github.com/Sparklink/mainframe/pull/8', repository: 'sparklink/mainframe', number: 8, linkedAt: '2026-10-01T00:00:00.000Z', snapshot: null },
     ]);
     assert.deepEqual(threads.scratch.pullRequests, []);
   } finally { w.close(); }
@@ -1155,6 +1158,8 @@ test('ls --json gives each thread its parent and root thread', async () => {
     const threads = Object.fromEntries(JSON.parse(stdout).projects[0].threads.map((t) => [t.title, t]));
     assert.equal(threads.child.parentThreadId, root);
     assert.equal(threads.child.rootThreadId, root);
+    // Explicit nulls, not missing keys, for a thread the server gives no lineage.
+    assert.ok('parentThreadId' in threads.scratch && 'rootThreadId' in threads.scratch);
     assert.equal(threads.scratch.parentThreadId, null);
     assert.equal(threads.scratch.rootThreadId, null);
   } finally { w.close(); }

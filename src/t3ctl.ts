@@ -296,11 +296,11 @@ const pullRequestsOf = (t: Thread) => (t.pullRequests ?? [])
   .filter((l) => l.source !== 'stack-dismissed')
   .map((l) => ({ url: l.url, repository: l.repository, number: l.number, linkedAt: l.linkedAt ?? null, snapshot: snapshotOf(l.snapshot) }));
 
-const snapshotOf = (s: PullRequestSnapshot | null | undefined) => s && {
+const snapshotOf = (s: PullRequestSnapshot | null | undefined) => s ? {
   state: s.state, title: s.title, headBranch: s.headBranch, baseBranch: s.baseBranch, isDraft: s.isDraft,
   checksState: s.checksState ?? null, mergeability: s.mergeability ?? null, reviewDecision: s.reviewDecision ?? null,
   mergedAt: s.mergedAt ?? null, closedAt: s.closedAt ?? null, updatedAt: s.updatedAt ?? null, syncedAt: s.syncedAt,
-};
+} : null;
 
 const cmdLs = async ({ threads: showThreads, all: showAll, json: asJson }: LsOptions): Promise<void> => {
   const hosts = readHosts();
